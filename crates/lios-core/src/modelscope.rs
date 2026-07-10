@@ -3,7 +3,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::{multipart, Client, RequestBuilder, StatusCode};
+use reqwest::{multipart, Client, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::storage::{StorageAdapter, StorageObject};
-use crate::{LiosError, Result};
+use crate::{LiosError, RemoteError, RemoteErrorKind, Result};
 
 const DATASET_SEGMENT: &str = "datasets";
 const DEFAULT_REVISION: &str = "master";
@@ -77,11 +77,10 @@ impl ModelScopeAdapter {
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let repo_id = Self::repo_id(namespace, dataset);
         let response = self
             .auth(
                 self.client
-                    .get(self.api(&format!("{DATASET_SEGMENT}/{repo_id}/repo")))
+                    .get(self.api_segments(&[DATASET_SEGMENT, namespace, dataset, "repo"]))
                     .query(&[
                         ("Revision", self.revision.as_str()),
                         ("FilePath", remote_path),
@@ -89,16 +88,10 @@ impl ModelScopeAdapter {
             )
             .send()
             .await
-            .map_err(|err| LiosError::Storage(err.to_string()))?;
+            .map_err(Self::network_error)?;
         let status = response.status();
         if !status.is_success() {
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|err| LiosError::Storage(err.to_string()))?;
-            return Err(LiosError::Storage(
-                String::from_utf8_lossy(&bytes).to_string(),
-            ));
+            return Err(Self::response_error(response).await);
         }
 
         let temp_path = local_path.with_extension("download");
@@ -106,7 +99,7 @@ impl ModelScopeAdapter {
         let mut written = 0u64;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|err| LiosError::Storage(err.to_string()))?;
+            let chunk = chunk.map_err(Self::network_error)?;
             output.write_all(&chunk).await?;
             written += chunk.len() as u64;
             on_progress(written);
@@ -117,12 +110,17 @@ impl ModelScopeAdapter {
         Ok(())
     }
 
-    fn api(&self, path: &str) -> String {
-        format!("{}/api/v1/{}", self.endpoint, path.trim_start_matches('/'))
-    }
-
-    fn repo_id(namespace: &str, dataset: &str) -> String {
-        format!("{namespace}/{dataset}")
+    fn api_segments(&self, segments: &[&str]) -> Url {
+        let mut url = Url::parse(&self.endpoint).expect("ModelScope endpoint must be a valid URL");
+        url.set_query(None);
+        url.set_fragment(None);
+        let mut path = url
+            .path_segments_mut()
+            .expect("ModelScope endpoint must support path segments");
+        path.clear().push("api").push("v1");
+        path.extend(segments.iter().copied());
+        drop(path);
+        url
     }
 
     fn auth(&self, request: RequestBuilder) -> RequestBuilder {
@@ -132,21 +130,27 @@ impl ModelScopeAdapter {
             .header("X-Request-ID", Uuid::new_v4().simple().to_string())
     }
 
+    fn network_error(_error: reqwest::Error) -> LiosError {
+        RemoteError::new(RemoteErrorKind::Network, None).into()
+    }
+
+    async fn response_error(response: reqwest::Response) -> LiosError {
+        let status = response.status();
+        RemoteError::from_status(status.as_u16()).into()
+    }
+
     async fn json_body(response: reqwest::Response) -> Result<Value> {
         let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|err| LiosError::Storage(err.to_string()))?;
         if !status.is_success() {
-            return Err(LiosError::Storage(
-                String::from_utf8_lossy(&bytes).to_string(),
-            ));
+            return Err(Self::response_error(response).await);
         }
+        let bytes = response.bytes().await.map_err(Self::network_error)?;
         if bytes.is_empty() {
             return Ok(Value::Null);
         }
-        let body: Value = serde_json::from_slice(&bytes)?;
+        let body: Value = serde_json::from_slice(&bytes).map_err(|_error| {
+            RemoteError::new(RemoteErrorKind::InvalidResponse, Some(status.as_u16()))
+        })?;
         Ok(body)
     }
 
@@ -166,19 +170,22 @@ impl ModelScopeAdapter {
         commit_message: String,
         actions: Vec<Value>,
     ) -> Result<()> {
-        let repo_id = Self::repo_id(namespace, dataset);
         let response = self
-            .auth(self.client.post(self.api(&format!(
-                "repos/{DATASET_SEGMENT}/{repo_id}/commit/{}",
-                self.revision
-            ))))
+            .auth(self.client.post(self.api_segments(&[
+                "repos",
+                DATASET_SEGMENT,
+                namespace,
+                dataset,
+                "commit",
+                &self.revision,
+            ])))
             .json(&json!({
                 "commit_message": commit_message,
                 "actions": actions,
             }))
             .send()
             .await
-            .map_err(|err| LiosError::Storage(err.to_string()))?;
+            .map_err(Self::network_error)?;
         Self::json_data(response).await?;
         Ok(())
     }
@@ -190,18 +197,24 @@ impl ModelScopeAdapter {
         oid: &str,
         size: u64,
     ) -> Result<Option<String>> {
-        let repo_id = Self::repo_id(namespace, dataset);
         let response = self
-            .auth(self.client.post(self.api(&format!(
-                "repos/{DATASET_SEGMENT}/{repo_id}/info/lfs/objects/batch"
-            ))))
+            .auth(self.client.post(self.api_segments(&[
+                "repos",
+                DATASET_SEGMENT,
+                namespace,
+                dataset,
+                "info",
+                "lfs",
+                "objects",
+                "batch",
+            ])))
             .json(&json!({
                 "operation": "upload",
                 "objects": [{ "oid": oid, "size": size }],
             }))
             .send()
             .await
-            .map_err(|err| LiosError::Storage(err.to_string()))?;
+            .map_err(Self::network_error)?;
         let data = Self::json_data(response).await?;
         let objects = data
             .get("objects")
@@ -228,7 +241,7 @@ impl ModelScopeAdapter {
             .body(bytes)
             .send()
             .await
-            .map_err(|err| LiosError::Storage(err.to_string()))?;
+            .map_err(Self::network_error)?;
         Self::json_data(response).await?;
         Ok(())
     }
@@ -355,15 +368,18 @@ impl ModelScopeAdapter {
 
     pub async fn whoami(&self) -> Result<ModelScopeUserSummary> {
         let response = self
-            .auth(self.client.post(self.api("login")))
+            .auth(self.client.post(self.api_segments(&["login"])))
             .json(&json!({ "AccessToken": self.token }))
             .send()
             .await
-            .map_err(|err| LiosError::Storage(err.to_string()))?;
+            .map_err(Self::network_error)?;
         let data = Self::json_data(response).await?;
         let username = Self::value_string(&data, &["Username", "username", "Name", "name"])
             .ok_or_else(|| {
-                LiosError::Storage("ModelScope username was not returned".to_string())
+                RemoteError::new(
+                    RemoteErrorKind::InvalidResponse,
+                    Some(StatusCode::OK.as_u16()),
+                )
             })?;
         let email = Self::value_string(&data, &["Email", "email"]);
         Ok(ModelScopeUserSummary { username, email })
@@ -385,10 +401,14 @@ impl ModelScopeAdapter {
                 params.push(("owner", owner.trim().to_string()));
             }
             let response = self
-                .auth(self.client.get(self.api(DATASET_SEGMENT)).query(&params))
+                .auth(
+                    self.client
+                        .get(self.api_segments(&[DATASET_SEGMENT]))
+                        .query(&params),
+                )
                 .send()
                 .await
-                .map_err(|err| LiosError::Storage(err.to_string()))?;
+                .map_err(Self::network_error)?;
             let body = Self::json_body(response).await?;
             let (items, total) = Self::paged_repo_items(&body);
             let item_count = items.len();
@@ -424,39 +444,38 @@ impl StorageAdapter for ModelScopeAdapter {
             .text("Visibility", PRIVATE_VISIBILITY.to_string())
             .text("License", "Apache-2.0".to_string());
         let response = self
-            .auth(self.client.post(self.api(DATASET_SEGMENT)).multipart(form))
+            .auth(
+                self.client
+                    .post(self.api_segments(&[DATASET_SEGMENT]))
+                    .multipart(form),
+            )
             .send()
             .await
-            .map_err(|err| LiosError::Storage(err.to_string()))?;
+            .map_err(Self::network_error)?;
         let status = response.status();
-        if status.is_success()
-            || status == StatusCode::CONFLICT
-            || self.repo_exists(namespace, dataset).await.unwrap_or(false)
-        {
+        if status.is_success() || status == StatusCode::CONFLICT {
+            return Ok(());
+        }
+        if self.repo_exists(namespace, dataset).await? {
             Ok(())
         } else {
-            Err(LiosError::Storage(
-                response.text().await.unwrap_or_default(),
-            ))
+            Err(Self::response_error(response).await)
         }
     }
 
     async fn repo_exists(&self, namespace: &str, dataset: &str) -> Result<bool> {
-        let repo_id = Self::repo_id(namespace, dataset);
         let response = self
             .auth(
                 self.client
-                    .get(self.api(&format!("{DATASET_SEGMENT}/{repo_id}"))),
+                    .get(self.api_segments(&[DATASET_SEGMENT, namespace, dataset])),
             )
             .send()
             .await
-            .map_err(|err| LiosError::Storage(err.to_string()))?;
+            .map_err(Self::network_error)?;
         match response.status() {
             StatusCode::OK => Ok(true),
             StatusCode::NOT_FOUND => Ok(false),
-            _ => Err(LiosError::Storage(
-                response.text().await.unwrap_or_default(),
-            )),
+            _ => Err(Self::response_error(response).await),
         }
     }
 
@@ -466,11 +485,10 @@ impl StorageAdapter for ModelScopeAdapter {
         dataset: &str,
         prefix: &str,
     ) -> Result<Vec<StorageObject>> {
-        let repo_id = Self::repo_id(namespace, dataset);
         let response = self
             .auth(
                 self.client
-                    .get(self.api(&format!("{DATASET_SEGMENT}/{repo_id}/repo/tree")))
+                    .get(self.api_segments(&[DATASET_SEGMENT, namespace, dataset, "repo", "tree"]))
                     .query(&[
                         ("Revision", self.revision.as_str()),
                         ("Recursive", "true"),
@@ -479,7 +497,7 @@ impl StorageAdapter for ModelScopeAdapter {
             )
             .send()
             .await
-            .map_err(|err| LiosError::Storage(err.to_string()))?;
+            .map_err(Self::network_error)?;
         let data = Self::json_data(response).await?;
         let files = if let Some(files) = data.as_array() {
             files.clone()
@@ -597,5 +615,32 @@ impl StorageAdapter for ModelScopeAdapter {
         }
         self.create_commit(namespace, dataset, format!("Delete {prefix}"), actions)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelScopeAdapter;
+
+    #[test]
+    fn repository_identifiers_cannot_change_api_route() {
+        let adapter = ModelScopeAdapter::new(
+            "https://modelscope.cn/base?token=secret#fragment",
+            "request-token",
+        );
+
+        let url = adapter.api_segments(&[
+            "datasets",
+            "team/../../admin?x=1#frag",
+            "数据/../catalog",
+            "repo",
+        ]);
+
+        assert_eq!(
+            url.path(),
+            "/api/v1/datasets/team%2F..%2F..%2Fadmin%3Fx=1%23frag/%E6%95%B0%E6%8D%AE%2F..%2Fcatalog/repo"
+        );
+        assert_eq!(url.query(), None);
+        assert_eq!(url.fragment(), None);
     }
 }
