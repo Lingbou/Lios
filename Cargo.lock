@@ -2412,7 +2412,9 @@ dependencies = [
 name = "lios-desktop"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hex",
+ "httpmock",
  "lios-core",
  "serde",
  "serde_json",
@@ -2420,6 +2422,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tempfile",
  "tokio",
  "uuid",
  "walkdir",

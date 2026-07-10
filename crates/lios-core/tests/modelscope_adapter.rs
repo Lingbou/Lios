@@ -4,9 +4,179 @@ use httpmock::Method::{GET, POST, PUT};
 use httpmock::MockServer;
 use lios_core::modelscope::ModelScopeAdapter;
 use lios_core::storage::StorageAdapter;
+use lios_core::{LiosError, RemoteErrorKind};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
+
+fn assert_remote_error(error: LiosError, kind: RemoteErrorKind, status: Option<u16>) {
+    let LiosError::Remote(error) = error else {
+        panic!("expected remote error, got {error:?}");
+    };
+    assert_eq!(error.kind, kind);
+    assert_eq!(error.status, status);
+}
+
+#[tokio::test]
+async fn catalog_download_preserves_not_found_status() {
+    let server = MockServer::start();
+    let tmp = tempdir().unwrap();
+    let download = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v1/datasets/novix/cold/repo")
+            .query_param("Revision", "master")
+            .query_param("FilePath", "catalog.enc");
+        then.status(404).body("catalog missing");
+    });
+
+    let adapter = ModelScopeAdapter::new(server.base_url(), "token");
+    let error = adapter
+        .download_object(
+            "novix",
+            "cold",
+            "catalog.enc",
+            &tmp.path().join("catalog.enc"),
+        )
+        .await
+        .unwrap_err();
+
+    assert_remote_error(error, RemoteErrorKind::NotFound, Some(404));
+    download.assert();
+}
+
+#[tokio::test]
+async fn authentication_status_is_typed() {
+    let server = MockServer::start();
+    let login = server.mock(|when, then| {
+        when.method(POST).path("/api/v1/login");
+        then.status(401)
+            .json_body(json!({ "Message": "invalid token" }));
+    });
+
+    let error = ModelScopeAdapter::new(server.base_url(), "secret-token")
+        .whoami()
+        .await
+        .unwrap_err();
+
+    assert_remote_error(error, RemoteErrorKind::Authentication, Some(401));
+    login.assert();
+}
+
+#[tokio::test]
+async fn rate_limit_status_is_typed() {
+    let server = MockServer::start();
+    let list = server.mock(|when, then| {
+        when.method(GET).path("/api/v1/datasets");
+        then.status(429).body("slow down");
+    });
+
+    let error = ModelScopeAdapter::new(server.base_url(), "token")
+        .list_dataset_repos_for_owner(Some("novix"))
+        .await
+        .unwrap_err();
+
+    assert_remote_error(error, RemoteErrorKind::RateLimited, Some(429));
+    list.assert();
+}
+
+#[tokio::test]
+async fn server_status_is_typed() {
+    let server = MockServer::start();
+    let exists = server.mock(|when, then| {
+        when.method(GET).path("/api/v1/datasets/novix/cold");
+        then.status(503).body("unavailable");
+    });
+
+    let error = ModelScopeAdapter::new(server.base_url(), "token")
+        .repo_exists("novix", "cold")
+        .await
+        .unwrap_err();
+
+    assert_remote_error(error, RemoteErrorKind::Server, Some(503));
+    exists.assert();
+}
+
+#[tokio::test]
+async fn transport_failure_is_typed_as_network() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let error = ModelScopeAdapter::new(endpoint, "token")
+        .repo_exists("novix", "cold")
+        .await
+        .unwrap_err();
+
+    assert_remote_error(error, RemoteErrorKind::Network, None);
+}
+
+#[tokio::test]
+async fn remote_response_body_secrets_are_never_retained() {
+    let server = MockServer::start();
+    let secret_fragments = [
+        "ms-token-super-secret",
+        "Authorization: Bearer",
+        "Cookie: m_session_id",
+        "X-Amz-Credential=signed-secret",
+    ];
+    server.mock(|when, then| {
+        when.method(POST).path("/api/v1/login");
+        then.status(401).body(
+            "Authorization: Bearer ms-token-super-secret; Cookie: m_session_id=ms-token-super-secret; https://example.test/file?X-Amz-Credential=signed-secret",
+        );
+    });
+
+    let error = ModelScopeAdapter::new(server.base_url(), "request-token")
+        .whoami()
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:?} {error}");
+
+    for secret in secret_fragments {
+        assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+    }
+}
+
+#[tokio::test]
+async fn transport_error_urls_are_never_retained() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let endpoint =
+        format!("http://{address}/?token=ms-token-super-secret&X-Amz-Credential=signed-secret");
+
+    let error = ModelScopeAdapter::new(endpoint, "request-token")
+        .repo_exists("novix", "cold")
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:?} {error}");
+
+    assert!(!rendered.contains("ms-token-super-secret"), "{rendered}");
+    assert!(!rendered.contains("X-Amz-Credential"), "{rendered}");
+    assert!(!rendered.contains("token="), "{rendered}");
+}
+
+#[tokio::test]
+async fn create_repo_does_not_swallow_repo_exists_failure() {
+    let server = MockServer::start();
+    let create = server.mock(|when, then| {
+        when.method(POST).path("/api/v1/datasets");
+        then.status(400).body("create failed");
+    });
+    let exists = server.mock(|when, then| {
+        when.method(GET).path("/api/v1/datasets/novix/cold");
+        then.status(401).body("invalid token");
+    });
+
+    let error = ModelScopeAdapter::new(server.base_url(), "token")
+        .create_repo("novix", "cold")
+        .await
+        .unwrap_err();
+
+    assert_remote_error(error, RemoteErrorKind::Authentication, Some(401));
+    create.assert();
+    exists.assert();
+}
 
 #[tokio::test]
 async fn create_repo_is_idempotent_when_dataset_already_exists() {

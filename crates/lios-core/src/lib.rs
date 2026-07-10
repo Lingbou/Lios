@@ -12,4 +12,4 @@ pub mod restore;
 pub mod storage;
 pub mod tasks;
 
-pub use error::{LiosError, Result};
+pub use error::{LiosError, RemoteError, RemoteErrorKind, Result};

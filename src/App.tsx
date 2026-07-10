@@ -28,6 +28,9 @@ import {
 } from "lucide-react";
 import { type MouseEvent, useEffect, useState } from "react";
 import liosPetalMark from "./assets/lios-petal-mark.svg";
+import { initializeWithExistingCatalog, loadCatalogState } from "./catalogState.ts";
+import { errorText } from "./commandError.ts";
+import { setupWarningMessage, type SetupWarning } from "./setupWarning.ts";
 
 type RepoConfig = {
   namespace: string;
@@ -131,6 +134,7 @@ type Snapshot = {
   config: LiosConfig;
   has_token: boolean;
   tasks: TaskRecord[];
+  warning: SetupWarning | null;
 };
 
 type InvokeArgs = Record<string, unknown>;
@@ -162,7 +166,8 @@ function previewSnapshot(): Snapshot {
       chunk_size: 134217728
     },
     has_token: false,
-    tasks: []
+    tasks: [],
+    warning: null
   };
 }
 
@@ -191,14 +196,6 @@ type ConflictResolution = {
 
 type View = "spaces" | "drive" | "settings";
 type CatalogStatus = "idle" | "loading" | "ready" | "missing" | "error";
-
-function errorText(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function isMissingCatalogError(error: unknown) {
-  return errorText(error).toLowerCase().includes("space is not initialized");
-}
 
 function formatBytes(bytes: number) {
   if (!bytes) return "-";
@@ -406,7 +403,7 @@ function App() {
     try {
       await getCurrentWindow().minimize();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
+      setMessage(errorText(error));
     }
   }
 
@@ -415,7 +412,7 @@ function App() {
     try {
       await getCurrentWindow().toggleMaximize();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
+      setMessage(errorText(error));
     }
   }
 
@@ -424,7 +421,7 @@ function App() {
     try {
       await getCurrentWindow().close();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
+      setMessage(errorText(error));
     }
   }
 
@@ -434,13 +431,15 @@ function App() {
     try {
       await getCurrentWindow().startDragging();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
+      setMessage(errorText(error));
     }
   }
 
   async function refreshSetup(loadSpaces = true) {
     const next = await appInvoke<Snapshot>("current_setup");
     setSnapshot(next);
+    const warning = setupWarningMessage(next.warning);
+    if (warning) setMessage(warning);
     const configuredRepo = next.config.active_repo;
     let visibleActiveRepo = configuredRepo ?? null;
     setManualEndpoint((current) => configuredRepo?.endpoint || current);
@@ -495,7 +494,7 @@ function App() {
       await refreshSetup(false);
       await refreshTasks().catch(() => undefined);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
+      setMessage(errorText(error));
       await refreshSetup(false).catch(() => undefined);
       await refreshTasks().catch(() => undefined);
     } finally {
@@ -504,7 +503,7 @@ function App() {
   }
 
   useEffect(() => {
-    refreshSetup().catch((error) => setMessage(String(error)));
+    refreshSetup().catch((error) => setMessage(errorText(error)));
   }, []);
 
   useEffect(() => {
@@ -554,7 +553,15 @@ function App() {
     setSearchResults([]);
     setQuery("");
     try {
-      const result = await appInvoke<CatalogLoadResult>("load_space_catalog", { space });
+      const outcome = await loadCatalogState(() =>
+        appInvoke<CatalogLoadResult>("load_space_catalog", { space })
+      );
+      if (outcome.status === "missing") {
+        setCatalogStatus("missing");
+        setMessage("");
+        return;
+      }
+      const result = outcome.catalog;
       setCatalogTree(result.tree);
       setCurrentFolderId(result.tree.id);
       setCatalogStatus("ready");
@@ -562,33 +569,52 @@ function App() {
     } catch (error) {
       setCatalogTree(null);
       setCurrentFolderId(null);
-      if (isMissingCatalogError(error)) {
-        setCatalogStatus("missing");
-        setMessage("");
-      } else {
-        setCatalogStatus("error");
-        setMessage(errorText(error));
-      }
+      setCatalogStatus("error");
+      setMessage(errorText(error));
     }
   }
 
   async function initializeActiveSpace() {
     if (!activeSpace) return;
-    await run("初始化空间", async () => {
-      const result = await appInvoke<CatalogLoadResult>("initialize_space", { space: activeSpace });
-      setCatalogTree(result.tree);
-      setCurrentFolderId(result.tree.id);
-      setCatalogStatus("ready");
-      setSelectedIds(new Set());
-    });
+    setBusy("初始化空间");
+    setMessage("");
+    try {
+      await initializeWithExistingCatalog(
+        async () => {
+          const result = await appInvoke<CatalogLoadResult>("initialize_space", {
+            space: activeSpace
+          });
+          setCatalogTree(result.tree);
+          setCurrentFolderId(result.tree.id);
+          setCatalogStatus("ready");
+          setSelectedIds(new Set());
+        },
+        () => reloadCatalog(true)
+      );
+      await refreshSetup(false);
+    } catch (error) {
+      setMessage(errorText(error));
+      await refreshTasks().catch(() => undefined);
+    } finally {
+      setBusy(null);
+    }
   }
 
-  async function reloadCatalog() {
+  async function reloadCatalog(rethrow = false) {
     if (!activeSpace) return;
     setCatalogStatus("loading");
     setMessage("");
     try {
-      const result = await appInvoke<CatalogLoadResult>("load_space_catalog", { space: activeSpace });
+      const outcome = await loadCatalogState(() =>
+        appInvoke<CatalogLoadResult>("load_space_catalog", { space: activeSpace })
+      );
+      if (outcome.status === "missing") {
+        setCatalogTree(null);
+        setCurrentFolderId(null);
+        setCatalogStatus("missing");
+        return;
+      }
+      const result = outcome.catalog;
       setCatalogTree(result.tree);
       if (!currentFolderId) setCurrentFolderId(result.tree.id);
       setCatalogStatus("ready");
@@ -597,12 +623,9 @@ function App() {
     } catch (error) {
       setCatalogTree(null);
       setCurrentFolderId(null);
-      if (isMissingCatalogError(error)) {
-        setCatalogStatus("missing");
-      } else {
-        setCatalogStatus("error");
-        setMessage(errorText(error));
-      }
+      setCatalogStatus("error");
+      setMessage(errorText(error));
+      if (rethrow) throw error;
     }
   }
 
@@ -756,7 +779,7 @@ function App() {
     try {
       await refreshSetup(true);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
+      setMessage(errorText(error));
     }
   }
 
@@ -792,17 +815,12 @@ function App() {
         endpoint: manualEndpoint
       };
       await appInvoke("create_dataset_repo", space);
-      setActiveSpace(space);
-      setCatalogTree(null);
-      setCatalogStatus("missing");
-      setCurrentFolderId(null);
-      setSelectedIds(new Set());
       await refreshSetup(true);
       setCreateSpaceOpen(false);
       setNewSpaceName("");
-      setView("spaces");
+      await loadSpace(space);
     } catch (error) {
-      const text = error instanceof Error ? error.message : String(error);
+      const text = errorText(error);
       setCreateSpaceError(text);
       await refreshSetup(false).catch(() => undefined);
     } finally {
