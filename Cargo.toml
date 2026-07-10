@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/lios-core",
+    "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "git@github.com:Lingbou/Lios.git"
