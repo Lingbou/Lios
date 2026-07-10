@@ -3,6 +3,7 @@ use lios_core::{
     credentials::{protect_to_file, unprotect_from_file},
     crypto::KeyFile,
     tasks::{TaskRecord, TaskState, TaskStore},
+    LiosError,
 };
 use tempfile::tempdir;
 
@@ -57,6 +58,99 @@ fn first_run_generates_default_key_and_persists_config() {
     let saved = LiosConfig::load(&paths.config).unwrap();
     assert_eq!(saved.key_file_path.as_deref(), Some(key_path.as_path()));
     KeyFile::load_from_path(key_path).unwrap();
+}
+
+#[test]
+fn missing_key_path_rebinds_existing_valid_default_key_without_overwriting() {
+    let tmp = tempdir().unwrap();
+    let paths = LiosPaths::from_home(tmp.path());
+    paths.ensure_dirs().unwrap();
+    let key_path = paths.home.join("recovery.key");
+    KeyFile::generate_to_path(&key_path).unwrap();
+    let original_key_file = std::fs::read(&key_path).unwrap();
+    let mut config = LiosConfig::default();
+
+    ensure_default_key_configured(&paths, &mut config).unwrap();
+
+    assert_eq!(std::fs::read(&key_path).unwrap(), original_key_file);
+    assert_eq!(config.key_file_path.as_deref(), Some(key_path.as_path()));
+    let saved = LiosConfig::load(&paths.config).unwrap();
+    assert_eq!(saved.key_file_path.as_deref(), Some(key_path.as_path()));
+}
+
+#[test]
+fn invalid_existing_default_key_is_not_overwritten() {
+    let tmp = tempdir().unwrap();
+    let paths = LiosPaths::from_home(tmp.path());
+    paths.ensure_dirs().unwrap();
+    let key_path = paths.home.join("recovery.key");
+    let invalid_key = b"version: 1\nalgorithm: wrong\nkey: invalid\n";
+    std::fs::write(&key_path, invalid_key).unwrap();
+    let mut config = LiosConfig::default();
+
+    let result = ensure_default_key_configured(&paths, &mut config);
+
+    let error = result.unwrap_err();
+    assert!(matches!(&error, LiosError::InvalidKeyFile));
+    assert_eq!(error.to_string(), "invalid key file");
+    assert_eq!(std::fs::read(&key_path).unwrap(), invalid_key);
+    assert!(config.key_file_path.is_none());
+    assert!(!paths.config.exists());
+}
+
+#[test]
+fn key_generation_refuses_to_overwrite_existing_destination() {
+    let tmp = tempdir().unwrap();
+    let key_path = tmp.path().join("recovery.key");
+    KeyFile::generate_to_path(&key_path).unwrap();
+    let original_key_file = std::fs::read(&key_path).unwrap();
+
+    let result = KeyFile::generate_to_path(&key_path);
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&key_path).unwrap(), original_key_file);
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_recovery_key_is_owner_read_write_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let key_path = tmp.path().join("recovery.key");
+
+    KeyFile::generate_to_path(&key_path).unwrap();
+
+    let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn key_export_refuses_to_overwrite_existing_destination() {
+    let tmp = tempdir().unwrap();
+    let destination = tmp.path().join("export.key");
+    let source = tmp.path().join("source.key");
+    KeyFile::generate_to_path(&destination).unwrap();
+    let key = KeyFile::generate_to_path(&source).unwrap();
+    let original_destination = std::fs::read(&destination).unwrap();
+
+    let result = key.save_to_path(&destination);
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&destination).unwrap(), original_destination);
+}
+
+#[test]
+fn current_v1_key_yaml_remains_loadable() {
+    let tmp = tempdir().unwrap();
+    let key_path = tmp.path().join("recovery.key");
+    std::fs::write(
+        &key_path,
+        "version: 1\nalgorithm: XChaCha20Poly1305-compatible-32-byte-key\nkey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+    )
+    .unwrap();
+
+    KeyFile::load_from_path(&key_path).unwrap();
 }
 
 #[test]

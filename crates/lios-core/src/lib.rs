@@ -1,3 +1,5 @@
+mod atomic;
+
 pub mod cache;
 pub mod catalog;
 pub mod config;

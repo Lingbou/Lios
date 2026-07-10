@@ -187,11 +187,17 @@ fn upload_conflict_supports_replace_keep_both_and_skip() {
         staging_dir: staging.clone(),
     };
     catalog
-        .add_paths_to_folder(&root_id, &[old.clone()], &[], &key, options.clone())
+        .add_paths_to_folder(
+            &root_id,
+            std::slice::from_ref(&old),
+            &[],
+            &key,
+            options.clone(),
+        )
         .unwrap();
 
     let conflicts = catalog
-        .preview_upload_conflicts(&root_id, &[new.clone()], &key)
+        .preview_upload_conflicts(&root_id, std::slice::from_ref(&new), &key)
         .unwrap();
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0].target_name, "same.txt");
@@ -199,7 +205,7 @@ fn upload_conflict_supports_replace_keep_both_and_skip() {
     catalog
         .add_paths_to_folder(
             &root_id,
-            &[new.clone()],
+            std::slice::from_ref(&new),
             &[ConflictResolution {
                 source_path: new.display().to_string(),
                 action: ConflictAction::KeepBoth,
@@ -214,7 +220,7 @@ fn upload_conflict_supports_replace_keep_both_and_skip() {
     catalog
         .add_paths_to_folder(
             &root_id,
-            &[new.clone()],
+            std::slice::from_ref(&new),
             &[ConflictResolution {
                 source_path: new.display().to_string(),
                 action: ConflictAction::Skip,
