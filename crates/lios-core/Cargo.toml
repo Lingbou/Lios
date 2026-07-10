@@ -14,6 +14,7 @@ directories = "6"
 futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
+hkdf = "0.12"
 rand = "0.8"
 reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
 rusqlite = { version = "0.33", features = ["bundled"] }
@@ -25,7 +26,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 zstd = "0.13"
 
 [dev-dependencies]

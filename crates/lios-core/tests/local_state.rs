@@ -5,7 +5,26 @@ use lios_core::{
     tasks::{TaskRecord, TaskState, TaskStore},
     LiosError,
 };
+use serde::Deserialize;
 use tempfile::tempdir;
+
+#[derive(Deserialize)]
+struct FrozenV1KeyFile {
+    version: u8,
+    algorithm: String,
+    key: String,
+}
+
+fn parse_with_frozen_v1_reader(path: &std::path::Path) -> [u8; 32] {
+    let parsed: FrozenV1KeyFile =
+        serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(parsed.version, 1);
+    assert_eq!(parsed.algorithm, "XChaCha20Poly1305-compatible-32-byte-key");
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, parsed.key)
+        .unwrap()
+        .try_into()
+        .unwrap()
+}
 
 #[test]
 fn local_paths_follow_lios_layout() {
@@ -151,6 +170,61 @@ fn current_v1_key_yaml_remains_loadable() {
     .unwrap();
 
     KeyFile::load_from_path(&key_path).unwrap();
+}
+
+#[test]
+fn generated_and_exported_keys_remain_readable_by_frozen_v1_parser() {
+    let tmp = tempdir().unwrap();
+    let generated_path = tmp.path().join("generated.key");
+    let v2_source_path = tmp.path().join("v2-source.key");
+    let exported_path = tmp.path().join("exported.key");
+
+    KeyFile::generate_to_path(&generated_path).unwrap();
+    std::fs::write(
+        &v2_source_path,
+        "version: 2\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+    )
+    .unwrap();
+    KeyFile::load_from_path(&v2_source_path)
+        .unwrap()
+        .save_to_path(&exported_path)
+        .unwrap();
+
+    assert_eq!(parse_with_frozen_v1_reader(&generated_path).len(), 32);
+    assert_eq!(parse_with_frozen_v1_reader(&exported_path), [0; 32]);
+}
+
+#[test]
+fn v2_key_yaml_loads() {
+    let tmp = tempdir().unwrap();
+    let v2_path = tmp.path().join("v2.key");
+    std::fs::write(
+        &v2_path,
+        "version: 2\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+    )
+    .unwrap();
+
+    KeyFile::load_from_path(&v2_path).unwrap();
+}
+
+#[test]
+fn unknown_key_versions_and_algorithms_are_rejected() {
+    let tmp = tempdir().unwrap();
+    let cases = [
+        "version: 9\nalgorithm: XChaCha20Poly1305-compatible-32-byte-key\nkey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        "version: 1\nalgorithm: unknown\nkey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        "version: 2\nkdf: HKDF-SHA256\nalgorithm: unknown\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        "version: 2\nkdf: unknown\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+    ];
+
+    for (index, contents) in cases.into_iter().enumerate() {
+        let path = tmp.path().join(format!("invalid-{index}.key"));
+        std::fs::write(&path, contents).unwrap();
+        assert!(matches!(
+            KeyFile::load_from_path(path),
+            Err(LiosError::InvalidKeyFile)
+        ));
+    }
 }
 
 #[test]
