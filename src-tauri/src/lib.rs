@@ -493,7 +493,7 @@ async fn run_upload(
         emit_tasks(&app, paths);
         let preparing_started = Instant::now();
 
-        Catalog::pack_with_progress(
+        let outcome = Catalog::pack_with_progress_and_report(
             PackSource::Path(PathBuf::from(source_path)),
             &key,
             PackOptions {
@@ -517,6 +517,7 @@ async fn run_upload(
             },
         )
         .map_err(to_err)?;
+        outcome.into_catalog().map_err(to_err)?;
 
         let staged = staged_files(&paths.staging)?;
         let local_objects = staged
@@ -999,8 +1000,8 @@ async fn enqueue_upload_to_folder(
         update_task_phase(&state.paths, task.id, Some("preparing".to_string()))?;
         emit_tasks(&app, &state.paths);
         let preparing_started = Instant::now();
-        catalog
-            .add_paths_to_folder_with_progress(
+        let report = catalog
+            .add_paths_to_folder_with_progress_and_report(
                 &parent_node_id,
                 &upload_paths,
                 &conflict_resolutions,
@@ -1026,6 +1027,7 @@ async fn enqueue_upload_to_folder(
                 },
             )
             .map_err(to_err)?;
+        report.ensure_no_skipped_paths().map_err(to_err)?;
         let work = plan_catalog_sync(&state.paths, &catalog, &key, &adapter, &repo).await?;
         update_task_phase(&state.paths, task.id, Some("uploading".to_string()))?;
         task.progress_done = 0;

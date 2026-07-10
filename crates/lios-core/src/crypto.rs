@@ -11,6 +11,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+use crate::atomic::write_private_atomic_new;
 use crate::{LiosError, Result};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -50,15 +51,13 @@ impl KeyFile {
     }
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
-        if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent)?;
-        }
         let yaml = KeyFileYaml {
             version: 1,
             algorithm: "XChaCha20Poly1305-compatible-32-byte-key".to_string(),
             key: STANDARD.encode(self.key),
         };
-        fs::write(path, serde_yaml::to_string(&yaml)?)?;
+        let serialized = serde_yaml::to_string(&yaml)?;
+        write_private_atomic_new(path.as_ref(), serialized.as_bytes())?;
         Ok(())
     }
 

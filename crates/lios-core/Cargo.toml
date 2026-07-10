@@ -25,7 +25,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 zstd = "0.13"
 
 [dev-dependencies]
