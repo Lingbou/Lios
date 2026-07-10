@@ -18,13 +18,15 @@ use tempfile::tempdir;
 
 #[derive(Deserialize)]
 struct TestKeyFile {
-    key: String,
+    key: Option<String>,
+    master_key: Option<String>,
 }
 
 fn raw_test_key(key_path: &Path) -> [u8; 32] {
     let key_file: TestKeyFile =
         serde_yaml::from_str(&fs::read_to_string(key_path).unwrap()).unwrap();
-    STANDARD.decode(key_file.key).unwrap().try_into().unwrap()
+    let encoded = key_file.key.or(key_file.master_key).unwrap();
+    STANDARD.decode(encoded).unwrap().try_into().unwrap()
 }
 
 fn decrypt_test_blob(key_path: &Path, encrypted: &[u8]) -> Vec<u8> {
@@ -75,6 +77,40 @@ fn assert_restore_link_error(result: Result<(), LiosError>) {
         panic!("expected restore path link rejection");
     };
     assert!(message.contains("restore path contains symlink or junction"));
+}
+
+#[test]
+fn golden_v1_catalog_and_chunk_restore_end_to_end() {
+    let tmp = tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto_v1");
+    let staging = tmp.path().join("staging");
+    let chunk_path = staging.join("objects/files/legacy-object/chunks/golden.lios");
+    let restore = tmp.path().join("restore");
+    write_file(
+        &staging.join("catalog.enc"),
+        &fs::read(fixtures.join("legacy_catalog_v1.enc")).unwrap(),
+    );
+    write_file(
+        &chunk_path,
+        &fs::read(fixtures.join("legacy_chunk_v1.enc")).unwrap(),
+    );
+    let key = KeyFile::load_from_path(fixtures.join("legacy_v1.key")).unwrap();
+
+    Catalog::from_staging(staging)
+        .restore(
+            CatalogSelection::All,
+            &key,
+            RestoreOptions {
+                output_dir: restore.clone(),
+                conflict_policy: RestoreConflictPolicy::Rename,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        fs::read(restore.join("legacy-archive/legacy.bin")).unwrap(),
+        fs::read(fixtures.join("legacy_chunk_v1.bin")).unwrap()
+    );
 }
 
 #[test]
