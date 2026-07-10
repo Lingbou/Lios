@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::atomic::write_atomic;
 use crate::crypto::KeyFile;
-use crate::Result;
+use crate::{LiosError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiosPaths {
@@ -76,10 +77,8 @@ impl LiosConfig {
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, serde_yaml::to_string(self)?)?;
+        let serialized = serde_yaml::to_string(self)?;
+        write_atomic(path.as_ref(), serialized.as_bytes())?;
         Ok(())
     }
 }
@@ -89,7 +88,23 @@ pub fn ensure_default_key_configured(paths: &LiosPaths, config: &mut LiosConfig)
         return Ok(());
     }
     let key_path = paths.home.join("recovery.key");
-    KeyFile::generate_to_path(&key_path)?;
-    config.key_file_path = Some(key_path);
-    config.save(&paths.config)
+    match KeyFile::load_from_path(&key_path) {
+        Ok(_) => {}
+        Err(LiosError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            match KeyFile::generate_to_path(&key_path) {
+                Ok(_) => {}
+                Err(LiosError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    KeyFile::load_from_path(&key_path)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+
+    let mut updated = config.clone();
+    updated.key_file_path = Some(key_path);
+    updated.save(&paths.config)?;
+    *config = updated;
+    Ok(())
 }

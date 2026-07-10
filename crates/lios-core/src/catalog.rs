@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::atomic::{publish_staged_new, write_atomic, write_atomic_immutable, SiblingTempFile};
 use crate::crypto::KeyFile;
 use crate::pack::{PackOptions, PackProgress, PackSource};
 use crate::restore::{RestoreConflictPolicy, RestoreOptions};
@@ -19,6 +20,12 @@ const FILES_DIR: &str = "objects/files";
 const FILE_CHUNKS_DIR: &str = "chunks";
 const FILE_MANIFEST: &str = "manifest.enc";
 const TMP_DIR: &str = ".tmp";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackablePathKind {
+    Directory,
+    File,
+}
 
 #[derive(Clone, Debug)]
 pub enum CatalogSelection {
@@ -98,6 +105,76 @@ pub struct ConflictResolution {
     pub action: ConflictAction,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackReport {
+    pub skipped_paths: Vec<SkippedPath>,
+}
+
+impl PackReport {
+    pub fn ensure_no_skipped_paths(&self) -> Result<()> {
+        if self.skipped_paths.is_empty() {
+            return Ok(());
+        }
+        let count = self.skipped_paths.len();
+        let label = if count == 1 { "path" } else { "paths" };
+        let paths = self
+            .skipped_paths
+            .iter()
+            .take(3)
+            .map(|skipped| skipped.path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remainder = if count > 3 {
+            format!(", and {} more", count - 3)
+        } else {
+            String::new()
+        };
+        Err(LiosError::Unsupported(format!(
+            "skipped {count} {label}: {paths}{remainder}"
+        )))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum PackOutcome {
+    Packed {
+        catalog: Catalog,
+        report: PackReport,
+    },
+    Skipped {
+        report: PackReport,
+    },
+}
+
+impl PackOutcome {
+    pub fn into_catalog(self) -> Result<Catalog> {
+        match self {
+            Self::Packed { catalog, report } => {
+                report.ensure_no_skipped_paths()?;
+                Ok(catalog)
+            }
+            Self::Skipped { report } => {
+                report.ensure_no_skipped_paths()?;
+                Err(LiosError::Unsupported(
+                    "packing produced no catalog".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkippedPath {
+    pub path: PathBuf,
+    pub reason: SkippedPathReason,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkippedPathReason {
+    SymbolicLinkOrJunction,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PlainCatalog {
     version: u8,
@@ -146,6 +223,14 @@ impl Catalog {
     }
 
     pub fn pack(source: PackSource, key: &KeyFile, options: PackOptions) -> Result<Self> {
+        Self::pack_with_report(source, key, options)?.into_catalog()
+    }
+
+    pub fn pack_with_report(
+        source: PackSource,
+        key: &KeyFile,
+        options: PackOptions,
+    ) -> Result<PackOutcome> {
         Self::pack_with_optional_progress(source, key, options, None)
     }
 
@@ -155,6 +240,15 @@ impl Catalog {
         options: PackOptions,
         mut on_progress: impl FnMut(PackProgress),
     ) -> Result<Self> {
+        Self::pack_with_progress_and_report(source, key, options, &mut on_progress)?.into_catalog()
+    }
+
+    pub fn pack_with_progress_and_report(
+        source: PackSource,
+        key: &KeyFile,
+        options: PackOptions,
+        mut on_progress: impl FnMut(PackProgress),
+    ) -> Result<PackOutcome> {
         Self::pack_with_optional_progress(source, key, options, Some(&mut on_progress))
     }
 
@@ -163,45 +257,53 @@ impl Catalog {
         key: &KeyFile,
         options: PackOptions,
         on_progress: Option<&mut dyn FnMut(PackProgress)>,
-    ) -> Result<Self> {
+    ) -> Result<PackOutcome> {
         if options.chunk_size == 0 {
             return Err(LiosError::Unsupported(
                 "chunk size must be greater than zero".to_string(),
             ));
         }
 
-        fs::create_dir_all(options.staging_dir.join(OBJECTS_DIR))?;
         let PackSource::Path(source_path) = source;
+        let source_kind = packable_path_kind(&source_path)?;
+        let mut report = PackReport::default();
+        if source_kind.is_none() {
+            report.skipped_paths.push(skipped_link(&source_path));
+            return Ok(PackOutcome::Skipped { report });
+        }
         let name = file_name(&source_path)?;
+
+        fs::create_dir_all(options.staging_dir.join(OBJECTS_DIR))?;
         let mut tracker = PackProgressTracker::new(on_progress);
         tracker.add_total(pack_stats(&source_path, options.chunk_size)?);
-        let root = if source_path.is_dir() {
-            pack_directory(
+        let root = match source_kind {
+            Some(PackablePathKind::Directory) => pack_directory(
                 &source_path,
                 &source_path,
                 name,
                 key,
                 &options,
                 &mut tracker,
-            )?
-        } else if source_path.is_file() {
-            pack_file(&source_path, name, key, &options, &mut tracker)?
-        } else {
-            return Err(LiosError::Unsupported(format!(
-                "source path is not a file or directory: {}",
-                source_path.display()
-            )));
+                &mut report,
+            )?,
+            Some(PackablePathKind::File) => {
+                pack_file(&source_path, name, key, &options, &mut tracker)?
+            }
+            None => unreachable!(),
         };
 
         let plain = PlainCatalog { version: 1, root };
         let serialized = serde_json::to_vec(&plain)?;
         let encrypted = key.encrypt(&serialized)?;
         let encrypted_catalog_path = options.staging_dir.join(CATALOG_FILE);
-        fs::write(&encrypted_catalog_path, encrypted)?;
+        write_atomic(&encrypted_catalog_path, &encrypted)?;
 
-        Ok(Self {
-            encrypted_catalog_path,
-            staging_dir: options.staging_dir,
+        Ok(PackOutcome::Packed {
+            catalog: Self {
+                encrypted_catalog_path,
+                staging_dir: options.staging_dir,
+            },
+            report,
         })
     }
 
@@ -213,11 +315,12 @@ impl Catalog {
         let staging_dir = staging_dir.into();
         fs::create_dir_all(&staging_dir)?;
         let catalog = Self::from_staging(staging_dir);
+        let name = normalize_name(&name.into())?;
         let plain = PlainCatalog {
             version: 1,
             root: CatalogNode {
                 id: random_id(),
-                name: name.into(),
+                name,
                 updated_at: timestamp(),
                 kind: CatalogNodeKind::Directory {
                     children: Vec::new(),
@@ -333,6 +436,9 @@ impl Catalog {
         let mut conflicts = Vec::new();
         for path in paths {
             let target_name = file_name(path)?;
+            if should_skip_link(path)? {
+                continue;
+            }
             if let Some(existing) = children.iter().find(|child| child.name == target_name) {
                 conflicts.push(UploadConflict {
                     source_path: path.display().to_string(),
@@ -357,6 +463,19 @@ impl Catalog {
         key: &KeyFile,
         options: PackOptions,
     ) -> Result<()> {
+        let report =
+            self.add_paths_to_folder_with_report(parent_id, paths, resolutions, key, options)?;
+        report.ensure_no_skipped_paths()
+    }
+
+    pub fn add_paths_to_folder_with_report(
+        &self,
+        parent_id: &str,
+        paths: &[PathBuf],
+        resolutions: &[ConflictResolution],
+        key: &KeyFile,
+        options: PackOptions,
+    ) -> Result<PackReport> {
         self.add_paths_to_folder_with_optional_progress(
             parent_id,
             paths,
@@ -376,6 +495,26 @@ impl Catalog {
         options: PackOptions,
         mut on_progress: impl FnMut(PackProgress),
     ) -> Result<()> {
+        let report = self.add_paths_to_folder_with_progress_and_report(
+            parent_id,
+            paths,
+            resolutions,
+            key,
+            options,
+            &mut on_progress,
+        )?;
+        report.ensure_no_skipped_paths()
+    }
+
+    pub fn add_paths_to_folder_with_progress_and_report(
+        &self,
+        parent_id: &str,
+        paths: &[PathBuf],
+        resolutions: &[ConflictResolution],
+        key: &KeyFile,
+        options: PackOptions,
+        mut on_progress: impl FnMut(PackProgress),
+    ) -> Result<PackReport> {
         self.add_paths_to_folder_with_optional_progress(
             parent_id,
             paths,
@@ -394,7 +533,7 @@ impl Catalog {
         key: &KeyFile,
         options: PackOptions,
         on_progress: Option<&mut dyn FnMut(PackProgress)>,
-    ) -> Result<()> {
+    ) -> Result<PackReport> {
         if options.chunk_size == 0 {
             return Err(LiosError::Unsupported(
                 "chunk size must be greater than zero".to_string(),
@@ -403,6 +542,7 @@ impl Catalog {
         fs::create_dir_all(options.staging_dir.join(OBJECTS_DIR))?;
         let mut catalog = self.load_plain(key)?;
         let mut tracker = PackProgressTracker::new(on_progress);
+        let mut report = PackReport::default();
         let resolution_by_source = resolutions
             .iter()
             .map(|resolution| (resolution.source_path.as_str(), resolution.action.clone()))
@@ -414,6 +554,9 @@ impl Catalog {
         };
         for path in paths {
             let target_name = file_name(path)?;
+            let Some(_) = packable_path_kind(path)? else {
+                continue;
+            };
             let source_key = path.display().to_string();
             let parent = find_node(&catalog.root, parent_id).ok_or_else(|| {
                 LiosError::Unsupported(format!("catalog node not found: {parent_id}"))
@@ -438,12 +581,6 @@ impl Catalog {
             if matches!(conflict_action, Some(ConflictAction::Skip)) {
                 continue;
             }
-            if !path.is_dir() && !path.is_file() {
-                return Err(LiosError::Unsupported(format!(
-                    "upload path is not a file or directory: {}",
-                    path.display()
-                )));
-            }
             let stats = pack_stats(path, options.chunk_size)?;
             total_stats.chunks += stats.chunks;
             total_stats.bytes += stats.bytes;
@@ -454,6 +591,10 @@ impl Catalog {
 
         for path in paths {
             let mut target_name = file_name(path)?;
+            let Some(path_kind) = packable_path_kind(path)? else {
+                report.skipped_paths.push(skipped_link(path));
+                continue;
+            };
             let source_key = path.display().to_string();
             let conflict_action = {
                 let parent = find_directory_mut(&mut catalog.root, parent_id)?;
@@ -501,15 +642,19 @@ impl Catalog {
                 None => {}
             }
 
-            let node = if path.is_dir() {
-                pack_directory(path, path, target_name, key, &options, &mut tracker)?
-            } else if path.is_file() {
-                pack_file(path, target_name, key, &options, &mut tracker)?
-            } else {
-                return Err(LiosError::Unsupported(format!(
-                    "upload path is not a file or directory: {}",
-                    path.display()
-                )));
+            let node = match path_kind {
+                PackablePathKind::Directory => pack_directory(
+                    path,
+                    path,
+                    target_name,
+                    key,
+                    &options,
+                    &mut tracker,
+                    &mut report,
+                )?,
+                PackablePathKind::File => {
+                    pack_file(path, target_name, key, &options, &mut tracker)?
+                }
             };
             let parent = find_directory_mut(&mut catalog.root, parent_id)?;
             let CatalogNodeKind::Directory { children } = &mut parent.kind else {
@@ -519,7 +664,8 @@ impl Catalog {
             parent.updated_at = timestamp();
             sort_children(children);
         }
-        self.save_plain(&catalog, key)
+        self.save_plain(&catalog, key)?;
+        Ok(report)
     }
 
     pub fn remote_files_for_selection(
@@ -599,7 +745,8 @@ impl Catalog {
             fs::create_dir_all(parent)?;
         }
         let serialized = serde_json::to_vec(catalog)?;
-        fs::write(&self.encrypted_catalog_path, key.encrypt(&serialized)?)?;
+        let encrypted = key.encrypt(&serialized)?;
+        write_atomic(&self.encrypted_catalog_path, &encrypted)?;
         Ok(())
     }
 }
@@ -732,8 +879,14 @@ struct PackStats {
 }
 
 fn pack_stats(path: &Path, chunk_size: usize) -> Result<PackStats> {
-    if path.is_file() {
-        let len = fs::metadata(path)?.len();
+    let Some(path_kind) = packable_path_kind(path)? else {
+        return Ok(PackStats {
+            chunks: 0,
+            bytes: 0,
+        });
+    };
+    if path_kind == PackablePathKind::File {
+        let len = fs::symlink_metadata(path)?.len();
         if len == 0 {
             return Ok(PackStats {
                 chunks: 1,
@@ -742,11 +895,11 @@ fn pack_stats(path: &Path, chunk_size: usize) -> Result<PackStats> {
         }
         let chunk_size = chunk_size as u64;
         return Ok(PackStats {
-            chunks: (len + chunk_size - 1) / chunk_size,
+            chunks: len.div_ceil(chunk_size),
             bytes: len,
         });
     }
-    if path.is_dir() {
+    if path_kind == PackablePathKind::Directory {
         let mut total = PackStats {
             chunks: 0,
             bytes: 0,
@@ -772,19 +925,26 @@ fn pack_directory(
     key: &KeyFile,
     options: &PackOptions,
     progress: &mut PackProgressTracker<'_>,
+    report: &mut PackReport,
 ) -> Result<CatalogNode> {
+    ensure_packable_path_kind(dir, PackablePathKind::Directory)?;
     let mut children = Vec::new();
     let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
     for entry in entries {
         let path = entry.path();
+        let Some(path_kind) = packable_path_kind(&path)? else {
+            report.skipped_paths.push(skipped_link(&path));
+            continue;
+        };
         let child_name = file_name(&path)?;
-        if path.is_dir() {
-            children.push(pack_directory(
-                root, &path, child_name, key, options, progress,
-            )?);
-        } else if path.is_file() {
-            children.push(pack_file(&path, child_name, key, options, progress)?);
+        match path_kind {
+            PackablePathKind::Directory => children.push(pack_directory(
+                root, &path, child_name, key, options, progress, report,
+            )?),
+            PackablePathKind::File => {
+                children.push(pack_file(&path, child_name, key, options, progress)?)
+            }
         }
     }
 
@@ -804,6 +964,7 @@ fn pack_file(
     options: &PackOptions,
     progress: &mut PackProgressTracker<'_>,
 ) -> Result<CatalogNode> {
+    ensure_packable_path_kind(path, PackablePathKind::File)?;
     let temp_chunk_dir = options
         .staging_dir
         .join(TMP_DIR)
@@ -871,10 +1032,20 @@ fn pack_file(
         let chunk_name = chunk.path.clone();
         let from = temp_chunk_dir.join(&chunk_name);
         let to = object_chunks_dir.join(&chunk_name);
-        if to.exists() {
-            let _ = fs::remove_file(&from);
-        } else {
-            fs::rename(&from, &to)?;
+        match fs::symlink_metadata(&to) {
+            Ok(metadata) => {
+                if is_link_or_junction(&to, &metadata)?
+                    || !metadata.is_file()
+                    || sha256_file(&to)? != chunk.encrypted_sha256
+                {
+                    return Err(LiosError::Crypto);
+                }
+                let _ = fs::remove_file(&from);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                publish_staged_new(&from, &to)?;
+            }
+            Err(error) => return Err(error.into()),
         }
         chunk.path = format!("{FILES_DIR}/{object_id}/{FILE_CHUNKS_DIR}/{chunk_name}");
     }
@@ -884,9 +1055,10 @@ fn pack_file(
         "object_id": object_id,
         "chunks": &chunks,
     }))?;
-    fs::write(
-        object_dir.join(FILE_MANIFEST),
-        key.encrypt_deterministic("file-manifest", &file_manifest)?,
+    let encrypted_manifest = key.encrypt_deterministic("file-manifest", &file_manifest)?;
+    write_atomic_immutable(
+        &object_dir.join(FILE_MANIFEST),
+        encrypted_manifest.as_slice(),
     )?;
 
     Ok(CatalogNode {
@@ -909,21 +1081,29 @@ fn restore_node(
     staging_dir: &Path,
     options: &RestoreOptions,
 ) -> Result<()> {
+    let node_name = restore_local_name(&node.name);
+    let restore_root = &options.output_dir;
     match &node.kind {
         CatalogNodeKind::Directory { children } => {
-            let dir = parent.join(&node.name);
+            let dir = parent.join(node_name);
+            ensure_restore_descendants_safe(restore_root, &dir)?;
             fs::create_dir_all(&dir)?;
+            ensure_restore_descendants_safe(restore_root, &dir)?;
             for child in children {
                 restore_node(child, &dir, key, staging_dir, options)?;
             }
         }
         CatalogNodeKind::File { chunks, sha256, .. } => {
-            let output_path =
-                resolve_restore_path(&parent.join(&node.name), &options.conflict_policy);
-            if let Some(parent) = output_path.parent() {
-                fs::create_dir_all(parent)?;
+            let requested_path = parent.join(node_name);
+            ensure_restore_descendants_safe(restore_root, &requested_path)?;
+            let output_path = resolve_restore_path(&requested_path, &options.conflict_policy);
+            ensure_restore_descendants_safe(restore_root, &output_path)?;
+            if let Some(output_parent) = output_path.parent() {
+                ensure_restore_descendants_safe(restore_root, output_parent)?;
+                fs::create_dir_all(output_parent)?;
+                ensure_restore_descendants_safe(restore_root, output_parent)?;
             }
-            let mut output = fs::File::create(&output_path)?;
+            let mut output = SiblingTempFile::create(&output_path, ".lios-part")?;
             let mut file_hasher = Sha256::new();
             let mut ordered = chunks.iter().collect::<Vec<_>>();
             ordered.sort_by_key(|chunk| chunk.index);
@@ -938,12 +1118,40 @@ fn restore_node(
                     return Err(LiosError::Crypto);
                 }
                 file_hasher.update(&data);
-                output.write_all(&data)?;
+                output.file_mut().write_all(&data)?;
             }
             let restored_sha = hex::encode(file_hasher.finalize());
             if restored_sha != *sha256 {
                 return Err(LiosError::Crypto);
             }
+            ensure_restore_descendants_safe(restore_root, &output_path)?;
+            output.persist_new(&output_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_restore_descendants_safe(root: &Path, path: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| LiosError::InvalidRelativePath(path.to_path_buf()))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(part) => current.push(part),
+            _ => return Err(LiosError::InvalidRelativePath(path.to_path_buf())),
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if is_link_or_junction(&current, &metadata)? => {
+                return Err(LiosError::Unsupported(format!(
+                    "restore path contains symlink or junction: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())
@@ -1052,11 +1260,65 @@ fn sort_name_key(name: &str) -> (String, String, u32) {
 }
 
 fn normalize_name(name: &str) -> Result<String> {
-    let name = name.trim();
-    if name.is_empty() || name.contains('/') || name.contains('\\') {
+    if !is_portable_logical_name(name) {
         return Err(LiosError::Unsupported("invalid item name".to_string()));
     }
     Ok(name.to_string())
+}
+
+fn is_portable_logical_name(name: &str) -> bool {
+    !(name.is_empty()
+        || name.trim().is_empty()
+        || name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|character| character <= '\u{1f}' || "/\\:*?\"<>|".contains(character))
+        || name.ends_with(' ')
+        || name.ends_with('.')
+        || is_windows_reserved_name(name))
+}
+
+fn restore_local_name(name: &str) -> String {
+    if is_portable_logical_name(name) {
+        return name.to_string();
+    }
+    let mut base = name
+        .chars()
+        .map(|character| {
+            if character <= '\u{1f}' || "/\\:*?\"<>|".contains(character) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .trim_end_matches([' ', '.'])
+        .to_string();
+    if base.trim().is_empty() || base == "." || base == ".." {
+        base = "item".to_string();
+    }
+    if is_windows_reserved_name(&base) {
+        base.insert(0, '_');
+    }
+    let digest = sha256_hex(name.as_bytes());
+    format!("{base} (legacy {})", &digest[..8])
+}
+
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
 }
 
 fn available_name(existing: &[&str], name: &str) -> String {
@@ -1109,9 +1371,106 @@ fn resolve_restore_path(path: &Path, conflict_policy: &RestoreConflictPolicy) ->
 }
 
 fn file_name(path: &Path) -> Result<String> {
-    path.file_name()
+    let name = path
+        .file_name()
         .map(|name| name.to_string_lossy().to_string())
-        .ok_or_else(|| LiosError::MissingFileName(path.to_path_buf()))
+        .ok_or_else(|| LiosError::MissingFileName(path.to_path_buf()))?;
+    normalize_name(&name)
+}
+
+fn packable_path_kind(path: &Path) -> Result<Option<PackablePathKind>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if is_link_or_junction(path, &metadata)? {
+        return Ok(None);
+    }
+    if metadata.is_dir() {
+        Ok(Some(PackablePathKind::Directory))
+    } else if metadata.is_file() {
+        Ok(Some(PackablePathKind::File))
+    } else {
+        Err(LiosError::Unsupported(format!(
+            "source path is not a file or directory: {}",
+            path.display()
+        )))
+    }
+}
+
+fn ensure_packable_path_kind(path: &Path, expected: PackablePathKind) -> Result<()> {
+    match packable_path_kind(path)? {
+        Some(actual) if actual == expected => Ok(()),
+        _ => Err(LiosError::Unsupported(format!(
+            "source path changed before packing: {}",
+            path.display()
+        ))),
+    }
+}
+
+fn should_skip_link(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => is_link_or_junction(path, &metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn is_link_or_junction(path: &Path, metadata: &fs::Metadata) -> Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+
+    classify_windows_reparse_tag(metadata.file_attributes(), || {
+        query_windows_reparse_tag(path)
+    })
+    .map_err(Into::into)
+}
+
+#[cfg(not(windows))]
+fn is_link_or_junction(_path: &Path, metadata: &fs::Metadata) -> Result<bool> {
+    Ok(metadata.file_type().is_symlink())
+}
+
+#[cfg(windows)]
+fn classify_windows_reparse_tag(
+    file_attributes: u32,
+    query_tag: impl FnOnce() -> std::io::Result<u32>,
+) -> std::io::Result<bool> {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0000003;
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000000C;
+
+    if file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return Ok(false);
+    }
+    let tag = query_tag()?;
+    Ok(matches!(
+        tag,
+        IO_REPARSE_TAG_MOUNT_POINT | IO_REPARSE_TAG_SYMLINK
+    ))
+}
+
+#[cfg(windows)]
+fn query_windows_reparse_tag(path: &Path) -> std::io::Result<u32> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut data = WIN32_FIND_DATAW::default();
+    let handle = unsafe { FindFirstFileW(PCWSTR(path.as_ptr()), &mut data) }
+        .map_err(|_| std::io::Error::last_os_error())?;
+    unsafe { FindClose(handle) }.map_err(|_| std::io::Error::last_os_error())?;
+    Ok(data.dwReserved0)
+}
+
+fn skipped_link(path: &Path) -> SkippedPath {
+    SkippedPath {
+        path: path.to_path_buf(),
+        reason: SkippedPathReason::SymbolicLinkOrJunction,
+    }
 }
 
 fn random_id() -> String {
@@ -1124,4 +1483,85 @@ fn timestamp() -> String {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_tags_distinguish_links_from_other_tags() {
+        use std::io;
+
+        const REPARSE_ATTRIBUTE: u32 = 0x400;
+        const SYMLINK_TAG: u32 = 0xA000000C;
+        const MOUNT_POINT_TAG: u32 = 0xA0000003;
+        const CLOUD_TAG: u32 = 0x9000001A;
+
+        assert!(
+            super::classify_windows_reparse_tag(REPARSE_ATTRIBUTE, || Ok(SYMLINK_TAG)).unwrap()
+        );
+        assert!(
+            super::classify_windows_reparse_tag(REPARSE_ATTRIBUTE, || Ok(MOUNT_POINT_TAG)).unwrap()
+        );
+        assert!(!super::classify_windows_reparse_tag(REPARSE_ATTRIBUTE, || Ok(CLOUD_TAG)).unwrap());
+        let error = super::classify_windows_reparse_tag(REPARSE_ATTRIBUTE, || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected tag query failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn source_kind_revalidation_rejects_path_changed_into_link() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let expected = super::packable_path_kind(&source).unwrap().unwrap();
+        fs::remove_dir(&source).unwrap();
+        create_directory_link(&outside, &source);
+
+        let error = super::ensure_packable_path_kind(&source, expected).unwrap_err();
+        assert!(error.to_string().contains("source path changed"));
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to create junction: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
