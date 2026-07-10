@@ -1,32 +1,58 @@
+pub mod catalog_probe;
+pub mod command_error;
+pub mod command_surface;
+pub mod download_service;
+pub mod initialization_gate;
+pub mod production_config;
+
+#[cfg(test)]
+#[path = "../build_support.rs"]
+mod build_support;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
+use catalog_probe::{ensure_space_can_initialize, map_catalog_load_error};
+use command_error::{CommandError, CommandErrorCode};
+use command_surface::with_registered_commands;
+use download_service::prepare_download_task;
+use initialization_gate::InitializationGate;
 use lios_core::cache::{cleanup_temporary_staging, prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
     Catalog, CatalogRemoteFile, CatalogSelection, CatalogTreeNode, ConflictResolution, DriveItem,
     UploadConflict, CATALOG_FILE,
 };
-use lios_core::config::{ensure_default_key_configured, LiosConfig, LiosPaths, RepoConfig};
+use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
 use lios_core::credentials::{protect_to_file, unprotect_from_file};
 use lios_core::crypto::KeyFile;
 use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUserSummary};
-use lios_core::pack::{PackOptions, PackSource};
+use lios_core::pack::PackOptions;
 use lios_core::restore::{RestoreConflictPolicy, RestoreOptions};
-use lios_core::storage::{plan_current_snapshot_changes, LocalStorageObject, StorageAdapter};
+use lios_core::storage::StorageAdapter;
 use lios_core::tasks::{TaskRecord, TaskState, TaskStore};
+use production_config::{
+    configured_endpoint, generate_key_file_and_bind, persist_config, prepare_config_for_write,
+    prepare_startup_config, validate_repo, SetupWarning,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::Emitter;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
-type CommandResult<T> = std::result::Result<T, String>;
-
-const DEFAULT_MODELSCOPE_ENDPOINT: &str = "https://modelscope.cn";
+type CommandResult<T> = std::result::Result<T, CommandError>;
 
 struct AppContext {
     paths: LiosPaths,
+    initialization_gate: InitializationGate,
+    task_lifecycle_gate: Mutex<TaskLifecycleState>,
+}
+
+#[derive(Default)]
+struct TaskLifecycleState {
+    active_workers: HashSet<Uuid>,
 }
 
 impl AppContext {
@@ -36,7 +62,11 @@ impl AppContext {
         if let Ok(store) = TaskStore::open(&paths.database) {
             let _ = store.mark_running_interrupted("上次应用退出，任务已中断");
         }
-        Self { paths }
+        Self {
+            paths,
+            initialization_gate: InitializationGate::default(),
+            task_lifecycle_gate: Mutex::new(TaskLifecycleState::default()),
+        }
     }
 }
 
@@ -55,6 +85,7 @@ struct SetupSnapshot {
     config: LiosConfig,
     has_token: bool,
     tasks: Vec<TaskRecord>,
+    warning: Option<SetupWarning>,
 }
 
 #[derive(Clone, Serialize)]
@@ -87,8 +118,11 @@ struct SyncUpload {
     local_path: PathBuf,
 }
 
-fn to_err(error: impl std::fmt::Display) -> String {
-    error.to_string()
+fn to_err<E>(error: E) -> CommandError
+where
+    CommandError: From<E>,
+{
+    error.into()
 }
 
 fn paths_dto(paths: &LiosPaths) -> PathsDto {
@@ -103,10 +137,6 @@ fn paths_dto(paths: &LiosPaths) -> PathsDto {
 
 fn load_config(paths: &LiosPaths) -> CommandResult<LiosConfig> {
     LiosConfig::load(&paths.config).map_err(to_err)
-}
-
-fn save_config(paths: &LiosPaths, config: &LiosConfig) -> CommandResult<()> {
-    config.save(&paths.config).map_err(to_err)
 }
 
 fn task_store(paths: &LiosPaths) -> CommandResult<TaskStore> {
@@ -185,21 +215,6 @@ fn read_token(paths: &LiosPaths) -> CommandResult<String> {
     unprotect_from_file(&paths.credentials).map_err(to_err)
 }
 
-fn configured_endpoint(config: &LiosConfig, endpoint: Option<String>) -> String {
-    endpoint
-        .and_then(|value| {
-            let trimmed = value.trim().to_string();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-        .or_else(|| {
-            config
-                .active_repo
-                .as_ref()
-                .map(|repo| repo.endpoint.clone())
-        })
-        .unwrap_or_else(|| DEFAULT_MODELSCOPE_ENDPOINT.to_string())
-}
-
 fn adapter_from_config(
     paths: &LiosPaths,
     config: &LiosConfig,
@@ -207,7 +222,8 @@ fn adapter_from_config(
     let repo = config
         .active_repo
         .clone()
-        .ok_or_else(|| "dataset repo is not configured".to_string())?;
+        .ok_or_else(|| CommandError::invalid_input("dataset repo is not configured"))?;
+    let repo = validate_repo(repo)?;
     let token = read_token(paths)?;
     Ok((ModelScopeAdapter::new(repo.endpoint.clone(), token), repo))
 }
@@ -216,7 +232,7 @@ fn key_from_config(config: &LiosConfig) -> CommandResult<KeyFile> {
     let path = config
         .key_file_path
         .clone()
-        .ok_or_else(|| "key file is not configured".to_string())?;
+        .ok_or_else(|| CommandError::invalid_input("key file is not configured"))?;
     KeyFile::load_from_path(path).map_err(to_err)
 }
 
@@ -226,7 +242,9 @@ fn reset_staging(paths: &LiosPaths) -> CommandResult<()> {
         let staging = paths.staging.canonicalize().map_err(to_err)?;
         let home = paths.home.canonicalize().map_err(to_err)?;
         if !staging.starts_with(home) {
-            return Err("refusing to clear staging outside ~/.lios".to_string());
+            return Err(CommandError::invalid_input(
+                "refusing to clear staging outside ~/.lios",
+            ));
         }
         fs::remove_dir_all(&paths.staging).map_err(to_err)?;
     }
@@ -240,9 +258,9 @@ fn remote_to_staging_path(staging: &Path, remote_path: &str) -> CommandResult<Pa
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
-        return Err(format!(
+        return Err(CommandError::invalid_input(format!(
             "invalid remote object path in catalog: {remote_path}"
-        ));
+        )));
     }
     Ok(staging.join(relative))
 }
@@ -304,8 +322,122 @@ fn cleanup_current_staging_cache(
     cleanup_temporary_staging(&paths.staging).map_err(to_err)
 }
 
-fn cleanup_after_task(paths: &LiosPaths) {
-    let _ = cleanup_current_staging_cache(paths, true, false);
+async fn activate_new_task(
+    paths: &LiosPaths,
+    gate: &Mutex<TaskLifecycleState>,
+    mut task: TaskRecord,
+) -> CommandResult<TaskRecord> {
+    let mut lifecycle = gate.lock().await;
+    insert_task(paths, &task)?;
+    update_task_state(paths, task.id, TaskState::Running, None)?;
+    lifecycle.active_workers.insert(task.id);
+    task.state = TaskState::Running;
+    Ok(task)
+}
+
+async fn activate_existing_task(
+    paths: &LiosPaths,
+    gate: &Mutex<TaskLifecycleState>,
+    task_id: Uuid,
+    state: TaskState,
+) -> CommandResult<()> {
+    set_task_state(paths, gate, task_id, state, None).await
+}
+
+async fn set_task_state(
+    paths: &LiosPaths,
+    gate: &Mutex<TaskLifecycleState>,
+    task_id: Uuid,
+    state: TaskState,
+    error: Option<String>,
+) -> CommandResult<()> {
+    let _lifecycle = gate.lock().await;
+    update_task_state(paths, task_id, state, error)
+}
+
+fn cleanup_is_safe(paths: &LiosPaths, lifecycle: &TaskLifecycleState) -> CommandResult<bool> {
+    if !lifecycle.active_workers.is_empty() {
+        return Ok(false);
+    }
+    Ok(!task_store(paths)?
+        .list()
+        .map_err(to_err)?
+        .iter()
+        .any(|task| task_state_is_active(&task.state)))
+}
+
+async fn cleanup_if_idle<T>(
+    paths: &LiosPaths,
+    gate: &Mutex<TaskLifecycleState>,
+    cleanup: impl FnOnce() -> CommandResult<T>,
+) -> CommandResult<Option<T>> {
+    let lifecycle = gate.lock().await;
+    if !cleanup_is_safe(paths, &lifecycle)? {
+        return Ok(None);
+    }
+    cleanup().map(Some)
+}
+
+async fn finish_active_worker(
+    paths: &LiosPaths,
+    gate: &Mutex<TaskLifecycleState>,
+    task_id: Uuid,
+    intended_state: TaskState,
+    error: Option<String>,
+) -> CommandResult<TaskState> {
+    let mut lifecycle = gate.lock().await;
+    let current_state = task_store(paths)?
+        .list()
+        .map_err(to_err)?
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .map(|task| task.state);
+    let final_state = match current_state {
+        Some(TaskState::Canceled) => TaskState::Canceled,
+        Some(TaskState::Paused) => TaskState::Paused,
+        _ => intended_state,
+    };
+    let final_error = if final_state == TaskState::Failed {
+        error
+    } else {
+        None
+    };
+    update_task_phase(paths, task_id, None)?;
+    update_task_state(paths, task_id, final_state.clone(), final_error)?;
+    lifecycle.active_workers.remove(&task_id);
+    if cleanup_is_safe(paths, &lifecycle).unwrap_or(false) {
+        let _ = cleanup_current_staging_cache(paths, true, false);
+    }
+    Ok(final_state)
+}
+
+async fn clear_task_record(
+    paths: &LiosPaths,
+    gate: &Mutex<TaskLifecycleState>,
+    task_id: Uuid,
+) -> CommandResult<()> {
+    let lifecycle = gate.lock().await;
+    if lifecycle.active_workers.contains(&task_id) {
+        return Err(CommandError::invalid_input(
+            "active worker task cannot be cleared",
+        ));
+    }
+    let store = task_store(paths)?;
+    if store.list().map_err(to_err)?.iter().any(|task| {
+        task.id == task_id && matches!(task.state, TaskState::Queued | TaskState::Running)
+    }) {
+        return Err(CommandError::invalid_input("active task cannot be cleared"));
+    }
+    let result = store.delete(task_id).map_err(to_err);
+    drop(lifecycle);
+    result
+}
+
+fn task_state_is_active(state: &TaskState) -> bool {
+    match state {
+        TaskState::Queued | TaskState::Running | TaskState::Paused => true,
+        TaskState::Failed | TaskState::Completed | TaskState::Canceled => false,
+    }
 }
 
 fn desired_catalog_objects(
@@ -422,232 +554,18 @@ async fn sync_current_catalog(
     execute_sync_work(adapter, repo, &work).await
 }
 
-fn selection_from_node_id(node_id: Option<String>) -> CatalogSelection {
-    node_id
-        .and_then(|id| {
-            let trimmed = id.trim().to_string();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-        .map(CatalogSelection::Node)
-        .unwrap_or(CatalogSelection::All)
-}
-
-fn selection_from_node_ids(node_ids: Vec<String>) -> CatalogSelection {
-    let ids = node_ids
-        .into_iter()
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
-        .collect::<Vec<_>>();
-    if ids.is_empty() {
-        CatalogSelection::All
-    } else {
-        CatalogSelection::Nodes(ids)
-    }
-}
-
-fn staged_files(staging: &Path) -> CommandResult<Vec<(PathBuf, LocalStorageObject)>> {
-    let mut files = Vec::new();
-    for entry in walkdir::WalkDir::new(staging) {
-        let entry = entry.map_err(to_err)?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let relative = entry.path().strip_prefix(staging).map_err(to_err)?;
-        let remote = relative.to_string_lossy().replace('\\', "/");
-        files.push((
-            entry.path().to_path_buf(),
-            LocalStorageObject {
-                path: remote,
-                sha256: sha256_hex_file(entry.path())?,
-            },
-        ));
-    }
-    files.sort_by(|a, b| {
-        let a_catalog = a.1.path == "catalog.enc";
-        let b_catalog = b.1.path == "catalog.enc";
-        a_catalog
-            .cmp(&b_catalog)
-            .then_with(|| a.1.path.cmp(&b.1.path))
-    });
-    Ok(files)
-}
-
-async fn run_upload(
-    app: tauri::AppHandle,
-    paths: &LiosPaths,
-    source_path: String,
-    label: String,
-) -> CommandResult<TaskRecord> {
-    let mut task = TaskRecord::queued(label, 0);
-    insert_task(paths, &task)?;
-    update_task_state(paths, task.id, TaskState::Running, None)?;
-    task.state = TaskState::Running;
-    emit_tasks(&app, paths);
-
-    let result = async {
-        let config = load_config(paths)?;
-        let key = key_from_config(&config)?;
-        let (adapter, repo) = adapter_from_config(paths, &config)?;
-        reset_staging(paths)?;
-        update_task_phase(paths, task.id, Some("preparing".to_string()))?;
-        emit_tasks(&app, paths);
-        let preparing_started = Instant::now();
-
-        let outcome = Catalog::pack_with_progress_and_report(
-            PackSource::Path(PathBuf::from(source_path)),
-            &key,
-            PackOptions {
-                chunk_size: config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
-                staging_dir: paths.staging.clone(),
-            },
-            |progress| {
-                task.progress_done = progress.completed_chunks;
-                task.progress_total = progress.total_chunks;
-                let speed_bps = average_speed_bps(progress.completed_bytes, preparing_started);
-                let _ = update_task_transfer(
-                    paths,
-                    task.id,
-                    progress.completed_chunks,
-                    progress.total_chunks,
-                    progress.completed_bytes,
-                    progress.total_bytes,
-                    speed_bps,
-                );
-                emit_tasks(&app, paths);
-            },
-        )
-        .map_err(to_err)?;
-        outcome.into_catalog().map_err(to_err)?;
-
-        let staged = staged_files(&paths.staging)?;
-        let local_objects = staged
-            .iter()
-            .map(|(_, object)| object.clone())
-            .collect::<Vec<_>>();
-        let local_paths = staged
-            .into_iter()
-            .map(|(path, object)| (object.path, path))
-            .collect::<HashMap<_, _>>();
-        let remote_objects = adapter
-            .list_objects(&repo.namespace, &repo.dataset, "")
-            .await
-            .map_err(to_err)?;
-        let sync_plan = plan_current_snapshot_changes(local_objects, remote_objects);
-        let upload_objects = sync_plan.upload;
-        let delete_paths = sync_plan.delete;
-
-        update_task_phase(paths, task.id, Some("uploading".to_string()))?;
-        task.progress_done = 0;
-        task.bytes_done = 0;
-        task.progress_total = (upload_objects.len() + delete_paths.len()) as u64;
-        let upload_total_bytes = upload_objects
-            .iter()
-            .filter_map(|object| local_paths.get(&object.path))
-            .filter_map(|local| std::fs::metadata(local).ok())
-            .map(|metadata| metadata.len())
-            .sum::<u64>();
-        let uploading_started = Instant::now();
-        update_task_transfer(
-            paths,
-            task.id,
-            task.progress_done,
-            task.progress_total,
-            task.bytes_done,
-            upload_total_bytes,
-            0,
-        )?;
-        emit_tasks(&app, paths);
-        for object in upload_objects {
-            if let Some(state) = task_interrupt(paths, task.id)? {
-                return Ok::<Option<TaskState>, String>(Some(state));
-            }
-            let local = local_paths
-                .get(&object.path)
-                .ok_or_else(|| format!("staged object disappeared: {}", object.path))?;
-            adapter
-                .upload_object(&repo.namespace, &repo.dataset, &object.path, local)
-                .await
-                .map_err(to_err)?;
-            task.progress_done += 1;
-            task.bytes_done += std::fs::metadata(local)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            update_task_transfer(
-                paths,
-                task.id,
-                task.progress_done,
-                task.progress_total,
-                task.bytes_done,
-                upload_total_bytes,
-                average_speed_bps(task.bytes_done, uploading_started),
-            )?;
-            emit_tasks(&app, paths);
-        }
-        if !delete_paths.is_empty() {
-            if let Some(state) = task_interrupt(paths, task.id)? {
-                return Ok::<Option<TaskState>, String>(Some(state));
-            }
-            adapter
-                .delete_objects(&repo.namespace, &repo.dataset, &delete_paths)
-                .await
-                .map_err(to_err)?;
-            task.progress_done += delete_paths.len() as u64;
-            update_task_transfer(
-                paths,
-                task.id,
-                task.progress_done,
-                task.progress_total,
-                task.bytes_done,
-                upload_total_bytes,
-                average_speed_bps(task.bytes_done, uploading_started),
-            )?;
-            emit_tasks(&app, paths);
-        }
-        Ok::<Option<TaskState>, String>(None)
-    }
-    .await;
-
-    match result {
-        Ok(None) => {
-            task.state = TaskState::Completed;
-            task.error = None;
-            update_task_phase(paths, task.id, None)?;
-            update_task_state(paths, task.id, TaskState::Completed, None)?;
-            cleanup_after_task(paths);
-            emit_tasks(&app, paths);
-            Ok(task)
-        }
-        Ok(Some(interrupt_state)) => {
-            task.state = interrupt_state.clone();
-            update_task_phase(paths, task.id, None)?;
-            update_task_state(paths, task.id, interrupt_state, None)?;
-            cleanup_after_task(paths);
-            emit_tasks(&app, paths);
-            Ok(task)
-        }
-        Err(error) => {
-            task.state = TaskState::Failed;
-            task.error = Some(error.clone());
-            update_task_phase(paths, task.id, None)?;
-            update_task_state(paths, task.id, TaskState::Failed, Some(error.clone()))?;
-            cleanup_after_task(paths);
-            emit_tasks(&app, paths);
-            Err(error)
-        }
-    }
-}
-
 #[tauri::command]
 fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnapshot> {
     state.paths.ensure_dirs().map_err(to_err)?;
     let mut config = load_config(&state.paths)?;
-    ensure_default_key_configured(&state.paths, &mut config).map_err(to_err)?;
+    let warning = prepare_startup_config(&state.paths, &mut config)?;
     let tasks = task_store(&state.paths)?.list().map_err(to_err)?;
     Ok(SetupSnapshot {
         paths: paths_dto(&state.paths),
         config,
         has_token: state.paths.credentials.exists(),
         tasks,
+        warning,
     })
 }
 
@@ -665,19 +583,20 @@ async fn create_dataset_repo(
     endpoint: String,
 ) -> CommandResult<()> {
     state.paths.ensure_dirs().map_err(to_err)?;
-    let token = read_token(&state.paths)?;
-    let adapter = ModelScopeAdapter::new(endpoint.clone(), token);
-    adapter
-        .create_repo(&namespace, &dataset)
-        .await
-        .map_err(to_err)?;
-    let mut config = load_config(&state.paths)?;
-    config.active_repo = Some(RepoConfig {
+    let repo = validate_repo(RepoConfig {
         namespace,
         dataset,
         endpoint,
-    });
-    save_config(&state.paths, &config)
+    })?;
+    let token = read_token(&state.paths)?;
+    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
+    adapter
+        .create_repo(&repo.namespace, &repo.dataset)
+        .await
+        .map_err(to_err)?;
+    let mut config = load_config(&state.paths)?;
+    config.active_repo = Some(repo);
+    persist_config(&state.paths, &mut config)
 }
 
 #[tauri::command]
@@ -688,22 +607,25 @@ async fn connect_dataset_repo(
     endpoint: String,
 ) -> CommandResult<()> {
     state.paths.ensure_dirs().map_err(to_err)?;
-    let token = read_token(&state.paths)?;
-    let adapter = ModelScopeAdapter::new(endpoint.clone(), token);
-    if !adapter
-        .repo_exists(&namespace, &dataset)
-        .await
-        .map_err(to_err)?
-    {
-        return Err("dataset repo was not found or is not visible".to_string());
-    }
-    let mut config = load_config(&state.paths)?;
-    config.active_repo = Some(RepoConfig {
+    let repo = validate_repo(RepoConfig {
         namespace,
         dataset,
         endpoint,
-    });
-    save_config(&state.paths, &config)
+    })?;
+    let token = read_token(&state.paths)?;
+    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
+    if !adapter
+        .repo_exists(&repo.namespace, &repo.dataset)
+        .await
+        .map_err(to_err)?
+    {
+        return Err(CommandError::invalid_input(
+            "dataset repo was not found or is not visible",
+        ));
+    }
+    let mut config = load_config(&state.paths)?;
+    config.active_repo = Some(repo);
+    persist_config(&state.paths, &mut config)
 }
 
 #[tauri::command]
@@ -713,7 +635,7 @@ async fn list_dataset_repos(
 ) -> CommandResult<DatasetRepoListResult> {
     state.paths.ensure_dirs().map_err(to_err)?;
     let config = load_config(&state.paths)?;
-    let endpoint = configured_endpoint(&config, endpoint);
+    let endpoint = configured_endpoint(&config, endpoint)?;
     let token = read_token(&state.paths)?;
     let adapter = ModelScopeAdapter::new(endpoint, token);
     let user = adapter.whoami().await.map_err(to_err)?;
@@ -726,17 +648,10 @@ async fn list_dataset_repos(
 
 #[tauri::command]
 fn select_dataset_repo(state: tauri::State<'_, AppContext>, repo: RepoConfig) -> CommandResult<()> {
-    if repo.namespace.trim().is_empty() || repo.dataset.trim().is_empty() {
-        return Err("dataset repo is incomplete".to_string());
-    }
+    let repo = validate_repo(repo)?;
     let mut config = load_config(&state.paths)?;
-    let endpoint = configured_endpoint(&config, Some(repo.endpoint));
-    config.active_repo = Some(RepoConfig {
-        namespace: repo.namespace.trim().to_string(),
-        dataset: repo.dataset.trim().to_string(),
-        endpoint,
-    });
-    save_config(&state.paths, &config)
+    config.active_repo = Some(repo);
+    persist_config(&state.paths, &mut config)
 }
 
 #[tauri::command]
@@ -745,24 +660,29 @@ async fn initialize_space(
     space: RepoConfig,
 ) -> CommandResult<CatalogLoadResult> {
     state.paths.ensure_dirs().map_err(to_err)?;
+    let repo = validate_repo(space)?;
     let token = read_token(&state.paths)?;
-    let adapter = ModelScopeAdapter::new(space.endpoint.clone(), token);
+    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
     if !adapter
-        .repo_exists(&space.namespace, &space.dataset)
+        .repo_exists(&repo.namespace, &repo.dataset)
         .await
         .map_err(to_err)?
     {
-        return Err("space was not found or is not visible".to_string());
+        return Err(CommandError::invalid_input(
+            "space was not found or is not visible",
+        ));
     }
+    let _initialization_guard = state.initialization_gate.lock().await;
+    ensure_space_can_initialize(
+        &adapter,
+        &repo.namespace,
+        &repo.dataset,
+        &state.paths.staging,
+    )
+    .await?;
     let mut config = load_config(&state.paths)?;
-    let endpoint = configured_endpoint(&config, Some(space.endpoint));
-    let repo = RepoConfig {
-        namespace: space.namespace.trim().to_string(),
-        dataset: space.dataset.trim().to_string(),
-        endpoint,
-    };
     config.active_repo = Some(repo.clone());
-    save_config(&state.paths, &config)?;
+    persist_config(&state.paths, &mut config)?;
     let key = key_from_config(&config)?;
     reset_staging(&state.paths)?;
     let catalog = Catalog::initialize_empty(&repo.dataset, &key, state.paths.staging.clone())
@@ -785,30 +705,27 @@ async fn load_space_catalog(
     space: RepoConfig,
 ) -> CommandResult<CatalogLoadResult> {
     state.paths.ensure_dirs().map_err(to_err)?;
+    let repo = validate_repo(space)?;
     let token = read_token(&state.paths)?;
-    let adapter = ModelScopeAdapter::new(space.endpoint.clone(), token);
+    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
     if !adapter
-        .repo_exists(&space.namespace, &space.dataset)
+        .repo_exists(&repo.namespace, &repo.dataset)
         .await
         .map_err(to_err)?
     {
-        return Err("space was not found or is not visible".to_string());
+        return Err(CommandError::invalid_input(
+            "space was not found or is not visible",
+        ));
     }
     let mut config = load_config(&state.paths)?;
-    let endpoint = configured_endpoint(&config, Some(space.endpoint));
-    let repo = RepoConfig {
-        namespace: space.namespace.trim().to_string(),
-        dataset: space.dataset.trim().to_string(),
-        endpoint,
-    };
     config.active_repo = Some(repo.clone());
-    save_config(&state.paths, &config)?;
+    persist_config(&state.paths, &mut config)?;
     let key = key_from_config(&config)?;
     let local_path = state.paths.staging.join(CATALOG_FILE);
     adapter
         .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
         .await
-        .map_err(|error| format!("space is not initialized: {error}"))?;
+        .map_err(map_catalog_load_error)?;
     let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
     let catalog = Catalog::from_staging(state.paths.staging.clone());
     let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
@@ -922,10 +839,7 @@ fn generate_key_file(
     let path = path
         .map(PathBuf::from)
         .unwrap_or_else(|| state.paths.home.join("recovery.key"));
-    KeyFile::generate_to_path(&path).map_err(to_err)?;
-    let mut config = load_config(&state.paths)?;
-    config.key_file_path = Some(path.clone());
-    save_config(&state.paths, &config)?;
+    let path = generate_key_file_and_bind(&state.paths, path)?;
     Ok(path.display().to_string())
 }
 
@@ -934,40 +848,9 @@ fn import_key_file(state: tauri::State<'_, AppContext>, path: String) -> Command
     let path = PathBuf::from(path);
     KeyFile::load_from_path(&path).map_err(to_err)?;
     let mut config = load_config(&state.paths)?;
+    prepare_config_for_write(&state.paths, &mut config)?;
     config.key_file_path = Some(path);
-    save_config(&state.paths, &config)
-}
-
-#[tauri::command]
-async fn load_remote_catalog(
-    state: tauri::State<'_, AppContext>,
-) -> CommandResult<CatalogLoadResult> {
-    state.paths.ensure_dirs().map_err(to_err)?;
-    let config = load_config(&state.paths)?;
-    let key = key_from_config(&config)?;
-    let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let local_path = state.paths.staging.join(CATALOG_FILE);
-    adapter
-        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
-        .await
-        .map_err(to_err)?;
-    let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
-    let catalog = Catalog::from_staging(state.paths.staging.clone());
-    let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
-    Ok(CatalogLoadResult {
-        local_path: local_path.display().to_string(),
-        bytes,
-        tree,
-    })
-}
-
-#[tauri::command]
-async fn enqueue_upload(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppContext>,
-    path: String,
-) -> CommandResult<TaskRecord> {
-    run_upload(app, &state.paths, path, "upload".to_string()).await
+    persist_config(&state.paths, &mut config)
 }
 
 #[tauri::command]
@@ -979,12 +862,14 @@ async fn enqueue_upload_to_folder(
     conflict_resolutions: Vec<ConflictResolution>,
 ) -> CommandResult<TaskRecord> {
     if paths.is_empty() {
-        return Err("upload paths cannot be empty".to_string());
+        return Err(CommandError::invalid_input("upload paths cannot be empty"));
     }
-    let mut task = TaskRecord::queued("upload", 0);
-    insert_task(&state.paths, &task)?;
-    update_task_state(&state.paths, task.id, TaskState::Running, None)?;
-    task.state = TaskState::Running;
+    let mut task = activate_new_task(
+        &state.paths,
+        &state.task_lifecycle_gate,
+        TaskRecord::queued("upload", 0),
+    )
+    .await?;
     emit_tasks(&app, &state.paths);
     let result = async {
         let config = load_config(&state.paths)?;
@@ -1052,7 +937,7 @@ async fn enqueue_upload_to_folder(
         emit_tasks(&app, &state.paths);
         for object in &work.upload {
             if let Some(state) = task_interrupt(&state.paths, task.id)? {
-                return Ok::<Option<TaskState>, String>(Some(state));
+                return Ok::<Option<TaskState>, CommandError>(Some(state));
             }
             adapter
                 .upload_object(
@@ -1080,7 +965,7 @@ async fn enqueue_upload_to_folder(
         }
         if !work.delete.is_empty() {
             if let Some(state) = task_interrupt(&state.paths, task.id)? {
-                return Ok::<Option<TaskState>, String>(Some(state));
+                return Ok::<Option<TaskState>, CommandError>(Some(state));
             }
             adapter
                 .delete_objects(&repo.namespace, &repo.dataset, &work.delete)
@@ -1098,92 +983,51 @@ async fn enqueue_upload_to_folder(
             )?;
             emit_tasks(&app, &state.paths);
         }
-        Ok::<Option<TaskState>, String>(None)
+        Ok::<Option<TaskState>, CommandError>(None)
     }
     .await;
     match result {
         Ok(None) => {
-            task.state = TaskState::Completed;
-            update_task_phase(&state.paths, task.id, None)?;
-            update_task_state(&state.paths, task.id, TaskState::Completed, None)?;
-            cleanup_after_task(&state.paths);
+            task.state = finish_active_worker(
+                &state.paths,
+                &state.task_lifecycle_gate,
+                task.id,
+                TaskState::Completed,
+                None,
+            )
+            .await?;
+            task.error = None;
             emit_tasks(&app, &state.paths);
             Ok(task)
         }
         Ok(Some(interrupt_state)) => {
-            task.state = interrupt_state.clone();
-            update_task_phase(&state.paths, task.id, None)?;
-            update_task_state(&state.paths, task.id, interrupt_state, None)?;
-            cleanup_after_task(&state.paths);
+            task.state = finish_active_worker(
+                &state.paths,
+                &state.task_lifecycle_gate,
+                task.id,
+                interrupt_state,
+                None,
+            )
+            .await?;
+            task.error = None;
             emit_tasks(&app, &state.paths);
             Ok(task)
         }
         Err(error) => {
-            task.state = TaskState::Failed;
-            task.error = Some(error.clone());
-            update_task_phase(&state.paths, task.id, None)?;
-            update_task_state(
+            task.state = finish_active_worker(
                 &state.paths,
+                &state.task_lifecycle_gate,
                 task.id,
                 TaskState::Failed,
-                Some(error.clone()),
-            )?;
-            cleanup_after_task(&state.paths);
+                Some(error.message.clone()),
+            )
+            .await?;
+            task.error = if task.state == TaskState::Failed {
+                Some(error.message.clone())
+            } else {
+                None
+            };
             emit_tasks(&app, &state.paths);
-            Err(error)
-        }
-    }
-}
-
-#[tauri::command]
-async fn enqueue_replace(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppContext>,
-    path: String,
-) -> CommandResult<TaskRecord> {
-    run_upload(app, &state.paths, path, "replace".to_string()).await
-}
-
-#[tauri::command]
-async fn enqueue_delete(
-    state: tauri::State<'_, AppContext>,
-    prefix: String,
-) -> CommandResult<TaskRecord> {
-    if prefix.trim().is_empty() {
-        return Err("delete prefix cannot be empty".to_string());
-    }
-    let mut task = TaskRecord::queued(format!("delete {prefix}"), 1);
-    insert_task(&state.paths, &task)?;
-    update_task_state(&state.paths, task.id, TaskState::Running, None)?;
-    let result = async {
-        let config = load_config(&state.paths)?;
-        let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-        adapter
-            .delete_prefix(&repo.namespace, &repo.dataset, &prefix)
-            .await
-            .map_err(to_err)?;
-        Ok::<(), String>(())
-    }
-    .await;
-    match result {
-        Ok(()) => {
-            task.state = TaskState::Completed;
-            task.progress_done = 1;
-            update_task_progress(&state.paths, task.id, 1, 1)?;
-            update_task_state(&state.paths, task.id, TaskState::Completed, None)?;
-            cleanup_after_task(&state.paths);
-            Ok(task)
-        }
-        Err(error) => {
-            task.state = TaskState::Failed;
-            task.error = Some(error.clone());
-            update_task_state(
-                &state.paths,
-                task.id,
-                TaskState::Failed,
-                Some(error.clone()),
-            )?;
-            cleanup_after_task(&state.paths);
             Err(error)
         }
     }
@@ -1195,12 +1039,16 @@ async fn enqueue_delete_nodes(
     node_ids: Vec<String>,
 ) -> CommandResult<TaskRecord> {
     if node_ids.is_empty() {
-        return Err("delete selection cannot be empty".to_string());
+        return Err(CommandError::invalid_input(
+            "delete selection cannot be empty",
+        ));
     }
-    let mut task = TaskRecord::queued("delete", 0);
-    insert_task(&state.paths, &task)?;
-    update_task_state(&state.paths, task.id, TaskState::Running, None)?;
-    task.state = TaskState::Running;
+    let mut task = activate_new_task(
+        &state.paths,
+        &state.task_lifecycle_gate,
+        TaskRecord::queued("delete", 0),
+    )
+    .await?;
     let result = async {
         let config = load_config(&state.paths)?;
         let key = key_from_config(&config)?;
@@ -1251,133 +1099,36 @@ async fn enqueue_delete_nodes(
                 task.progress_total,
             )?;
         }
-        Ok::<(), String>(())
+        Ok::<(), CommandError>(())
     }
     .await;
     match result {
         Ok(()) => {
-            task.state = TaskState::Completed;
-            update_task_state(&state.paths, task.id, TaskState::Completed, None)?;
-            cleanup_after_task(&state.paths);
-            Ok(task)
-        }
-        Err(error) => {
-            task.state = TaskState::Failed;
-            task.error = Some(error.clone());
-            update_task_state(
+            task.state = finish_active_worker(
                 &state.paths,
+                &state.task_lifecycle_gate,
                 task.id,
-                TaskState::Failed,
-                Some(error.clone()),
-            )?;
-            cleanup_after_task(&state.paths);
-            Err(error)
-        }
-    }
-}
-
-#[tauri::command]
-async fn enqueue_restore(
-    state: tauri::State<'_, AppContext>,
-    output_dir: String,
-    node_id: Option<String>,
-) -> CommandResult<TaskRecord> {
-    let mut task = TaskRecord::queued("restore", 1);
-    insert_task(&state.paths, &task)?;
-    update_task_state(&state.paths, task.id, TaskState::Running, None)?;
-    task.state = TaskState::Running;
-    let result = async {
-        let config = load_config(&state.paths)?;
-        let key = key_from_config(&config)?;
-        let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-        let catalog_path = state.paths.staging.join(CATALOG_FILE);
-        adapter
-            .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
-            .await
-            .map_err(to_err)?;
-        let catalog = Catalog::from_staging(state.paths.staging.clone());
-        let selection = selection_from_node_id(node_id);
-        let remote_files = catalog
-            .remote_files_for_selection(&selection, &key)
-            .map_err(to_err)?;
-        task.progress_total = remote_files.len() as u64 + 1;
-        update_task_progress(
-            &state.paths,
-            task.id,
-            task.progress_done,
-            task.progress_total,
-        )?;
-        for (index, file) in remote_files.iter().enumerate() {
-            if let Some(state) = task_interrupt(&state.paths, task.id)? {
-                return Ok::<Option<TaskState>, String>(Some(state));
-            }
-            let local_path = remote_to_staging_path(&state.paths.staging, &file.path)?;
-            if !local_remote_file_is_valid(&local_path, file)? {
-                adapter
-                    .download_object(&repo.namespace, &repo.dataset, &file.path, &local_path)
-                    .await
-                    .map_err(to_err)?;
-            }
-            if !local_remote_file_is_valid(&local_path, file)? {
-                return Err(format!(
-                    "downloaded object failed hash verification: {}",
-                    file.path
-                ));
-            }
-            task.progress_done = (index + 1) as u64;
-            update_task_progress(
-                &state.paths,
-                task.id,
-                task.progress_done,
-                task.progress_total,
-            )?;
-        }
-        if let Some(state) = task_interrupt(&state.paths, task.id)? {
-            return Ok::<Option<TaskState>, String>(Some(state));
-        }
-        catalog
-            .restore(
-                selection,
-                &key,
-                RestoreOptions {
-                    output_dir: PathBuf::from(output_dir),
-                    conflict_policy: RestoreConflictPolicy::Rename,
-                },
+                TaskState::Completed,
+                None,
             )
-            .map_err(to_err)?;
-        task.progress_done = task.progress_total;
-        update_task_progress(
-            &state.paths,
-            task.id,
-            task.progress_done,
-            task.progress_total,
-        )?;
-        Ok::<Option<TaskState>, String>(None)
-    }
-    .await;
-    match result {
-        Ok(None) => {
-            task.state = TaskState::Completed;
-            update_task_state(&state.paths, task.id, TaskState::Completed, None)?;
-            cleanup_after_task(&state.paths);
-            Ok(task)
-        }
-        Ok(Some(interrupt_state)) => {
-            task.state = interrupt_state.clone();
-            update_task_state(&state.paths, task.id, interrupt_state, None)?;
-            cleanup_after_task(&state.paths);
+            .await?;
+            task.error = None;
             Ok(task)
         }
         Err(error) => {
-            task.state = TaskState::Failed;
-            task.error = Some(error.clone());
-            update_task_state(
+            task.state = finish_active_worker(
                 &state.paths,
+                &state.task_lifecycle_gate,
                 task.id,
                 TaskState::Failed,
-                Some(error.clone()),
-            )?;
-            cleanup_after_task(&state.paths);
+                Some(error.message.clone()),
+            )
+            .await?;
+            task.error = if task.state == TaskState::Failed {
+                Some(error.message.clone())
+            } else {
+                None
+            };
             Err(error)
         }
     }
@@ -1390,10 +1141,11 @@ async fn enqueue_download(
     node_ids: Vec<String>,
     output_dir: String,
 ) -> CommandResult<TaskRecord> {
-    let mut task = TaskRecord::queued("download", 1);
-    insert_task(&state.paths, &task)?;
-    update_task_state(&state.paths, task.id, TaskState::Running, None)?;
-    task.state = TaskState::Running;
+    let prepared = prepare_download_task(node_ids, output_dir)?;
+    let mut task =
+        activate_new_task(&state.paths, &state.task_lifecycle_gate, prepared.task).await?;
+    let selection = prepared.selection;
+    let output_dir = prepared.output_dir;
     emit_tasks(&app, &state.paths);
     let result = async {
         let config = load_config(&state.paths)?;
@@ -1405,7 +1157,6 @@ async fn enqueue_download(
             .await
             .map_err(to_err)?;
         let catalog = Catalog::from_staging(state.paths.staging.clone());
-        let selection = selection_from_node_ids(node_ids);
         let remote_files = catalog
             .remote_files_for_selection(&selection, &key)
             .map_err(to_err)?;
@@ -1444,7 +1195,7 @@ async fn enqueue_download(
         emit_tasks(&app, &state.paths);
         for (index, (file, local_path, was_cached)) in download_plan.iter().enumerate() {
             if let Some(state) = task_interrupt(&state.paths, task.id)? {
-                return Ok::<Option<TaskState>, String>(Some(state));
+                return Ok::<Option<TaskState>, CommandError>(Some(state));
             }
             if !was_cached {
                 let completed_before_object = task.bytes_done;
@@ -1472,9 +1223,11 @@ async fn enqueue_download(
                     .map_err(to_err)?;
             }
             if !local_remote_file_is_valid(local_path, file)? {
-                return Err(format!(
-                    "downloaded object failed hash verification: {}",
-                    file.path
+                return Err(CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    format!("downloaded object failed hash verification: {}", file.path),
+                    false,
+                    Some(serde_json::json!({ "path": file.path })),
                 ));
             }
             task.progress_done = (index + 1) as u64;
@@ -1495,7 +1248,7 @@ async fn enqueue_download(
             emit_tasks(&app, &state.paths);
         }
         if let Some(state) = task_interrupt(&state.paths, task.id)? {
-            return Ok::<Option<TaskState>, String>(Some(state));
+            return Ok::<Option<TaskState>, CommandError>(Some(state));
         }
         update_task_phase(&state.paths, task.id, Some("restoring".to_string()))?;
         emit_tasks(&app, &state.paths);
@@ -1504,7 +1257,7 @@ async fn enqueue_download(
                 selection,
                 &key,
                 RestoreOptions {
-                    output_dir: PathBuf::from(output_dir),
+                    output_dir,
                     conflict_policy: RestoreConflictPolicy::Rename,
                 },
             )
@@ -1520,37 +1273,50 @@ async fn enqueue_download(
             average_speed_bps(task.bytes_done, downloading_started),
         )?;
         emit_tasks(&app, &state.paths);
-        Ok::<Option<TaskState>, String>(None)
+        Ok::<Option<TaskState>, CommandError>(None)
     }
     .await;
     match result {
         Ok(None) => {
-            task.state = TaskState::Completed;
-            update_task_phase(&state.paths, task.id, None)?;
-            update_task_state(&state.paths, task.id, TaskState::Completed, None)?;
-            cleanup_after_task(&state.paths);
+            task.state = finish_active_worker(
+                &state.paths,
+                &state.task_lifecycle_gate,
+                task.id,
+                TaskState::Completed,
+                None,
+            )
+            .await?;
+            task.error = None;
             emit_tasks(&app, &state.paths);
             Ok(task)
         }
         Ok(Some(interrupt_state)) => {
-            task.state = interrupt_state.clone();
-            update_task_phase(&state.paths, task.id, None)?;
-            update_task_state(&state.paths, task.id, interrupt_state, None)?;
-            cleanup_after_task(&state.paths);
+            task.state = finish_active_worker(
+                &state.paths,
+                &state.task_lifecycle_gate,
+                task.id,
+                interrupt_state,
+                None,
+            )
+            .await?;
+            task.error = None;
             emit_tasks(&app, &state.paths);
             Ok(task)
         }
         Err(error) => {
-            task.state = TaskState::Failed;
-            task.error = Some(error.clone());
-            update_task_phase(&state.paths, task.id, None)?;
-            update_task_state(
+            task.state = finish_active_worker(
                 &state.paths,
+                &state.task_lifecycle_gate,
                 task.id,
                 TaskState::Failed,
-                Some(error.clone()),
-            )?;
-            cleanup_after_task(&state.paths);
+                Some(error.message.clone()),
+            )
+            .await?;
+            task.error = if task.state == TaskState::Failed {
+                Some(error.message.clone())
+            } else {
+                None
+            };
             emit_tasks(&app, &state.paths);
             Err(error)
         }
@@ -1563,120 +1329,393 @@ fn list_tasks(state: tauri::State<'_, AppContext>) -> CommandResult<Vec<TaskReco
 }
 
 #[tauri::command]
-fn cleanup_local_cache(state: tauri::State<'_, AppContext>) -> CommandResult<CacheCleanupReport> {
-    if task_store(&state.paths)?
-        .list()
-        .map_err(to_err)?
-        .iter()
-        .any(|task| {
-            matches!(
-                task.state,
-                TaskState::Queued | TaskState::Running | TaskState::Paused
-            )
-        })
+async fn cleanup_local_cache(
+    state: tauri::State<'_, AppContext>,
+) -> CommandResult<CacheCleanupReport> {
+    match cleanup_if_idle(&state.paths, &state.task_lifecycle_gate, || {
+        cleanup_current_staging_cache(&state.paths, true, false)
+    })
+    .await?
     {
-        return Err("active tasks must finish before cleaning local cache".to_string());
+        Some(report) => Ok(report),
+        None => Err(CommandError::invalid_input(
+            "active tasks must finish before cleaning local cache",
+        )),
     }
-    cleanup_current_staging_cache(&state.paths, true, false)
 }
 
 #[tauri::command]
-fn pause_task(
+async fn pause_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<Vec<TaskRecord>> {
+    set_task_state(
+        &state.paths,
+        &state.task_lifecycle_gate,
+        task_id,
+        TaskState::Paused,
+        None,
+    )
+    .await?;
     let store = task_store(&state.paths)?;
-    store
-        .update_state(task_id, TaskState::Paused, None)
-        .map_err(to_err)?;
     emit_tasks(&app, &state.paths);
     store.list().map_err(to_err)
 }
 
 #[tauri::command]
-fn resume_task(
+async fn resume_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<Vec<TaskRecord>> {
+    activate_existing_task(
+        &state.paths,
+        &state.task_lifecycle_gate,
+        task_id,
+        TaskState::Queued,
+    )
+    .await?;
     let store = task_store(&state.paths)?;
-    store
-        .update_state(task_id, TaskState::Queued, None)
-        .map_err(to_err)?;
     emit_tasks(&app, &state.paths);
     store.list().map_err(to_err)
 }
 
 #[tauri::command]
-fn cancel_task(
+async fn cancel_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<Vec<TaskRecord>> {
+    set_task_state(
+        &state.paths,
+        &state.task_lifecycle_gate,
+        task_id,
+        TaskState::Canceled,
+        None,
+    )
+    .await?;
     let store = task_store(&state.paths)?;
-    store
-        .update_state(task_id, TaskState::Canceled, None)
-        .map_err(to_err)?;
     emit_tasks(&app, &state.paths);
     store.list().map_err(to_err)
 }
 
 #[tauri::command]
-fn clear_task(
+async fn clear_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<Vec<TaskRecord>> {
+    clear_task_record(&state.paths, &state.task_lifecycle_gate, task_id).await?;
     let store = task_store(&state.paths)?;
-    if store
-        .list()
-        .map_err(to_err)?
-        .iter()
-        .any(|task| task.id == task_id && task.state == TaskState::Running)
-    {
-        return Err("running task cannot be cleared".to_string());
-    }
-    store.delete(task_id).map_err(to_err)?;
     emit_tasks(&app, &state.paths);
     store.list().map_err(to_err)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
+    macro_rules! generate_tauri_handler {
+        ($($command:ident),* $(,)?) => {
+            tauri::generate_handler![$($command),*]
+        };
+    }
+
+    let builder = tauri::Builder::default();
+    #[cfg(not(test))]
+    let builder = builder.plugin(tauri_plugin_dialog::init());
+    builder
         .manage(AppContext::new())
-        .invoke_handler(tauri::generate_handler![
-            current_setup,
-            setup_token,
-            create_dataset_repo,
-            connect_dataset_repo,
-            list_dataset_repos,
-            select_dataset_repo,
-            initialize_space,
-            load_space_catalog,
-            preview_upload_conflicts,
-            enqueue_upload_to_folder,
-            enqueue_download,
-            enqueue_delete_nodes,
-            rename_node,
-            create_folder,
-            search_catalog,
-            generate_key_file,
-            import_key_file,
-            load_remote_catalog,
-            enqueue_upload,
-            enqueue_replace,
-            enqueue_delete,
-            enqueue_restore,
-            list_tasks,
-            cleanup_local_cache,
-            pause_task,
-            resume_task,
-            cancel_task,
-            clear_task
-        ])
+        .invoke_handler(with_registered_commands!(generate_tauri_handler))
         .run(tauri::generate_context!())
         .expect("failed to run Lios desktop app");
+}
+
+#[cfg(test)]
+mod task_cleanup_tests {
+    use std::{fs, sync::Arc, time::Duration};
+
+    use lios_core::config::LiosPaths;
+    use lios_core::tasks::{TaskRecord, TaskState, TaskStore};
+    use tempfile::tempdir;
+    use tokio::sync::{oneshot, Mutex};
+
+    use super::{
+        activate_existing_task, activate_new_task, cleanup_current_staging_cache, cleanup_if_idle,
+        clear_task_record, finish_active_worker, set_task_state, CommandErrorCode,
+        TaskLifecycleState,
+    };
+
+    #[tokio::test]
+    async fn active_task_staging_survives_another_task_finishing() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let staged = paths.staging.join("other-task.download");
+        fs::write(&staged, b"still active").unwrap();
+        let store = TaskStore::open(&paths.database).unwrap();
+        let active = TaskRecord::queued("active", 1);
+        store.insert(&active).unwrap();
+        store
+            .update_state(active.id, TaskState::Running, None)
+            .unwrap();
+        let completed = TaskRecord::queued("completed", 1);
+        store.insert(&completed).unwrap();
+        store
+            .update_state(completed.id, TaskState::Completed, None)
+            .unwrap();
+
+        let gate = Mutex::new(TaskLifecycleState::default());
+        let skipped = cleanup_if_idle(&paths, &gate, || {
+            cleanup_current_staging_cache(&paths, true, false)
+        })
+        .await
+        .unwrap();
+
+        assert!(skipped.is_none());
+        assert!(staged.exists());
+    }
+
+    #[tokio::test]
+    async fn task_end_cleanup_runs_after_all_tasks_are_inactive() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let staged = paths.staging.join("finished.download");
+        fs::write(&staged, b"finished").unwrap();
+        let store = TaskStore::open(&paths.database).unwrap();
+        let completed = TaskRecord::queued("completed", 1);
+        store.insert(&completed).unwrap();
+        store
+            .update_state(completed.id, TaskState::Completed, None)
+            .unwrap();
+
+        let gate = Mutex::new(TaskLifecycleState::default());
+        let cleaned = cleanup_if_idle(&paths, &gate, || {
+            cleanup_current_staging_cache(&paths, true, false)
+        })
+        .await
+        .unwrap();
+
+        assert!(cleaned.is_some());
+        assert!(!staged.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_cannot_enter_between_cleanup_check_and_deletion() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let stale_staged = paths.staging.join("stale.download");
+        let active_staged = paths.staging.join("active.download");
+        fs::write(&stale_staged, b"stale").unwrap();
+
+        let gate = Arc::new(Mutex::new(TaskLifecycleState::default()));
+        let cleanup_paths = paths.clone();
+        let deletion_paths = cleanup_paths.clone();
+        let cleanup_gate = Arc::clone(&gate);
+        let (checked_tx, checked_rx) = oneshot::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let cleanup = tokio::spawn(async move {
+            cleanup_if_idle(&cleanup_paths, cleanup_gate.as_ref(), move || {
+                checked_tx.send(()).unwrap();
+                continue_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                cleanup_current_staging_cache(&deletion_paths, true, false)
+            })
+            .await
+        });
+        checked_rx.await.unwrap();
+
+        let activation_paths = paths.clone();
+        let activation_gate = Arc::clone(&gate);
+        let activation_staged = active_staged.clone();
+        let (attempted_tx, attempted_rx) = oneshot::channel();
+        let activation = tokio::spawn(async move {
+            attempted_tx.send(()).unwrap();
+            let task = activate_new_task(
+                &activation_paths,
+                activation_gate.as_ref(),
+                TaskRecord::queued("active", 1),
+            )
+            .await
+            .unwrap();
+            fs::write(&activation_staged, b"active").unwrap();
+            task
+        });
+        attempted_rx.await.unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(!activation.is_finished());
+        assert!(TaskStore::open(&paths.database)
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty());
+
+        continue_tx.send(()).unwrap();
+        assert!(cleanup.await.unwrap().unwrap().is_some());
+        let activated = activation.await.unwrap();
+        assert_eq!(activated.state, TaskState::Running);
+        assert!(!stale_staged.exists());
+        assert!(active_staged.exists());
+
+        let skipped = cleanup_if_idle(&paths, gate.as_ref(), || {
+            cleanup_current_staging_cache(&paths, true, false)
+        })
+        .await
+        .unwrap();
+        assert!(skipped.is_none());
+        assert!(active_staged.exists());
+    }
+
+    #[tokio::test]
+    async fn existing_task_reactivation_waits_for_lifecycle_gate() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let store = TaskStore::open(&paths.database).unwrap();
+        let paused = TaskRecord::queued("paused", 1);
+        store.insert(&paused).unwrap();
+        store
+            .update_state(paused.id, TaskState::Paused, None)
+            .unwrap();
+
+        let gate = Arc::new(Mutex::new(TaskLifecycleState::default()));
+        let guard = gate.lock().await;
+        let activation_paths = paths.clone();
+        let activation_gate = Arc::clone(&gate);
+        let task_id = paused.id;
+        let activation = tokio::spawn(async move {
+            activate_existing_task(
+                &activation_paths,
+                activation_gate.as_ref(),
+                task_id,
+                TaskState::Queued,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        let state_while_locked = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == paused.id)
+            .unwrap()
+            .state;
+        assert_eq!(state_while_locked, TaskState::Paused);
+
+        drop(guard);
+        activation.await.unwrap().unwrap();
+        let state_after_release = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == paused.id)
+            .unwrap()
+            .state;
+        assert_eq!(state_after_release, TaskState::Queued);
+    }
+
+    #[tokio::test]
+    async fn canceled_worker_blocks_cleanup_until_exit_is_acknowledged() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let staged = paths.staging.join("blocked-transfer.download");
+        fs::write(&staged, b"worker still owns this").unwrap();
+        let lifecycle = Mutex::new(TaskLifecycleState::default());
+
+        let task = activate_new_task(&paths, &lifecycle, TaskRecord::queued("blocked delete", 1))
+            .await
+            .unwrap();
+        set_task_state(&paths, &lifecycle, task.id, TaskState::Canceled, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            TaskStore::open(&paths.database)
+                .unwrap()
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.id == task.id)
+                .unwrap()
+                .state,
+            TaskState::Canceled
+        );
+        assert!(lifecycle.lock().await.active_workers.contains(&task.id));
+
+        let skipped = cleanup_if_idle(&paths, &lifecycle, || {
+            cleanup_current_staging_cache(&paths, true, false)
+        })
+        .await
+        .unwrap();
+        assert!(skipped.is_none());
+        assert!(staged.exists());
+
+        let final_state =
+            finish_active_worker(&paths, &lifecycle, task.id, TaskState::Completed, None)
+                .await
+                .unwrap();
+
+        assert_eq!(final_state, TaskState::Canceled);
+        assert!(!lifecycle.lock().await.active_workers.contains(&task.id));
+        assert!(!staged.exists());
+        assert_eq!(
+            TaskStore::open(&paths.database)
+                .unwrap()
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.id == task.id)
+                .unwrap()
+                .state,
+            TaskState::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_rejects_registered_canceled_and_paused_workers_until_exit() {
+        for controlled_state in [TaskState::Canceled, TaskState::Paused] {
+            let temp = tempdir().unwrap();
+            let paths = LiosPaths::from_home(temp.path());
+            let lifecycle = Mutex::new(TaskLifecycleState::default());
+            let task = activate_new_task(
+                &paths,
+                &lifecycle,
+                TaskRecord::queued("controlled worker", 1),
+            )
+            .await
+            .unwrap();
+            set_task_state(&paths, &lifecycle, task.id, controlled_state.clone(), None)
+                .await
+                .unwrap();
+
+            let error = clear_task_record(&paths, &lifecycle, task.id)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, CommandErrorCode::InvalidInput);
+            assert!(TaskStore::open(&paths.database)
+                .unwrap()
+                .list()
+                .unwrap()
+                .iter()
+                .any(|record| record.id == task.id));
+
+            let final_state =
+                finish_active_worker(&paths, &lifecycle, task.id, TaskState::Completed, None)
+                    .await
+                    .unwrap();
+            assert_eq!(final_state, controlled_state);
+
+            clear_task_record(&paths, &lifecycle, task.id)
+                .await
+                .unwrap();
+            assert!(TaskStore::open(&paths.database)
+                .unwrap()
+                .list()
+                .unwrap()
+                .iter()
+                .all(|record| record.id != task.id));
+        }
+    }
 }

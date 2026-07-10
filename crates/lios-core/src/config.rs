@@ -8,6 +8,22 @@ use crate::atomic::write_atomic;
 use crate::crypto::KeyFile;
 use crate::{LiosError, Result};
 
+pub const MODELSCOPE_ENDPOINT: &str = "https://modelscope.cn";
+pub const MODELSCOPE_WWW_ENDPOINT: &str = "https://www.modelscope.cn";
+
+pub fn validate_modelscope_production_endpoint(endpoint: &str) -> Result<String> {
+    match endpoint.trim() {
+        "https://modelscope.cn" | "https://modelscope.cn/" => Ok(MODELSCOPE_ENDPOINT.to_string()),
+        "https://www.modelscope.cn" | "https://www.modelscope.cn/" => {
+            Ok(MODELSCOPE_WWW_ENDPOINT.to_string())
+        }
+        _ => Err(LiosError::Unsupported(
+            "ModelScope endpoint must be https://modelscope.cn or https://www.modelscope.cn"
+                .to_string(),
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiosPaths {
     pub home: PathBuf,
@@ -83,9 +99,9 @@ impl LiosConfig {
     }
 }
 
-pub fn ensure_default_key_configured(paths: &LiosPaths, config: &mut LiosConfig) -> Result<()> {
+pub fn ensure_default_key_binding(paths: &LiosPaths, config: &mut LiosConfig) -> Result<bool> {
     if config.key_file_path.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let key_path = paths.home.join("recovery.key");
     match KeyFile::load_from_path(&key_path) {
@@ -102,8 +118,16 @@ pub fn ensure_default_key_configured(paths: &LiosPaths, config: &mut LiosConfig)
         Err(error) => return Err(error),
     }
 
+    config.key_file_path = Some(key_path);
+    Ok(true)
+}
+
+pub fn ensure_default_key_configured(paths: &LiosPaths, config: &mut LiosConfig) -> Result<()> {
     let mut updated = config.clone();
-    updated.key_file_path = Some(key_path);
+    if !ensure_default_key_binding(paths, &mut updated)? {
+        return Ok(());
+    }
+
     updated.save(&paths.config)?;
     *config = updated;
     Ok(())

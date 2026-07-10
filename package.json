@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "test:frontend": "node --test tests/catalogState.test.ts",
     "build": "tsc && vite build",
     "tauri": "tauri"
   },
