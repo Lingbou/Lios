@@ -1,0 +1,33 @@
+[package]
+name = "lios-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+rand = "0.8"
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+zstd = "0.13"
+
+[dev-dependencies]
+httpmock = "0.7"
+tempfile = "3"
