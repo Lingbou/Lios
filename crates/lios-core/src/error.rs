@@ -75,8 +75,14 @@ pub enum LiosError {
     Uuid(#[from] uuid::Error),
     #[error("crypto operation failed")]
     Crypto,
+    #[error("corrupted encrypted or compressed data: {0}")]
+    DataCorruption(String),
     #[error("invalid key file")]
     InvalidKeyFile,
+    #[error("invalid v2 format: {0}")]
+    InvalidV2Format(&'static str),
+    #[error("unexpected v2 content kind: expected {expected}, got {actual}")]
+    UnexpectedV2Kind { expected: u8, actual: u8 },
     #[error("path has no file name: {0}")]
     MissingFileName(PathBuf),
     #[error("path is outside of expected root: {0}")]

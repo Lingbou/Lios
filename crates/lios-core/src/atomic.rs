@@ -19,6 +19,18 @@ impl SiblingTempFile {
     }
 
     fn create_with_privacy(destination: &Path, suffix: &str, private: bool) -> io::Result<Self> {
+        Self::create_with_privacy_using(destination, suffix, private, set_private_permissions)
+    }
+
+    fn create_with_privacy_using<ApplyPermissions>(
+        destination: &Path,
+        suffix: &str,
+        private: bool,
+        apply_permissions: ApplyPermissions,
+    ) -> io::Result<Self>
+    where
+        ApplyPermissions: Fn(&File, &Path) -> io::Result<()>,
+    {
         let parent = destination_parent(destination);
         fs::create_dir_all(parent)?;
         let file_name = destination
@@ -42,7 +54,7 @@ impl SiblingTempFile {
             match options.open(&path) {
                 Ok(file) => {
                     if private {
-                        if let Err(error) = set_private_permissions(&file) {
+                        if let Err(error) = apply_permissions(&file, &path) {
                             drop(file);
                             let _ = fs::remove_file(&path);
                             return Err(error);
@@ -228,14 +240,124 @@ fn destination_parent(path: &Path) -> &Path {
 }
 
 #[cfg(unix)]
-fn set_private_permissions(file: &File) -> io::Result<()> {
+fn set_private_permissions(file: &File, _path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     file.set_permissions(fs::Permissions::from_mode(0o600))
 }
 
-#[cfg(not(unix))]
-fn set_private_permissions(_file: &File) -> io::Result<()> {
+#[cfg(windows)]
+fn set_private_permissions(_file: &File, path: &Path) -> io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        AddAccessAllowedAceEx, CreateWellKnownSid, GetLengthSid, InitializeAcl,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_FLAGS, ACL,
+        ACL_REVISION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE,
+    };
+    use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = LocalFree(HLOCAL(self.0 .0));
+            }
+        }
+    }
+
+    fn win32_status(status: windows::Win32::Foundation::WIN32_ERROR) -> io::Result<()> {
+        if status.0 == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status.0 as i32))
+        }
+    }
+
+    fn well_known_sid(kind: windows::Win32::Security::WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u8>> {
+        let mut sid = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut sid_len = sid.len() as u32;
+        unsafe {
+            CreateWellKnownSid(
+                kind,
+                PSID::default(),
+                PSID(sid.as_mut_ptr().cast()),
+                &mut sid_len,
+            )
+        }
+        .map_err(io::Error::other)?;
+        sid.truncate(sid_len as usize);
+        Ok(sid)
+    }
+
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    win32_status(unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide_path.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+    })?;
+    let _descriptor = SecurityDescriptor(descriptor);
+    if owner.0.is_null() {
+        return Err(io::Error::other("private file owner SID is missing"));
+    }
+
+    let system = well_known_sid(WinLocalSystemSid)?;
+    let administrators = well_known_sid(WinBuiltinAdministratorsSid)?;
+    let system_sid = PSID(system.as_ptr().cast_mut().cast());
+    let administrators_sid = PSID(administrators.as_ptr().cast_mut().cast());
+    let sids = [owner, system_sid, administrators_sid];
+    let acl_size = sids.iter().try_fold(size_of::<ACL>(), |size, sid| {
+        let ace_size = size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>()
+            + unsafe { GetLengthSid(*sid) } as usize;
+        size.checked_add(ace_size)
+            .ok_or_else(|| io::Error::other("private file ACL is too large"))
+    })?;
+    let acl_size =
+        u32::try_from(acl_size).map_err(|_| io::Error::other("private file ACL is too large"))?;
+    let mut acl_storage = vec![0u32; (acl_size as usize).div_ceil(size_of::<u32>())];
+    let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+    unsafe { InitializeAcl(acl, acl_size, ACL_REVISION) }.map_err(io::Error::other)?;
+    for sid in sids {
+        unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, ACE_FLAGS(0), FILE_ALL_ACCESS.0, sid) }
+            .map_err(io::Error::other)?;
+    }
+
+    win32_status(unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(wide_path.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            PSID::default(),
+            PSID::default(),
+            Some(acl),
+            None,
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_private_permissions(_file: &File, _path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -391,5 +513,24 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"existing");
         assert!(!temp_path.exists());
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn private_permission_failure_removes_temp_without_publishing() {
+        let tmp = tempdir().unwrap();
+        let destination = tmp.path().join("recovery.key");
+
+        let result =
+            SiblingTempFile::create_with_privacy_using(&destination, ".test", true, |_, _| {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"))
+            });
+
+        let error = match result {
+            Ok(_) => panic!("permission failure must abort private temp creation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 }

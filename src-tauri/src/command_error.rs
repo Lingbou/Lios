@@ -95,6 +95,18 @@ impl From<LiosError> for CommandError {
                 false,
                 None,
             ),
+            LiosError::InvalidV2Format(_) | LiosError::UnexpectedV2Kind { .. } => Self::new(
+                CommandErrorCode::CorruptedData,
+                "encrypted data has an invalid format",
+                false,
+                None,
+            ),
+            LiosError::DataCorruption(_) => Self::new(
+                CommandErrorCode::CorruptedData,
+                "encrypted or compressed data is corrupted",
+                false,
+                None,
+            ),
             LiosError::Json(error) => Self::new(
                 CommandErrorCode::CorruptedData,
                 error.to_string(),
@@ -233,6 +245,33 @@ mod tests {
         assert_eq!(
             CommandError::from(LiosError::Crypto).code,
             CommandErrorCode::CorruptedData
+        );
+        assert_eq!(
+            CommandError::from(LiosError::InvalidV2Format("truncated envelope")).code,
+            CommandErrorCode::CorruptedData
+        );
+        assert_eq!(
+            CommandError::from(LiosError::UnexpectedV2Kind {
+                expected: 1,
+                actual: 2,
+            })
+            .code,
+            CommandErrorCode::CorruptedData
+        );
+        assert_eq!(
+            CommandError::from(LiosError::DataCorruption(
+                "incomplete zstd frame".to_string(),
+            ))
+            .code,
+            CommandErrorCode::CorruptedData
+        );
+        assert_eq!(
+            CommandError::from(LiosError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "output denied",
+            )))
+            .code,
+            CommandErrorCode::Storage
         );
     }
 
