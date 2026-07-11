@@ -36,6 +36,21 @@ pub struct CatalogTransactionProgress {
     pub total_items: u64,
     pub bytes_done: u64,
     pub bytes_total: u64,
+    pub blob_checkpoint: Option<CatalogBlobCheckpoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogBlobCheckpointState {
+    Uploaded,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogBlobCheckpoint {
+    pub path: String,
+    pub oid: String,
+    pub size: u64,
+    pub state: CatalogBlobCheckpointState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +119,7 @@ where
         total_items,
         bytes_done: 0,
         bytes_total: 0,
+        blob_checkpoint: None,
     };
     on_progress(progress.clone())?;
 
@@ -120,14 +136,62 @@ where
 
     progress.phase = CatalogTransactionPhase::UploadBlobs;
     on_progress(progress.clone())?;
-    for (blob, validation) in blobs.iter().zip(validations) {
+    for ((upload, blob), validation) in spec.uploads.iter().zip(&blobs).zip(validations) {
         if should_cancel()? {
             return Ok(CatalogTransactionOutcome::Canceled);
         }
-        let (checkpoint, transferred_bytes) = match validation {
-            BlobValidation::Reusable(checkpoint) => (checkpoint, 0),
+        let checkpoint = match validation {
+            BlobValidation::Reusable(checkpoint) => checkpoint,
             BlobValidation::UploadRequired(validated) => {
-                (adapter.upload_blob(blob, validated).await?, blob.size)
+                let completed_before_blob = progress.bytes_done;
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+                let upload = adapter.upload_blob_with_progress(blob, validated, Some(progress_tx));
+                tokio::pin!(upload);
+                let mut progress_open = true;
+                let checkpoint = loop {
+                    tokio::select! {
+                        result = &mut upload => {
+                            let checkpoint = result?;
+                            while let Ok(streamed) = progress_rx.try_recv() {
+                                if streamed > blob.size {
+                                    return Err(LiosError::DataCorruption(
+                                        "blob upload reported more bytes than expected".to_string(),
+                                    ));
+                                }
+                                let bytes_done = completed_before_blob.saturating_add(streamed);
+                                if bytes_done > progress.bytes_done {
+                                    progress.bytes_done = bytes_done;
+                                    on_progress(progress.clone())?;
+                                }
+                                if should_cancel()? {
+                                    return Ok(CatalogTransactionOutcome::Canceled);
+                                }
+                            }
+                            break checkpoint;
+                        },
+                        streamed = progress_rx.recv(), if progress_open => {
+                            let Some(streamed) = streamed else {
+                                progress_open = false;
+                                continue;
+                            };
+                            if streamed > blob.size {
+                                return Err(LiosError::DataCorruption(
+                                    "blob upload reported more bytes than expected".to_string(),
+                                ));
+                            }
+                            let bytes_done = completed_before_blob.saturating_add(streamed);
+                            if bytes_done > progress.bytes_done {
+                                progress.bytes_done = bytes_done;
+                                on_progress(progress.clone())?;
+                            }
+                            if should_cancel()? {
+                                return Ok(CatalogTransactionOutcome::Canceled);
+                            }
+                        }
+                    }
+                };
+                progress.bytes_done = completed_before_blob.saturating_add(blob.size);
+                checkpoint
             }
         };
         if checkpoint.oid != blob.oid || checkpoint.size != blob.size {
@@ -136,8 +200,14 @@ where
             ));
         }
         progress.completed_items += 1;
-        progress.bytes_done = progress.bytes_done.saturating_add(transferred_bytes);
+        progress.blob_checkpoint = Some(CatalogBlobCheckpoint {
+            path: upload.path.clone(),
+            oid: checkpoint.oid,
+            size: checkpoint.size,
+            state: CatalogBlobCheckpointState::Uploaded,
+        });
         on_progress(progress.clone())?;
+        progress.blob_checkpoint = None;
     }
 
     for batch in &plan.prepublish {
@@ -179,6 +249,7 @@ where
     }
 
     progress.phase = CatalogTransactionPhase::Publish;
+    on_progress(progress.clone())?;
     let publish = adapter
         .commit_actions(
             namespace,
@@ -213,6 +284,20 @@ where
     if let Err(error) = on_progress(progress.clone()) {
         warnings.push(format!("publish progress could not be recorded: {error}"));
     }
+    for (upload, blob) in spec.uploads.iter().zip(&blobs) {
+        progress.blob_checkpoint = Some(CatalogBlobCheckpoint {
+            path: upload.path.clone(),
+            oid: blob.oid.clone(),
+            size: blob.size,
+            state: CatalogBlobCheckpointState::Committed,
+        });
+        if let Err(error) = on_progress(progress.clone()) {
+            warnings.push(format!(
+                "committed blob checkpoint could not be recorded: {error}"
+            ));
+        }
+    }
+    progress.blob_checkpoint = None;
 
     progress.phase = CatalogTransactionPhase::Cleanup;
     for batch in &plan.cleanup {
@@ -265,7 +350,7 @@ fn validate_initial_catalog(spec: &CatalogTransactionSpec) -> Result<()> {
     }
 }
 
-async fn probe_catalog_sha256<A: StorageAdapter + ?Sized>(
+pub async fn probe_catalog_sha256<A: StorageAdapter + ?Sized>(
     adapter: &A,
     namespace: &str,
     dataset: &str,
@@ -454,6 +539,20 @@ mod tests {
             Ok(checkpoint)
         }
 
+        async fn upload_blob_with_progress(
+            &self,
+            blob: &BlobSpec,
+            validated: ValidatedBlobUpload,
+            progress: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
+        ) -> Result<BlobCheckpoint> {
+            if let Some(progress) = progress {
+                let _ = progress.send(blob.size / 2);
+                tokio::task::yield_now().await;
+                let _ = progress.send(blob.size);
+            }
+            self.upload_blob(blob, validated).await
+        }
+
         async fn commit_actions(
             &self,
             _namespace: &str,
@@ -619,6 +718,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn required_blob_uploads_report_intermediate_streamed_bytes() {
+        let tmp = tempdir().unwrap();
+        let base = b"old encrypted catalog";
+        let adapter = ScriptedAdapter::new(ProbeResult::Bytes(base.to_vec()), true);
+        let mut observed = Vec::new();
+
+        execute_catalog_transaction(
+            &adapter,
+            NAMESPACE,
+            DATASET,
+            spec(tmp.path(), Some(base), true, 0),
+            || Ok(false),
+            |progress| {
+                observed.push(progress);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(observed.iter().any(|progress| {
+            progress.phase == CatalogTransactionPhase::UploadBlobs
+                && progress.bytes_done > 0
+                && progress.bytes_done < progress.bytes_total
+                && progress.completed_items == 0
+        }));
+    }
+
+    #[tokio::test]
+    async fn blob_checkpoints_are_reported_as_uploaded_then_committed() {
+        let tmp = tempdir().unwrap();
+        let base = b"old encrypted catalog";
+        let adapter = ScriptedAdapter::new(ProbeResult::Bytes(base.to_vec()), true);
+        let transaction = spec(tmp.path(), Some(base), true, 0);
+        let expected_paths = transaction
+            .uploads
+            .iter()
+            .map(|upload| upload.path.clone())
+            .collect::<HashSet<_>>();
+        let mut observed = Vec::new();
+
+        execute_catalog_transaction(
+            &adapter,
+            NAMESPACE,
+            DATASET,
+            transaction,
+            || Ok(false),
+            |progress| {
+                if let Some(checkpoint) = progress.blob_checkpoint {
+                    observed.push(checkpoint);
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        for path in expected_paths {
+            let states = observed
+                .iter()
+                .filter(|checkpoint| checkpoint.path == path)
+                .map(|checkpoint| checkpoint.state)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                states,
+                vec![
+                    CatalogBlobCheckpointState::Uploaded,
+                    CatalogBlobCheckpointState::Committed,
+                ],
+                "{path}: {observed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn stable_large_transaction_orders_prepublish_probe_publish_cleanup() {
         let tmp = tempdir().unwrap();
         let base = b"old encrypted catalog";
@@ -638,6 +812,40 @@ mod tests {
             ordered.windows(2).all(|pair| pair[0] < pair[1]),
             "{events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn publish_phase_is_persisted_before_the_remote_publish_request() {
+        let tmp = tempdir().unwrap();
+        let base = b"old encrypted catalog";
+        let adapter = ScriptedAdapter::new(ProbeResult::Bytes(base.to_vec()), false);
+        let progress_adapter = adapter.clone();
+
+        execute_catalog_transaction(
+            &adapter,
+            NAMESPACE,
+            DATASET,
+            spec(tmp.path(), Some(base), true, 0),
+            || Ok(false),
+            move |progress| {
+                if progress.phase == CatalogTransactionPhase::Publish
+                    && progress.blob_checkpoint.is_none()
+                {
+                    progress_adapter.record("progress:publish");
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let events = adapter.events();
+        let persisted = events
+            .iter()
+            .position(|event| event == "progress:publish")
+            .unwrap();
+        let published = events.iter().position(|event| event == "publish").unwrap();
+        assert!(persisted < published, "{events:?}");
     }
 
     #[tokio::test]
@@ -744,6 +952,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let base = b"old encrypted catalog";
         let adapter = ScriptedAdapter::new(ProbeResult::Bytes(base.to_vec()), false);
+        let observed = adapter.clone();
 
         let result = execute_catalog_transaction(
             &adapter,
@@ -751,8 +960,10 @@ mod tests {
             DATASET,
             spec(tmp.path(), Some(base), true, 255),
             || Ok(false),
-            |progress| {
-                if progress.phase == CatalogTransactionPhase::Publish {
+            move |progress| {
+                if progress.phase == CatalogTransactionPhase::Publish
+                    && observed.events().iter().any(|event| event == "publish")
+                {
                     Err(LiosError::Storage("progress store failed".to_string()))
                 } else {
                     Ok(())
@@ -866,5 +1077,42 @@ mod tests {
             .any(|warning| warning.contains("publish response")));
         assert!(adapter.events().iter().any(|event| event == "publish"));
         assert!(adapter.events().iter().any(|event| event == "cleanup"));
+    }
+
+    #[tokio::test]
+    async fn uncertain_publish_failure_returns_only_after_publish_phase_is_reported() {
+        let tmp = tempdir().unwrap();
+        let base = b"old encrypted catalog";
+        let adapter = ScriptedAdapter::new(
+            ProbeResult::Sequence(VecDeque::from([
+                ProbeResult::Bytes(base.to_vec()),
+                ProbeResult::Error(RemoteErrorKind::Network),
+            ])),
+            false,
+        );
+        adapter.fail_publish_times(1);
+        let mut saw_publish_phase = false;
+
+        let error = execute_catalog_transaction(
+            &adapter,
+            NAMESPACE,
+            DATASET,
+            spec(tmp.path(), Some(base), true, 0),
+            || Ok(false),
+            |progress| {
+                saw_publish_phase |= progress.phase == CatalogTransactionPhase::Publish;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(saw_publish_phase);
+        assert!(matches!(
+            error,
+            LiosError::Remote(ref error) if error.kind == RemoteErrorKind::Network
+        ));
+        assert!(adapter.events().iter().any(|event| event == "publish"));
+        assert!(!adapter.events().iter().any(|event| event == "cleanup"));
     }
 }

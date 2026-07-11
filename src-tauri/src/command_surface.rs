@@ -22,6 +22,7 @@ macro_rules! with_registered_commands {
             cleanup_local_cache,
             pause_task,
             resume_task,
+            retry_task,
             cancel_task,
             clear_task,
         }
@@ -74,6 +75,7 @@ mod tests {
             "enqueue_upload_to_folder",
             "enqueue_delete_nodes",
             "enqueue_download",
+            "retry_task",
         ] {
             assert!(REGISTERED_COMMANDS.contains(&command), "{command}");
         }

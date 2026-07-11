@@ -793,13 +793,18 @@ select:focus {
 
 .taskRow {
   min-width: 0;
+  overflow: hidden;
+  border: 1px solid #f5e5ef;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.taskSummary {
+  min-width: 0;
   display: grid;
   grid-template-columns: 30px minmax(0, 1fr) minmax(160px, 280px) auto;
   align-items: center;
   gap: 10px;
-  border: 1px solid #f5e5ef;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.78);
   padding: 10px;
 }
 
@@ -860,6 +865,13 @@ select:focus {
   white-space: nowrap;
 }
 
+.taskInfo strong small {
+  margin-left: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
 .taskInfo span {
   margin-top: 2px;
   color: var(--muted);
@@ -906,6 +918,84 @@ select:focus {
   border-color: #efb9c0;
   color: var(--danger);
   background: var(--danger-soft);
+}
+
+.taskFileList {
+  max-height: 150px;
+  overflow: auto;
+  border-top: 1px solid #f5e5ef;
+  background: rgba(255, 250, 253, 0.62);
+}
+
+.taskFileRow {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) minmax(180px, 280px);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+}
+
+.taskFileRow + .taskFileRow {
+  border-top: 1px solid rgba(245, 229, 239, 0.76);
+}
+
+.taskFileRow > svg {
+  width: 16px;
+  height: 16px;
+  color: var(--pink-strong);
+}
+
+.taskFileRow.completed > svg {
+  color: #438260;
+}
+
+.taskFileRow.failed > svg,
+.taskFileRow.canceled > svg,
+.taskFileRow.skipped > svg {
+  color: var(--danger);
+}
+
+.taskFileInfo,
+.taskFileProgress {
+  min-width: 0;
+}
+
+.taskFileInfo strong,
+.taskFileInfo span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.taskFileInfo strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.taskFileInfo span,
+.taskFileProgress small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.taskFileInfo span {
+  margin-top: 2px;
+}
+
+.taskFileProgress {
+  display: grid;
+  gap: 4px;
+}
+
+.taskFileProgress .meter {
+  height: 5px;
+}
+
+.taskFileProgress small {
+  text-align: right;
 }
 
 @keyframes spin {
@@ -1057,12 +1147,20 @@ select:focus {
     right: 12px;
   }
 
-  .taskRow {
+  .taskSummary {
     grid-template-columns: 30px minmax(0, 1fr);
   }
 
   .taskProgress,
   .taskButtons {
+    grid-column: 2;
+  }
+
+  .taskFileRow {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+
+  .taskFileProgress {
     grid-column: 2;
   }
 

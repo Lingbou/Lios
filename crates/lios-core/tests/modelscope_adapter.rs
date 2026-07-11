@@ -605,10 +605,20 @@ async fn upload_blob_streams_exact_bytes_with_auth_and_content_length() {
     let BlobValidation::UploadRequired(validated) = validation else {
         panic!("expected an upload-required validation");
     };
-    let checkpoint = adapter.upload_blob(&spec, validated).await.unwrap();
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let checkpoint = adapter
+        .upload_blob_with_progress(&spec, validated, Some(progress_tx))
+        .await
+        .unwrap();
+    let mut progress = Vec::new();
+    while let Ok(bytes) = progress_rx.try_recv() {
+        progress.push(bytes);
+    }
 
     assert_eq!(checkpoint.oid, spec.oid);
     assert_eq!(checkpoint.size, spec.size);
+    assert!(progress.len() > 1);
+    assert_eq!(progress.last().copied(), Some(spec.size));
     validate.assert_hits(1);
     upload.assert_hits(1);
 }

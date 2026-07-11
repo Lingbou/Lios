@@ -1,11 +1,11 @@
 use lios_core::{
-    catalog::{ConflictAction, ConflictResolution},
+    catalog::{ConflictAction, ConflictResolution, SourceSnapshotReport},
     config::{ensure_default_key_configured, LiosConfig, LiosPaths, RepoConfig},
     credentials::{protect_to_file, unprotect_from_file},
     crypto::KeyFile,
     tasks::{
-        CheckpointState, FileContentIndexEntry, TaskItem, TaskItemState, TaskObjectCheckpoint,
-        TaskRecord, TaskSpec, TaskState, TaskStore,
+        CheckpointState, FileContentIndexEntry, TaskCatalogCheckpoint, TaskItem, TaskItemState,
+        TaskObjectCheckpoint, TaskRecord, TaskSpec, TaskState, TaskStore,
     },
     LiosError,
 };
@@ -409,6 +409,7 @@ fn task_store_persists_specs_items_checkpoints_and_content_index() {
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("album.bin")],
+        source_snapshot: None,
         chunk_size: 128 * 1024 * 1024,
         conflict_resolutions: vec![ConflictResolution {
             source_path: tmp.path().join("album.bin").to_string_lossy().into_owned(),
@@ -420,7 +421,9 @@ fn task_store_persists_specs_items_checkpoints_and_content_index() {
         id: Uuid::new_v4(),
         task_id: task.id,
         name: "album.bin".to_string(),
+        relative_path: Some("photos/album.bin".into()),
         source_path: Some(tmp.path().join("album.bin")),
+        source_modified_at_ns: Some(123456789),
         size: 4096,
         state: TaskItemState::Running,
         phase: Some("uploading".to_string()),
@@ -465,6 +468,7 @@ fn task_store_persists_specs_items_checkpoints_and_content_index() {
             source_paths,
             chunk_size,
             conflict_resolutions,
+            ..
         } => {
             assert_eq!(account_id, "account-a");
             assert_eq!(space_id, "novix/cold");
@@ -499,6 +503,521 @@ fn task_store_persists_specs_items_checkpoints_and_content_index() {
     reopened.delete(task.id).unwrap();
     assert!(reopened.list_items(task.id).unwrap().is_empty());
     assert!(reopened.list_checkpoints(task.id).unwrap().is_empty());
+}
+
+#[test]
+fn task_store_persists_catalog_commit_checkpoint_hashes() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let store = TaskStore::open(&db_path).unwrap();
+    let task = TaskRecord::queued("upload", 1);
+    store.insert(&task).unwrap();
+    let checkpoint = TaskCatalogCheckpoint {
+        task_id: task.id,
+        base_catalog_sha256: Some("a".repeat(64)),
+        target_catalog_sha256: "b".repeat(64),
+    };
+
+    store.upsert_catalog_checkpoint(&checkpoint).unwrap();
+    drop(store);
+
+    let reopened = TaskStore::open(&db_path).unwrap();
+    assert_eq!(
+        reopened.load_catalog_checkpoint(task.id).unwrap(),
+        Some(checkpoint)
+    );
+}
+
+#[test]
+fn task_store_replaces_catalog_transaction_checkpoints_atomically() {
+    let tmp = tempdir().unwrap();
+    let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let task = TaskRecord::queued("upload", 2);
+    store.insert(&task).unwrap();
+    let first_catalog = TaskCatalogCheckpoint {
+        task_id: task.id,
+        base_catalog_sha256: Some("a".repeat(64)),
+        target_catalog_sha256: "b".repeat(64),
+    };
+    let first_objects = vec![
+        TaskObjectCheckpoint {
+            task_id: task.id,
+            remote_path: "catalog.enc".to_string(),
+            oid: "b".repeat(64),
+            size: 10,
+            state: CheckpointState::Pending,
+        },
+        TaskObjectCheckpoint {
+            task_id: task.id,
+            remote_path: "objects/files/old/manifest.enc".to_string(),
+            oid: "c".repeat(64),
+            size: 20,
+            state: CheckpointState::Pending,
+        },
+    ];
+
+    store
+        .replace_transaction_checkpoints(&first_catalog, &first_objects)
+        .unwrap();
+
+    let second_catalog = TaskCatalogCheckpoint {
+        task_id: task.id,
+        base_catalog_sha256: Some("a".repeat(64)),
+        target_catalog_sha256: "d".repeat(64),
+    };
+    let second_objects = vec![TaskObjectCheckpoint {
+        task_id: task.id,
+        remote_path: "catalog.enc".to_string(),
+        oid: "d".repeat(64),
+        size: 11,
+        state: CheckpointState::Pending,
+    }];
+    store
+        .replace_transaction_checkpoints(&second_catalog, &second_objects)
+        .unwrap();
+
+    assert_eq!(
+        store.load_catalog_checkpoint(task.id).unwrap(),
+        Some(second_catalog)
+    );
+    assert_eq!(store.list_checkpoints(task.id).unwrap(), second_objects);
+}
+
+#[test]
+fn task_store_requeues_a_committing_task_for_safe_replay() {
+    let tmp = tempdir().unwrap();
+    let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let spec = TaskSpec::Delete {
+        account_id: "a".repeat(64),
+        space_id: "b".repeat(64),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let mut task = TaskRecord::queued_for_spec(&spec);
+    task.state = TaskState::Committing;
+    task.phase = Some("publishing".to_string());
+    task.progress_total = 3;
+    task.progress_done = 2;
+    task.bytes_total = 100;
+    task.bytes_done = 100;
+    task.speed_bps = 50;
+    task.eta_seconds = Some(1);
+    let mut item = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        name: "file.bin".to_string(),
+        relative_path: Some("file.bin".into()),
+        source_path: None,
+        source_modified_at_ns: None,
+        size: 100,
+        state: TaskItemState::Running,
+        phase: Some("committing".to_string()),
+        bytes_done: 100,
+        bytes_total: 100,
+        error: Some("old warning".to_string()),
+    };
+    task.items = vec![item.clone()];
+    store
+        .insert_with_spec_and_items(&task, &spec, &task.items)
+        .unwrap();
+
+    assert!(store.requeue_committing(task.id).unwrap());
+
+    let replay = store.get(task.id).unwrap().unwrap();
+    assert_eq!(replay.state, TaskState::Queued);
+    assert_eq!(replay.phase, None);
+    assert_eq!(replay.progress_done, 0);
+    assert_eq!(replay.bytes_done, 0);
+    assert_eq!(replay.speed_bps, 0);
+    assert_eq!(replay.eta_seconds, None);
+    assert_eq!(replay.attempt, 1);
+    item.state = TaskItemState::Queued;
+    item.phase = None;
+    item.bytes_done = 0;
+    item.error = None;
+    assert_eq!(replay.items, vec![item]);
+}
+
+#[test]
+fn task_store_completes_a_reconciled_commit_and_its_checkpoints() {
+    let tmp = tempdir().unwrap();
+    let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let spec = TaskSpec::Delete {
+        account_id: "a".repeat(64),
+        space_id: "b".repeat(64),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let mut task = TaskRecord::queued_for_spec(&spec);
+    task.state = TaskState::Committing;
+    task.phase = Some("reconciling".to_string());
+    task.progress_total = 2;
+    task.progress_done = 1;
+    task.bytes_total = 10;
+    task.bytes_done = 10;
+    let item = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        name: "file.bin".to_string(),
+        relative_path: Some("file.bin".into()),
+        source_path: None,
+        source_modified_at_ns: None,
+        size: 10,
+        state: TaskItemState::Running,
+        phase: Some("committing".to_string()),
+        bytes_done: 10,
+        bytes_total: 10,
+        error: None,
+    };
+    task.items = vec![item];
+    store
+        .insert_with_spec_and_items(&task, &spec, &task.items)
+        .unwrap();
+    store
+        .upsert_checkpoint(&TaskObjectCheckpoint {
+            task_id: task.id,
+            remote_path: "catalog.enc".to_string(),
+            oid: "c".repeat(64),
+            size: 10,
+            state: CheckpointState::Uploaded,
+        })
+        .unwrap();
+
+    assert!(store.complete_reconciled_commit(task.id).unwrap());
+
+    let completed = store.get(task.id).unwrap().unwrap();
+    assert_eq!(completed.state, TaskState::Completed);
+    assert_eq!(completed.phase, None);
+    assert_eq!(completed.progress_done, completed.progress_total);
+    assert_eq!(completed.bytes_done, completed.bytes_total);
+    assert_eq!(completed.items[0].state, TaskItemState::Completed);
+    assert_eq!(
+        completed.items[0].bytes_done,
+        completed.items[0].bytes_total
+    );
+    assert_eq!(
+        store.list_checkpoints(task.id).unwrap()[0].state,
+        CheckpointState::Committed
+    );
+    assert!(!store.complete_reconciled_commit(task.id).unwrap());
+}
+
+#[test]
+fn task_store_fails_a_reconciled_conflict_atomically_without_discarding_checkpoints() {
+    let tmp = tempdir().unwrap();
+    let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let spec = TaskSpec::Delete {
+        account_id: "a".repeat(64),
+        space_id: "b".repeat(64),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let mut task = TaskRecord::queued_for_spec(&spec);
+    task.state = TaskState::Committing;
+    task.phase = Some("reconciling".to_string());
+    let item = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        name: "file.bin".to_string(),
+        relative_path: Some("file.bin".into()),
+        source_path: None,
+        source_modified_at_ns: None,
+        size: 10,
+        state: TaskItemState::Running,
+        phase: Some("committing".to_string()),
+        bytes_done: 10,
+        bytes_total: 10,
+        error: None,
+    };
+    task.items = vec![item];
+    store
+        .insert_with_spec_and_items(&task, &spec, &task.items)
+        .unwrap();
+    let later = TaskRecord::queued_for_spec(&spec);
+    store.insert_with_spec(&later, &spec).unwrap();
+    let checkpoint = TaskObjectCheckpoint {
+        task_id: task.id,
+        remote_path: "catalog.enc".to_string(),
+        oid: "c".repeat(64),
+        size: 10,
+        state: CheckpointState::Uploaded,
+    };
+    store.upsert_checkpoint(&checkpoint).unwrap();
+
+    assert!(store
+        .fail_reconciled_commit(task.id, "remote catalog changed")
+        .unwrap());
+
+    let failed = store.get(task.id).unwrap().unwrap();
+    assert_eq!(failed.state, TaskState::Failed);
+    assert_eq!(failed.phase, None);
+    assert_eq!(failed.error.as_deref(), Some("remote catalog changed"));
+    assert_eq!(failed.items[0].state, TaskItemState::Failed);
+    assert_eq!(
+        failed.items[0].error.as_deref(),
+        Some("remote catalog changed")
+    );
+    assert_eq!(store.list_checkpoints(task.id).unwrap(), vec![checkpoint]);
+    let later = store.get(later.id).unwrap().unwrap();
+    assert_eq!(later.state, TaskState::Failed);
+    assert_eq!(later.error.as_deref(), Some("remote catalog changed"));
+    assert!(!store
+        .fail_reconciled_commit(task.id, "second conflict")
+        .unwrap());
+}
+
+#[test]
+fn task_store_makes_committing_monotonic_against_pause_cancel_and_progress() {
+    let tmp = tempdir().unwrap();
+    let store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let running = TaskRecord::queued("upload", 1);
+    store.insert(&running).unwrap();
+    store
+        .update_state(running.id, TaskState::Running, None)
+        .unwrap();
+
+    assert!(store
+        .set_transaction_state(running.id, TaskState::Committing)
+        .unwrap());
+    assert!(!store.interrupt_task(running.id, TaskState::Paused).unwrap());
+    assert!(!store
+        .interrupt_task(running.id, TaskState::Canceled)
+        .unwrap());
+    assert!(!store
+        .set_transaction_state(running.id, TaskState::Running)
+        .unwrap());
+    assert!(!store
+        .schedule_retry(running.id, 1, "network unavailable")
+        .unwrap());
+    assert_eq!(
+        store.get(running.id).unwrap().unwrap().state,
+        TaskState::Committing
+    );
+
+    let canceled = TaskRecord::queued("upload", 1);
+    store.insert(&canceled).unwrap();
+    store
+        .update_state(canceled.id, TaskState::Running, None)
+        .unwrap();
+    assert!(store
+        .interrupt_task(canceled.id, TaskState::Canceled)
+        .unwrap());
+    assert!(!store
+        .set_transaction_state(canceled.id, TaskState::Committing)
+        .unwrap());
+    assert!(!store
+        .schedule_retry(canceled.id, 1, "network unavailable")
+        .unwrap());
+    assert_eq!(
+        store.get(canceled.id).unwrap().unwrap().state,
+        TaskState::Canceled
+    );
+}
+
+#[test]
+fn task_store_fails_later_queued_tasks_when_a_space_conflicts() {
+    let tmp = tempdir().unwrap();
+    let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let make_spec = |space_id: &str| TaskSpec::Delete {
+        account_id: "a".repeat(64),
+        space_id: space_id.to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let blocked_spec = make_spec(&"b".repeat(64));
+    let other_spec = make_spec(&"c".repeat(64));
+    let blocked_a = TaskRecord::queued_for_spec(&blocked_spec);
+    let blocked_b = TaskRecord::queued_for_spec(&blocked_spec);
+    let other = TaskRecord::queued_for_spec(&other_spec);
+    store.insert_with_spec(&blocked_a, &blocked_spec).unwrap();
+    store.insert_with_spec(&blocked_b, &blocked_spec).unwrap();
+    store.insert_with_spec(&other, &other_spec).unwrap();
+
+    assert_eq!(
+        store
+            .fail_queued_tasks_in_space(&"b".repeat(64), "remote catalog conflict")
+            .unwrap(),
+        2
+    );
+
+    assert!(store.list().unwrap().into_iter().all(|task| {
+        if task.space_id == "b".repeat(64) {
+            task.state == TaskState::Failed
+                && task.error.as_deref() == Some("remote catalog conflict")
+        } else {
+            task.state == TaskState::Queued
+        }
+    }));
+}
+
+#[test]
+fn task_store_rolls_back_submission_when_any_item_is_invalid() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let mut store = TaskStore::open(&db_path).unwrap();
+    let spec = TaskSpec::Upload {
+        account_id: "account-a".to_string(),
+        space_id: "space-a".to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        parent_node_id: "root".to_string(),
+        source_paths: vec![tmp.path().join("album.bin")],
+        source_snapshot: None,
+        chunk_size: 128 * 1024 * 1024,
+        conflict_resolutions: Vec::new(),
+    };
+    let task = TaskRecord::queued_for_spec(&spec);
+    let invalid_item = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        name: "album.bin".to_string(),
+        relative_path: Some("album.bin".into()),
+        source_path: Some(tmp.path().join("album.bin")),
+        source_modified_at_ns: Some(123456789),
+        size: u64::MAX,
+        state: TaskItemState::Queued,
+        phase: None,
+        bytes_done: 0,
+        bytes_total: u64::MAX,
+        error: None,
+    };
+
+    assert!(matches!(
+        store
+            .insert_with_spec_and_items(&task, &spec, &[invalid_item])
+            .unwrap_err(),
+        LiosError::DataCorruption(_)
+    ));
+    assert!(store.get(task.id).unwrap().is_none());
+    assert!(store.list_items(task.id).unwrap().is_empty());
+}
+
+#[test]
+fn task_store_updates_all_file_items_to_a_terminal_state() {
+    let tmp = tempdir().unwrap();
+    let store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let task = TaskRecord::queued("upload", 1);
+    store.insert(&task).unwrap();
+    store
+        .upsert_item(&TaskItem {
+            id: Uuid::new_v4(),
+            task_id: task.id,
+            name: "album.bin".to_string(),
+            relative_path: Some("album.bin".into()),
+            source_path: Some(tmp.path().join("album.bin")),
+            source_modified_at_ns: Some(123456789),
+            size: 4096,
+            state: TaskItemState::Running,
+            phase: Some("uploading".to_string()),
+            bytes_done: 1024,
+            bytes_total: 4096,
+            error: None,
+        })
+        .unwrap();
+
+    store
+        .update_items_state(
+            task.id,
+            TaskItemState::Canceled,
+            None,
+            Some("task canceled".to_string()),
+            false,
+        )
+        .unwrap();
+
+    let item = store.list_items(task.id).unwrap().remove(0);
+    assert_eq!(item.state, TaskItemState::Canceled);
+    assert_eq!(item.phase, None);
+    assert_eq!(item.bytes_done, 1024);
+    assert_eq!(item.error.as_deref(), Some("task canceled"));
+}
+
+#[test]
+fn task_store_schedules_automatic_retry_and_requeues_manual_retry() {
+    let tmp = tempdir().unwrap();
+    let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let spec = TaskSpec::Upload {
+        account_id: "account-a".to_string(),
+        space_id: "space-a".to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        parent_node_id: "root".to_string(),
+        source_paths: vec![tmp.path().join("album.bin")],
+        source_snapshot: None,
+        chunk_size: 128 * 1024 * 1024,
+        conflict_resolutions: Vec::new(),
+    };
+    let task = TaskRecord::queued_for_spec(&spec);
+    store.insert_with_spec(&task, &spec).unwrap();
+    store
+        .update_state(task.id, TaskState::Running, None)
+        .unwrap();
+    store
+        .upsert_item(&TaskItem {
+            id: Uuid::new_v4(),
+            task_id: task.id,
+            name: "album.bin".to_string(),
+            relative_path: Some("album.bin".into()),
+            source_path: Some(tmp.path().join("album.bin")),
+            source_modified_at_ns: Some(123456789),
+            size: 4096,
+            state: TaskItemState::Running,
+            phase: Some("uploading".to_string()),
+            bytes_done: 2048,
+            bytes_total: 4096,
+            error: None,
+        })
+        .unwrap();
+
+    assert!(store
+        .schedule_retry(task.id, 1, "network unavailable")
+        .unwrap());
+    let retrying = store.get(task.id).unwrap().unwrap();
+    assert_eq!(retrying.state, TaskState::Retrying);
+    assert_eq!(retrying.phase.as_deref(), Some("retrying"));
+    assert_eq!(retrying.attempt, 1);
+    assert_eq!(retrying.error.as_deref(), Some("network unavailable"));
+
+    store
+        .update_state(
+            task.id,
+            TaskState::Failed,
+            Some("network unavailable".to_string()),
+        )
+        .unwrap();
+    assert!(store.requeue_failed(task.id).unwrap());
+    let queued = store.get(task.id).unwrap().unwrap();
+    assert_eq!(queued.state, TaskState::Queued);
+    assert_eq!(queued.phase, None);
+    assert_eq!(queued.attempt, 0);
+    assert_eq!(queued.error, None);
+    let item = store.list_items(task.id).unwrap().remove(0);
+    assert_eq!(item.state, TaskItemState::Queued);
+    assert_eq!(item.phase, None);
+    assert_eq!(item.bytes_done, 0);
+    assert_eq!(item.error, None);
 }
 
 #[test]
@@ -580,7 +1099,7 @@ fn task_store_migrates_the_existing_v1_tasks_table_in_place() {
     let schema_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(schema_version, 1);
+    assert_eq!(schema_version, 4);
 }
 
 #[test]
@@ -625,7 +1144,75 @@ fn task_store_serializes_concurrent_first_open_migrations() {
     let schema_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(schema_version, 1);
+    assert_eq!(schema_version, 4);
+}
+
+#[test]
+fn task_store_migrates_v2_items_with_a_nullable_relative_path() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let task_id = Uuid::new_v4();
+    let item_id = Uuid::new_v4();
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            PRAGMA user_version = 2;
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY NOT NULL,
+                account_id TEXT NOT NULL DEFAULT '',
+                space_id TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL,
+                label TEXT NOT NULL,
+                phase TEXT,
+                progress_total INTEGER NOT NULL,
+                progress_done INTEGER NOT NULL,
+                bytes_total INTEGER NOT NULL DEFAULT 0,
+                bytes_done INTEGER NOT NULL DEFAULT 0,
+                speed_bps INTEGER NOT NULL DEFAULT 0,
+                eta_seconds INTEGER,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                spec_json TEXT,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                error TEXT
+            );
+            CREATE TABLE task_items (
+                id TEXT PRIMARY KEY NOT NULL,
+                task_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                source_path TEXT,
+                source_modified_at_ns INTEGER,
+                size INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                phase TEXT,
+                bytes_done INTEGER NOT NULL DEFAULT 0,
+                bytes_total INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
+            "#,
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tasks (id, state, label, progress_total, progress_done) VALUES (?1, 'Queued', 'upload', 1, 0)",
+            rusqlite::params![task_id.to_string()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO task_items (id, task_id, name, size, state) VALUES (?1, ?2, 'legacy.bin', 4, 'Queued')",
+            rusqlite::params![item_id.to_string(), task_id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = TaskStore::open(&db_path).unwrap();
+    let item = store.list_items(task_id).unwrap().remove(0);
+
+    assert_eq!(item.id, item_id);
+    assert_eq!(item.relative_path, None);
 }
 
 #[test]
@@ -670,6 +1257,7 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("source.bin")],
+        source_snapshot: None,
         chunk_size: 128 * 1024 * 1024,
         conflict_resolutions: Vec::new(),
     };
@@ -689,7 +1277,9 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
         id: Uuid::new_v4(),
         task_id: replayable_ids[1],
         name: "source.bin".to_string(),
+        relative_path: Some("source.bin".into()),
         source_path: Some(tmp.path().join("source.bin")),
+        source_modified_at_ns: Some(123456789),
         size: 64,
         state: TaskItemState::Running,
         phase: Some("uploading".to_string()),
@@ -726,7 +1316,9 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
             id: Uuid::new_v4(),
             task_id: invalid_spec.id,
             name: "invalid.bin".to_string(),
+            relative_path: None,
             source_path: None,
+            source_modified_at_ns: None,
             size: 1,
             state: TaskItemState::Running,
             phase: Some("uploading".to_string()),
@@ -846,7 +1438,9 @@ fn task_store_rejects_out_of_range_writes_and_negative_persisted_numbers() {
         id: Uuid::new_v4(),
         task_id: task.id,
         name: "oversized.bin".to_string(),
+        relative_path: None,
         source_path: None,
+        source_modified_at_ns: None,
         size: u64::MAX,
         state: TaskItemState::Queued,
         phase: None,
@@ -989,8 +1583,66 @@ fn legacy_upload_task_spec_defaults_to_128mb_chunks() {
     }))
     .unwrap();
 
-    let TaskSpec::Upload { chunk_size, .. } = spec else {
+    let TaskSpec::Upload {
+        chunk_size,
+        source_snapshot,
+        ..
+    } = spec
+    else {
         panic!("expected upload task spec");
     };
     assert_eq!(chunk_size, 128 * 1024 * 1024);
+    assert_eq!(source_snapshot, None);
+}
+
+#[test]
+fn upload_task_spec_roundtrips_the_persisted_source_snapshot() {
+    let snapshot = SourceSnapshotReport::default();
+    let spec = TaskSpec::Upload {
+        account_id: "account-a".to_string(),
+        space_id: "space-a".to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        parent_node_id: "root".to_string(),
+        source_paths: vec!["C:/source".into()],
+        source_snapshot: Some(snapshot.clone()),
+        chunk_size: 128 * 1024 * 1024,
+        conflict_resolutions: Vec::new(),
+    };
+
+    let encoded = serde_json::to_string(&spec).unwrap();
+    let decoded: TaskSpec = serde_json::from_str(&encoded).unwrap();
+    let TaskSpec::Upload {
+        source_snapshot, ..
+    } = decoded
+    else {
+        panic!("expected upload task");
+    };
+
+    assert_eq!(source_snapshot, Some(snapshot));
+}
+
+#[test]
+fn task_store_transitions_state_only_from_the_expected_value() {
+    let tmp = tempdir().unwrap();
+    let store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let task = TaskRecord::queued("paused", 0);
+    store.insert(&task).unwrap();
+    store
+        .update_state(task.id, TaskState::Paused, None)
+        .unwrap();
+
+    assert!(store
+        .transition_state(task.id, TaskState::Paused, TaskState::Queued)
+        .unwrap());
+    assert!(!store
+        .transition_state(task.id, TaskState::Paused, TaskState::Queued)
+        .unwrap());
+    let task = store.get(task.id).unwrap().unwrap();
+    assert_eq!(task.state, TaskState::Queued);
+    assert_eq!(task.phase, None);
+    assert_eq!(task.error, None);
 }

@@ -66,6 +66,7 @@ struct BlobStreamState {
     expected_oid: String,
     expected_size: u64,
     progress: Arc<Mutex<BlobStreamProgress>>,
+    progress_sender: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
 }
 
 impl ModelScopeAdapter {
@@ -661,6 +662,15 @@ impl StorageAdapter for ModelScopeAdapter {
         blob: &BlobSpec,
         validated: ValidatedBlobUpload,
     ) -> Result<BlobCheckpoint> {
+        self.upload_blob_with_progress(blob, validated, None).await
+    }
+
+    async fn upload_blob_with_progress(
+        &self,
+        blob: &BlobSpec,
+        validated: ValidatedBlobUpload,
+        progress_sender: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
+    ) -> Result<BlobCheckpoint> {
         let (checkpoint, upload_url) = validated.into_parts();
         validate_blob_oid(&blob.oid)?;
         validate_blob_oid(&checkpoint.oid)?;
@@ -677,6 +687,7 @@ impl StorageAdapter for ModelScopeAdapter {
                 expected_oid: blob.oid.clone(),
                 expected_size: blob.size,
                 progress: Arc::clone(&progress),
+                progress_sender,
             },
             |mut state| async move {
                 let mut buffer = vec![0u8; BLOB_STREAM_BUFFER_SIZE];
@@ -695,10 +706,13 @@ impl StorageAdapter for ModelScopeAdapter {
                             "blob source changed during upload",
                         ));
                     }
+                    if let Some(sender) = &state.progress_sender {
+                        let _ = sender.send(progress.bytes);
+                    }
                     return Ok(None);
                 }
 
-                {
+                let uploaded_bytes = {
                     let mut progress = state.progress.lock().map_err(|_error| {
                         std::io::Error::other("blob stream progress is unavailable")
                     })?;
@@ -711,6 +725,10 @@ impl StorageAdapter for ModelScopeAdapter {
                             "blob source changed during upload",
                         ));
                     }
+                    progress.bytes
+                };
+                if let Some(sender) = &state.progress_sender {
+                    let _ = sender.send(uploaded_bytes);
                 }
                 buffer.truncate(read);
                 Ok(Some((buffer, state)))
