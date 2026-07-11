@@ -12,6 +12,7 @@ mod build_support;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use catalog_mutation_gate::CatalogMutationGate;
@@ -21,9 +22,9 @@ use command_surface::with_registered_commands;
 use download_service::prepare_download_task;
 use lios_core::cache::{cleanup_temporary_staging, prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
-    Catalog, CatalogRemoteFile, CatalogSelection, CatalogTreeNode, ConflictAction,
-    ConflictResolution, DriveItem, SourceFileSnapshot, SourceSnapshotReport, UploadConflict,
-    CATALOG_FILE,
+    Catalog, CatalogIntegrityOutcome, CatalogRemoteFile, CatalogRemoteIntegrityReport,
+    CatalogSelection, CatalogTreeNode, ConflictAction, ConflictResolution, DriveItem,
+    SourceFileSnapshot, SourceSnapshotReport, UploadConflict, CATALOG_FILE,
 };
 use lios_core::catalog_transaction::{
     execute_catalog_transaction, probe_catalog_sha256, CatalogBlobCheckpointState,
@@ -37,7 +38,8 @@ use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUse
 use lios_core::pack::PackOptions;
 use lios_core::restore::{RestoreConflictPolicy, RestoreOptions};
 use lios_core::storage::{
-    plan_catalog_sync_changes, CatalogSyncFile, CatalogSyncUpload, StorageAdapter, StorageObject,
+    plan_catalog_sync_changes, CatalogSyncFile, CatalogSyncUpload, RepoRevision, StorageAdapter,
+    StorageObject,
 };
 use lios_core::tasks::{
     CheckpointState, TaskCatalogCheckpoint, TaskItemState, TaskObjectCheckpoint, TaskRecord,
@@ -413,17 +415,86 @@ fn remote_to_staging_path(staging: &Path, remote_path: &str) -> CommandResult<Pa
 }
 
 fn sha256_hex_file(path: &Path) -> CommandResult<String> {
-    let bytes = fs::read(path).map_err(to_err)?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    sha256_hex_file_cancellable(path, || false)?.ok_or_else(|| {
+        CommandError::new(
+            CommandErrorCode::Internal,
+            "file hashing was unexpectedly canceled",
+            false,
+            None,
+        )
+    })
 }
 
-fn local_remote_file_is_valid(local_path: &Path, file: &CatalogRemoteFile) -> CommandResult<bool> {
-    if !local_path.exists() {
-        return Ok(false);
+fn sha256_hex_file_cancellable(
+    path: &Path,
+    mut should_cancel: impl FnMut() -> bool,
+) -> CommandResult<Option<String>> {
+    let mut file = fs::File::open(path).map_err(to_err)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        if should_cancel() {
+            return Ok(None);
+        }
+        let read = file.read(&mut buffer).map_err(to_err)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
     }
-    match &file.sha256 {
-        Some(expected) => Ok(sha256_hex_file(local_path)? == *expected),
-        None => Ok(true),
+    Ok(Some(hex::encode(hasher.finalize())))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalRemoteFileValidation {
+    Valid,
+    Invalid,
+    Canceled,
+}
+
+async fn validate_local_remote_file(
+    local_path: &Path,
+    file: &CatalogRemoteFile,
+    cancellation: &CancellationToken,
+) -> CommandResult<LocalRemoteFileValidation> {
+    if cancellation.is_cancelled() {
+        return Ok(LocalRemoteFileValidation::Canceled);
+    }
+    let metadata = match tokio::fs::metadata(local_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LocalRemoteFileValidation::Invalid)
+        }
+        Err(error) => return Err(to_err(error)),
+    };
+    if !metadata.is_file()
+        || file
+            .expected_size
+            .is_some_and(|expected| metadata.len() != expected)
+    {
+        return Ok(LocalRemoteFileValidation::Invalid);
+    }
+    let Some(expected) = file.sha256.clone() else {
+        return Ok(LocalRemoteFileValidation::Valid);
+    };
+    let path = local_path.to_path_buf();
+    let cancellation = cancellation.clone();
+    let actual = tokio::task::spawn_blocking(move || {
+        sha256_hex_file_cancellable(&path, || cancellation.is_cancelled())
+    })
+    .await
+    .map_err(|error| {
+        CommandError::new(
+            CommandErrorCode::Internal,
+            format!("local verification worker failed: {error}"),
+            false,
+            None,
+        )
+    })??;
+    match actual {
+        Some(actual) if actual == expected => Ok(LocalRemoteFileValidation::Valid),
+        Some(_) => Ok(LocalRemoteFileValidation::Invalid),
+        None => Ok(LocalRemoteFileValidation::Canceled),
     }
 }
 
@@ -590,10 +661,9 @@ async fn finish_worker(
             (true, Some(TaskState::Paused)) => TaskState::Paused,
             _ => intended_state,
         };
-        let final_error = if final_state == TaskState::Failed {
-            error
-        } else {
-            None
+        let final_error = match final_state {
+            TaskState::Failed | TaskState::Completed => error,
+            _ => None,
         };
         if !preserve_control_state && final_state == TaskState::Completed {
             task_store(paths)?
@@ -658,13 +728,27 @@ async fn clear_task_record(
         ));
     }
     let store = task_store(paths)?;
-    if store
-        .list()
-        .map_err(to_err)?
-        .iter()
-        .any(|task| task.id == task_id && task_state_blocks_clear(&task.state))
+    let task = store.get(task_id).map_err(to_err)?;
+    if task
+        .as_ref()
+        .is_some_and(|task| task_state_blocks_clear(&task.state))
     {
         return Err(CommandError::invalid_input("active task cannot be cleared"));
+    }
+    if let Some(spec) = store.load_spec(task_id).map_err(to_err)? {
+        if matches!(spec, TaskSpec::VerifySpace { .. }) {
+            let task_paths = paths
+                .for_task(spec.account_id(), spec.space_id(), task_id)
+                .map_err(to_err)?;
+            if let Err(error) = cleanup_terminal_verification_staging(&task_paths, &spec, task_id) {
+                append_task_warning(
+                    &task_paths,
+                    task_id,
+                    &format!("verification staging cleanup failed: {}", error.message),
+                )?;
+                return Err(error);
+            }
+        }
     }
     let result = store.delete(task_id).map_err(to_err);
     drop(lifecycle);
@@ -695,9 +779,148 @@ fn task_state_is_active(state: &TaskState) -> bool {
     }
 }
 
+fn cleanup_terminal_verification_staging(
+    paths: &LiosPaths,
+    spec: &TaskSpec,
+    task_id: Uuid,
+) -> CommandResult<()> {
+    if !matches!(spec, TaskSpec::VerifySpace { .. }) {
+        return Ok(());
+    }
+    let Some(task) = task_store(paths)?.get(task_id).map_err(to_err)? else {
+        return Ok(());
+    };
+    if task_state_is_active(&task.state) || !paths.staging.exists() {
+        return Ok(());
+    }
+    let expected_staging = paths
+        .home
+        .join("staging")
+        .join(spec.account_id())
+        .join(spec.space_id())
+        .join(task_id.to_string());
+    if paths.staging != expected_staging {
+        return Err(CommandError::invalid_input(
+            "refusing to clear an unexpected verification staging path",
+        ));
+    }
+    let staging_root = paths.home.join("staging");
+    let account_dir = staging_root.join(spec.account_id());
+    let space_dir = account_dir.join(spec.space_id());
+    for directory in [
+        paths.home.as_path(),
+        staging_root.as_path(),
+        account_dir.as_path(),
+        space_dir.as_path(),
+        paths.staging.as_path(),
+    ] {
+        let metadata = match fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(to_err(error)),
+        };
+        if !metadata.is_dir() || metadata_is_link_or_junction(&metadata) {
+            return Err(CommandError::invalid_input(
+                "refusing to clear verification staging through a link or junction",
+            ));
+        }
+    }
+    match fs::remove_dir_all(&paths.staging) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(to_err(error)),
+    }
+}
+
+fn append_task_warning(paths: &LiosPaths, task_id: Uuid, warning: &str) -> CommandResult<()> {
+    let store = task_store(paths)?;
+    let Some(task) = store.get(task_id).map_err(to_err)? else {
+        return Ok(());
+    };
+    let message = task
+        .error
+        .as_deref()
+        .map(|existing| format!("{existing}; {warning}"))
+        .unwrap_or_else(|| warning.to_string());
+    store
+        .update_state(task_id, task.state, Some(message))
+        .map_err(to_err)
+}
+
+fn cleanup_terminal_verification_staging_and_record(
+    paths: &LiosPaths,
+    spec: &TaskSpec,
+    task_id: Uuid,
+) -> CommandResult<()> {
+    if let Err(error) = cleanup_terminal_verification_staging(paths, spec, task_id) {
+        append_task_warning(
+            paths,
+            task_id,
+            &format!("verification staging cleanup failed: {}", error.message),
+        )?;
+    }
+    Ok(())
+}
+
+fn cleanup_terminal_verification_staging_after_restart(paths: &LiosPaths) -> lios_core::Result<()> {
+    let store = TaskStore::open(&paths.database)?;
+    for task in store.list()? {
+        if task_state_is_active(&task.state) {
+            continue;
+        }
+        let Some(spec) = store.load_spec(task.id)? else {
+            continue;
+        };
+        if !matches!(spec, TaskSpec::VerifySpace { .. }) {
+            continue;
+        }
+        let task_paths = paths.for_task(spec.account_id(), spec.space_id(), task.id)?;
+        cleanup_terminal_verification_staging_and_record(&task_paths, &spec, task.id)
+            .map_err(|error| lios_core::LiosError::Storage(error.message))?;
+    }
+    Ok(())
+}
+
+async fn cleanup_terminal_verification_staging_after_restart_async(
+    paths: LiosPaths,
+) -> lios_core::Result<()> {
+    tokio::task::spawn_blocking(move || cleanup_terminal_verification_staging_after_restart(&paths))
+        .await
+        .map_err(|error| {
+            lios_core::LiosError::Storage(format!(
+                "verification staging cleanup worker failed: {error}"
+            ))
+        })?
+}
+
+fn start_terminal_verification_staging_cleanup(app: &tauri::AppHandle, paths: &LiosPaths) {
+    let app = app.clone();
+    let paths = paths.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = cleanup_terminal_verification_staging_after_restart_async(paths.clone()).await;
+        emit_tasks(&app, &paths);
+    });
+}
+
+fn metadata_is_link_or_junction(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 enum TaskWorkerOutcome {
     Committed { warnings: Vec<String> },
     Completed,
+    CompletedWithWarnings { warnings: Vec<String> },
     Interrupted(TaskState),
     NeedsReconciliation,
 }
@@ -1385,6 +1608,19 @@ async fn run_persisted_task_locked(
                     .map(|_| ());
                     break result;
                 }
+                Ok(TaskWorkerOutcome::CompletedWithWarnings { warnings }) => {
+                    let result = finish_active_worker(
+                        &task_paths,
+                        &state.task_lifecycle_gate,
+                        &state.catalog_mutation_gate,
+                        task_id,
+                        TaskState::Completed,
+                        (!warnings.is_empty()).then(|| warnings.join("; ")),
+                    )
+                    .await
+                    .map(|_| ());
+                    break result;
+                }
                 Ok(TaskWorkerOutcome::Interrupted(interrupted)) => {
                     let result = finish_active_worker(
                         &task_paths,
@@ -1496,8 +1732,13 @@ async fn run_persisted_task_locked(
     }
     .await;
     manager.remove(&control).await;
+    let staging_cleanup =
+        cleanup_terminal_verification_staging_and_record(&task_paths, &spec, task_id);
     emit_tasks(&app, &paths);
-    finalization
+    match finalization {
+        Ok(()) => staging_cleanup,
+        Err(error) => Err(error),
+    }
 }
 
 async fn execute_task_with_retries(
@@ -1646,7 +1887,10 @@ async fn execute_task_spec(
             output_dir,
             ..
         } => run_download_worker(app, paths, task, repo, node_ids, output_dir, cancellation).await,
-        TaskSpec::VerifySpace { .. } | TaskSpec::RebuildCatalog { .. } => Err(CommandError::new(
+        TaskSpec::VerifySpace { repo, full, .. } => {
+            run_verify_space_worker(app, paths, task, repo, full, cancellation).await
+        }
+        TaskSpec::RebuildCatalog { .. } => Err(CommandError::new(
             CommandErrorCode::InvalidInput,
             "task type is not implemented yet",
             false,
@@ -1906,7 +2150,16 @@ async fn run_download_worker(
     let mut download_total_bytes = 0u64;
     for file in &remote_files {
         let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
-        let was_cached = local_remote_file_is_valid(&local_path, file)?;
+        let was_cached = match validate_local_remote_file(&local_path, file, cancellation).await? {
+            LocalRemoteFileValidation::Valid => true,
+            LocalRemoteFileValidation::Invalid => false,
+            LocalRemoteFileValidation::Canceled => {
+                let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+                    .map_err(to_err)?
+                    .unwrap_or(TaskState::Canceled);
+                return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+            }
+        };
         let size = remote_sizes.get(&file.path).copied().unwrap_or(0);
         if !was_cached {
             download_total_bytes = download_total_bytes.saturating_add(size);
@@ -1978,7 +2231,18 @@ async fn run_download_worker(
                 }
             }
         }
-        if !local_remote_file_is_valid(local_path, file)? {
+        let downloaded_is_valid =
+            match validate_local_remote_file(local_path, file, cancellation).await? {
+                LocalRemoteFileValidation::Valid => true,
+                LocalRemoteFileValidation::Invalid => false,
+                LocalRemoteFileValidation::Canceled => {
+                    let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+                        .map_err(to_err)?
+                        .unwrap_or(TaskState::Canceled);
+                    return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+                }
+            };
+        if !downloaded_is_valid {
             return Err(CommandError::new(
                 CommandErrorCode::CorruptedData,
                 format!("downloaded object failed hash verification: {}", file.path),
@@ -2044,6 +2308,502 @@ async fn run_download_worker(
     Ok(TaskWorkerOutcome::Completed)
 }
 
+fn remote_integrity_warnings(
+    report: &CatalogRemoteIntegrityReport,
+    include_metadata_limit: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if include_metadata_limit && report.metadata_limited_objects > 0 {
+        warnings.push(format!(
+            "{} 个旧分片没有密文大小元数据，已校验 LFS OID；请运行完整检查验证内容",
+            report.metadata_limited_objects
+        ));
+    }
+    if report.unreferenced_managed_objects > 0 {
+        warnings.push(format!(
+            "发现 {} 个未被当前 catalog 引用的远端对象",
+            report.unreferenced_managed_objects
+        ));
+    }
+    warnings
+}
+
+fn map_remote_integrity_error(error: lios_core::LiosError) -> CommandError {
+    match error {
+        lios_core::LiosError::DataCorruption(reason) => CommandError::new(
+            CommandErrorCode::CorruptedData,
+            format!("space verification failed: {reason}"),
+            false,
+            Some(serde_json::json!({ "reason": reason })),
+        ),
+        error => to_err(error),
+    }
+}
+
+fn verification_commit_id(revision: &RepoRevision) -> CommandResult<&str> {
+    revision
+        .commit_id
+        .as_deref()
+        .filter(|commit_id| !commit_id.trim().is_empty())
+        .ok_or_else(|| {
+            CommandError::new(
+                CommandErrorCode::Storage,
+                "remote revision has no immutable commit id",
+                false,
+                None,
+            )
+        })
+}
+
+fn ensure_verification_revision_unchanged(
+    started: &RepoRevision,
+    finished: &RepoRevision,
+) -> CommandResult<()> {
+    if started.branch != finished.branch || started.commit_id != finished.commit_id {
+        return Err(CommandError::new(
+            CommandErrorCode::RemoteConflict,
+            "remote space changed while verification was running",
+            false,
+            Some(serde_json::json!({
+                "started_revision": started.commit_id,
+                "finished_revision": finished.commit_id,
+            })),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_verification_snapshot_is_current(
+    branch_adapter: &ModelScopeAdapter,
+    repo: &RepoConfig,
+    started: &RepoRevision,
+    cancellation: &CancellationToken,
+) -> CommandResult<bool> {
+    let Some(finished) =
+        head_revision_with_cancellation(branch_adapter, repo, cancellation).await?
+    else {
+        return Ok(false);
+    };
+    ensure_verification_revision_unchanged(started, &finished)?;
+    Ok(true)
+}
+
+async fn head_revision_with_cancellation(
+    adapter: &ModelScopeAdapter,
+    repo: &RepoConfig,
+    cancellation: &CancellationToken,
+) -> CommandResult<Option<RepoRevision>> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Ok(None),
+        result = adapter.head_revision(&repo.namespace, &repo.dataset) => {
+            result.map(Some).map_err(to_err)
+        }
+    }
+}
+
+async fn run_verify_space_worker(
+    app: &tauri::AppHandle,
+    paths: &LiosPaths,
+    mut task: TaskRecord,
+    repo: RepoConfig,
+    full: bool,
+    cancellation: &CancellationToken,
+) -> CommandResult<TaskWorkerOutcome> {
+    let config = load_config(paths)?;
+    let key = key_from_config(&config)?;
+    let repo = validate_repo(repo)?;
+    let branch_adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(paths)?);
+    let Some(started_revision) =
+        head_revision_with_cancellation(&branch_adapter, &repo, cancellation).await?
+    else {
+        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+            .map_err(to_err)?
+            .unwrap_or(TaskState::Canceled);
+        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+    };
+    let pinned_commit = verification_commit_id(&started_revision)?.to_string();
+    let adapter = branch_adapter.clone().with_revision(pinned_commit);
+
+    update_task_state(paths, task.id, TaskState::Running, None)?;
+    update_task_phase(paths, task.id, Some("checking_remote".to_string()))?;
+    task.state = TaskState::Running;
+    task.phase = Some("checking_remote".to_string());
+    task.progress_done = 0;
+    task.progress_total = 1;
+    task.bytes_done = 0;
+    task.speed_bps = 0;
+    task.eta_seconds = None;
+
+    let remote_objects = tokio::select! {
+        result = adapter.list_objects(&repo.namespace, &repo.dataset, "") => {
+            result.map_err(to_err)?
+        }
+        _ = cancellation.cancelled() => {
+            let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+                .map_err(to_err)?
+                .unwrap_or(TaskState::Canceled);
+            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+        }
+    };
+    let catalog_remote_size = remote_objects
+        .iter()
+        .find(|object| object.path == CATALOG_FILE)
+        .map(|object| object.size)
+        .ok_or_else(|| {
+            CommandError::new(
+                CommandErrorCode::CorruptedData,
+                "space catalog is missing from remote inventory",
+                false,
+                None,
+            )
+        })?;
+    update_task_transfer(
+        paths,
+        task.id,
+        TaskTransferUpdate {
+            done: 0,
+            total: 1,
+            bytes_done: 0,
+            bytes_total: catalog_remote_size,
+            speed_bps: 0,
+            eta_seconds: None,
+        },
+    )?;
+    emit_tasks(app, paths);
+
+    let catalog_path = paths.staging.join(CATALOG_FILE);
+    let mut catalog_metrics = TransferMetrics::new();
+    let catalog_download = adapter.download_object_with_progress(
+        &repo.namespace,
+        &repo.dataset,
+        CATALOG_FILE,
+        &catalog_path,
+        |bytes_done| {
+            let observation = catalog_metrics.observe(bytes_done, catalog_remote_size, false);
+            if observation.should_publish {
+                let _ = update_task_transfer(
+                    paths,
+                    task.id,
+                    TaskTransferUpdate {
+                        done: 0,
+                        total: 1,
+                        bytes_done,
+                        bytes_total: catalog_remote_size,
+                        speed_bps: observation.speed_bps,
+                        eta_seconds: observation.eta_seconds,
+                    },
+                );
+                emit_tasks(app, paths);
+            }
+        },
+    );
+    tokio::select! {
+        result = catalog_download => result.map_err(map_catalog_load_error)?,
+        _ = cancellation.cancelled() => {
+            let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+                .map_err(to_err)?
+                .unwrap_or(TaskState::Canceled);
+            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+        }
+    }
+
+    let catalog = Catalog::from_staging(paths.staging.clone());
+    let remote_report = catalog
+        .verify_remote_inventory(&key, &remote_objects)
+        .map_err(map_remote_integrity_error)?;
+    if !full {
+        let warnings = remote_integrity_warnings(&remote_report, true);
+        update_task_phase(paths, task.id, Some("checking_complete".to_string()))?;
+        update_task_transfer(
+            paths,
+            task.id,
+            TaskTransferUpdate {
+                done: remote_report
+                    .verified_objects
+                    .saturating_add(remote_report.metadata_limited_objects),
+                total: remote_report.expected_objects,
+                bytes_done: remote_report.encoded_bytes_verified,
+                bytes_total: remote_report.encoded_bytes_verified,
+                speed_bps: 0,
+                eta_seconds: None,
+            },
+        )?;
+        emit_tasks(app, paths);
+        if !ensure_verification_snapshot_is_current(
+            &branch_adapter,
+            &repo,
+            &started_revision,
+            cancellation,
+        )
+        .await?
+        {
+            let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+                .map_err(to_err)?
+                .unwrap_or(TaskState::Canceled);
+            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+        }
+        return Ok(if warnings.is_empty() {
+            TaskWorkerOutcome::Completed
+        } else {
+            TaskWorkerOutcome::CompletedWithWarnings { warnings }
+        });
+    }
+
+    let remote_files = catalog
+        .remote_files_for_selection(&CatalogSelection::All, &key)
+        .map_err(map_remote_integrity_error)?;
+    let remote_sizes = remote_objects
+        .iter()
+        .map(|object| (object.path.as_str(), object.size))
+        .collect::<HashMap<_, _>>();
+    let mut download_plan = Vec::with_capacity(remote_files.len());
+    let mut download_total_bytes = catalog_remote_size;
+    for file in &remote_files {
+        let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
+        let was_cached = match validate_local_remote_file(&local_path, file, cancellation).await? {
+            LocalRemoteFileValidation::Valid => true,
+            LocalRemoteFileValidation::Invalid => false,
+            LocalRemoteFileValidation::Canceled => {
+                let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+                    .map_err(to_err)?
+                    .unwrap_or(TaskState::Canceled);
+                return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+            }
+        };
+        let remote_size = *remote_sizes.get(file.path.as_str()).ok_or_else(|| {
+            CommandError::new(
+                CommandErrorCode::CorruptedData,
+                format!("verified remote object disappeared: {}", file.path),
+                false,
+                None,
+            )
+        })?;
+        if !was_cached {
+            download_total_bytes =
+                download_total_bytes
+                    .checked_add(remote_size)
+                    .ok_or_else(|| {
+                        CommandError::new(
+                            CommandErrorCode::CorruptedData,
+                            "full space check byte total overflowed",
+                            false,
+                            None,
+                        )
+                    })?;
+        }
+        download_plan.push((file, local_path, was_cached, remote_size));
+    }
+
+    task.progress_total = u64::try_from(remote_files.len())
+        .ok()
+        .and_then(|count| count.checked_add(2))
+        .ok_or_else(|| {
+            CommandError::new(
+                CommandErrorCode::CorruptedData,
+                "full space check object count overflowed",
+                false,
+                None,
+            )
+        })?;
+    task.progress_done = 1;
+    task.bytes_done = catalog_remote_size;
+    update_task_phase(
+        paths,
+        task.id,
+        Some("downloading_verification_data".to_string()),
+    )?;
+    update_task_transfer(
+        paths,
+        task.id,
+        TaskTransferUpdate {
+            done: task.progress_done,
+            total: task.progress_total,
+            bytes_done: task.bytes_done,
+            bytes_total: download_total_bytes,
+            speed_bps: 0,
+            eta_seconds: None,
+        },
+    )?;
+    emit_tasks(app, paths);
+
+    let mut download_metrics = TransferMetrics::new();
+    let _ = download_metrics.observe(task.bytes_done, download_total_bytes, true);
+    for (index, (file, local_path, was_cached, remote_size)) in download_plan.iter().enumerate() {
+        if let Some(interrupted) =
+            observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
+        {
+            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+        }
+        if !was_cached {
+            let completed_before_object = task.bytes_done;
+            let download = adapter.download_object_with_progress(
+                &repo.namespace,
+                &repo.dataset,
+                &file.path,
+                local_path,
+                |object_bytes_done| {
+                    let bytes_done = completed_before_object.saturating_add(object_bytes_done);
+                    let observation =
+                        download_metrics.observe(bytes_done, download_total_bytes, false);
+                    if observation.should_publish {
+                        let _ = update_task_transfer(
+                            paths,
+                            task.id,
+                            TaskTransferUpdate {
+                                done: index as u64 + 1,
+                                total: task.progress_total,
+                                bytes_done,
+                                bytes_total: download_total_bytes,
+                                speed_bps: observation.speed_bps,
+                                eta_seconds: observation.eta_seconds,
+                            },
+                        );
+                        emit_tasks(app, paths);
+                    }
+                },
+            );
+            tokio::select! {
+                result = download => result.map_err(to_err)?,
+                _ = cancellation.cancelled() => {
+                    let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+                        .map_err(to_err)?
+                        .unwrap_or(TaskState::Canceled);
+                    return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+                }
+            }
+            let downloaded_is_valid =
+                match validate_local_remote_file(local_path, file, cancellation).await? {
+                    LocalRemoteFileValidation::Valid => true,
+                    LocalRemoteFileValidation::Invalid => false,
+                    LocalRemoteFileValidation::Canceled => {
+                        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+                            .map_err(to_err)?
+                            .unwrap_or(TaskState::Canceled);
+                        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+                    }
+                };
+            if !downloaded_is_valid {
+                return Err(CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    format!("downloaded verification object is invalid: {}", file.path),
+                    false,
+                    None,
+                ));
+            }
+            task.bytes_done = task.bytes_done.checked_add(*remote_size).ok_or_else(|| {
+                CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    "full space check progress overflowed",
+                    false,
+                    None,
+                )
+            })?;
+        }
+        task.progress_done = u64::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(2))
+            .ok_or_else(|| {
+                CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    "full space check progress overflowed",
+                    false,
+                    None,
+                )
+            })?;
+        let observation = download_metrics.observe(task.bytes_done, download_total_bytes, true);
+        update_task_transfer(
+            paths,
+            task.id,
+            TaskTransferUpdate {
+                done: task.progress_done,
+                total: task.progress_total,
+                bytes_done: task.bytes_done,
+                bytes_total: download_total_bytes,
+                speed_bps: observation.speed_bps,
+                eta_seconds: observation.eta_seconds,
+            },
+        )?;
+        emit_tasks(app, paths);
+    }
+
+    update_task_phase(paths, task.id, Some("verifying_content".to_string()))?;
+    update_task_transfer(
+        paths,
+        task.id,
+        TaskTransferUpdate {
+            done: task.progress_total.saturating_sub(1),
+            total: task.progress_total,
+            bytes_done: download_total_bytes,
+            bytes_total: download_total_bytes,
+            speed_bps: 0,
+            eta_seconds: None,
+        },
+    )?;
+    emit_tasks(app, paths);
+    let verify_catalog = catalog.clone();
+    let verify_key = key.clone();
+    let verify_cancellation = cancellation.clone();
+    let integrity_outcome = tokio::task::spawn_blocking(move || {
+        verify_catalog
+            .verify_staged_integrity_with_cancel(&verify_key, || verify_cancellation.is_cancelled())
+    })
+    .await
+    .map_err(|error| {
+        CommandError::new(
+            CommandErrorCode::Internal,
+            format!("full space check worker failed: {error}"),
+            false,
+            None,
+        )
+    })?
+    .map_err(to_err)?;
+    if matches!(integrity_outcome, CatalogIntegrityOutcome::Canceled(_)) {
+        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+            .map_err(to_err)?
+            .unwrap_or(TaskState::Canceled);
+        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+    }
+    if let Some(interrupted) =
+        observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
+    {
+        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+    }
+    update_task_phase(paths, task.id, Some("checking_complete".to_string()))?;
+    update_task_transfer(
+        paths,
+        task.id,
+        TaskTransferUpdate {
+            done: task.progress_total,
+            total: task.progress_total,
+            bytes_done: download_total_bytes,
+            bytes_total: download_total_bytes,
+            speed_bps: 0,
+            eta_seconds: None,
+        },
+    )?;
+    emit_tasks(app, paths);
+    if !ensure_verification_snapshot_is_current(
+        &branch_adapter,
+        &repo,
+        &started_revision,
+        cancellation,
+    )
+    .await?
+    {
+        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+            .map_err(to_err)?
+            .unwrap_or(TaskState::Canceled);
+        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+    }
+    let warnings = remote_integrity_warnings(&remote_report, false);
+    Ok(if warnings.is_empty() {
+        TaskWorkerOutcome::Completed
+    } else {
+        TaskWorkerOutcome::CompletedWithWarnings { warnings }
+    })
+}
+
 fn desired_catalog_objects(
     paths: &LiosPaths,
     catalog: &Catalog,
@@ -2066,7 +2826,7 @@ fn desired_catalog_objects(
             path: file.path,
             local_path: local_path.exists().then_some(local_path),
             expected_sha256: file.sha256,
-            expected_size: None,
+            expected_size: file.expected_size,
         });
     }
     desired.sort_by(|a, b| {
@@ -2702,6 +3462,27 @@ async fn enqueue_download(
 }
 
 #[tauri::command]
+async fn enqueue_verify_space(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppContext>,
+    space: RepoConfig,
+    full: bool,
+) -> CommandResult<TaskRecord> {
+    let config = load_config(&state.paths)?;
+    key_from_config(&config)?;
+    read_token(&state.paths)?;
+    let repo = validate_repo(space)?;
+    let scope = TaskScope::from_repo(&repo);
+    let spec = TaskSpec::VerifySpace {
+        account_id: scope.account_id,
+        space_id: scope.space_id,
+        repo,
+        full,
+    };
+    submit_and_spawn(&app, state.inner(), spec, &[])
+}
+
+#[tauri::command]
 fn list_tasks(state: tauri::State<'_, AppContext>) -> CommandResult<Vec<TaskRecord>> {
     task_store(&state.paths)?.list().map_err(to_err)
 }
@@ -2847,6 +3628,7 @@ pub fn run() {
             let handle = app.handle().clone();
             let paths = app.state::<AppContext>().paths.clone();
             let recovery = recover_startup_tasks(&paths)?;
+            start_terminal_verification_staging_cleanup(&handle, &paths);
             emit_tasks(&handle, &paths);
             start_startup_tasks(&handle, &paths, recovery)?;
             Ok(())
@@ -3343,6 +4125,38 @@ mod task_cleanup_tests {
         assert!(!staged.exists());
     }
 
+    #[tokio::test]
+    async fn completed_worker_preserves_warning_text() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let lifecycle = Mutex::new(TaskLifecycleState::default());
+        let catalog_mutation_gate = CatalogMutationGate::default();
+        let task = activate_new_task(&paths, &lifecycle, TaskRecord::queued("verify_quick", 1))
+            .await
+            .unwrap();
+        let warning = "1 个旧版分片缺少长度元数据";
+
+        let final_state = finish_active_worker(
+            &paths,
+            &lifecycle,
+            &catalog_mutation_gate,
+            task.id,
+            TaskState::Completed,
+            Some(warning.to_string()),
+        )
+        .await
+        .unwrap();
+
+        let completed = TaskStore::open(&paths.database)
+            .unwrap()
+            .get(task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_state, TaskState::Completed);
+        assert_eq!(completed.state, TaskState::Completed);
+        assert_eq!(completed.error.as_deref(), Some(warning));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn activation_cannot_enter_between_cleanup_check_and_deletion() {
         let temp = tempdir().unwrap();
@@ -3660,5 +4474,281 @@ mod task_cleanup_tests {
 
         assert!(result.is_err());
         assert!(!lifecycle.lock().await.active_workers.contains(&task.id));
+    }
+}
+
+#[cfg(test)]
+mod remote_verification_tests {
+    use std::fs;
+    #[cfg(windows)]
+    use std::process::Command;
+
+    use lios_core::catalog::CatalogRemoteFile;
+    use lios_core::config::{LiosPaths, RepoConfig};
+    use lios_core::storage::RepoRevision;
+    use lios_core::tasks::{TaskRecord, TaskSpec, TaskState, TaskStore};
+    use lios_core::LiosError;
+    use tempfile::tempdir;
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        append_task_warning, cleanup_terminal_verification_staging,
+        cleanup_terminal_verification_staging_after_restart_async,
+        cleanup_terminal_verification_staging_and_record, clear_task_record,
+        ensure_verification_revision_unchanged, head_revision_with_cancellation,
+        map_remote_integrity_error, validate_local_remote_file, verification_commit_id,
+        CommandErrorCode, LocalRemoteFileValidation, TaskLifecycleState,
+    };
+
+    fn verification_spec() -> TaskSpec {
+        TaskSpec::VerifySpace {
+            account_id: "a".repeat(64),
+            space_id: "b".repeat(64),
+            repo: RepoConfig {
+                namespace: "novix".to_string(),
+                dataset: "cold".to_string(),
+                endpoint: "https://modelscope.cn".to_string(),
+            },
+            full: true,
+        }
+    }
+
+    #[test]
+    fn changed_verification_revision_is_a_remote_conflict() {
+        let started = RepoRevision {
+            branch: "master".to_string(),
+            commit_id: Some("commit-a".to_string()),
+        };
+        let finished = RepoRevision {
+            branch: "master".to_string(),
+            commit_id: Some("commit-b".to_string()),
+        };
+
+        let error = ensure_verification_revision_unchanged(&started, &finished).unwrap_err();
+
+        assert_eq!(error.code, CommandErrorCode::RemoteConflict);
+    }
+
+    #[test]
+    fn verification_requires_an_immutable_commit_id() {
+        let revision = RepoRevision {
+            branch: "master".to_string(),
+            commit_id: None,
+        };
+
+        let error = verification_commit_id(&revision).unwrap_err();
+
+        assert_eq!(error.code, CommandErrorCode::Storage);
+    }
+
+    #[tokio::test]
+    async fn revision_lookup_observes_preexisting_cancellation() {
+        let adapter =
+            lios_core::modelscope::ModelScopeAdapter::new("http://127.0.0.1:9", "unused-token");
+        let repo = RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let revision = head_revision_with_cancellation(&adapter, &repo, &cancellation)
+            .await
+            .unwrap();
+
+        assert_eq!(revision, None);
+    }
+
+    #[test]
+    fn terminal_verification_discards_staging_but_paused_verification_keeps_it() {
+        for (state, should_exist) in [
+            (TaskState::Completed, false),
+            (TaskState::Failed, false),
+            (TaskState::Canceled, false),
+            (TaskState::Paused, true),
+            (TaskState::Retrying, true),
+        ] {
+            let temp = tempdir().unwrap();
+            let paths = LiosPaths::from_home(temp.path());
+            let spec = verification_spec();
+            let task = TaskRecord::queued_for_spec(&spec);
+            let store = TaskStore::open(&paths.database).unwrap();
+            store.insert_with_spec(&task, &spec).unwrap();
+            store.update_state(task.id, state, None).unwrap();
+            let task_paths = paths
+                .for_task(spec.account_id(), spec.space_id(), task.id)
+                .unwrap();
+            task_paths.ensure_dirs().unwrap();
+            fs::write(task_paths.staging.join("cached.lios"), b"cached").unwrap();
+
+            cleanup_terminal_verification_staging(&task_paths, &spec, task.id).unwrap();
+
+            assert_eq!(task_paths.staging.exists(), should_exist);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verification_cleanup_rejects_a_junction_target_inside_lios_home() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let spec = verification_spec();
+        let task = TaskRecord::queued_for_spec(&spec);
+        let store = TaskStore::open(&paths.database).unwrap();
+        store.insert_with_spec(&task, &spec).unwrap();
+        store
+            .update_state(task.id, TaskState::Completed, None)
+            .unwrap();
+        let task_paths = paths
+            .for_task(spec.account_id(), spec.space_id(), task.id)
+            .unwrap();
+        task_paths.ensure_dirs().unwrap();
+        fs::remove_dir_all(&task_paths.staging).unwrap();
+        let protected = paths.home.join("protected");
+        fs::create_dir_all(&protected).unwrap();
+        let sentinel = protected.join("keep.txt");
+        fs::write(&sentinel, b"keep").unwrap();
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&task_paths.staging)
+            .arg(&protected)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to create junction: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(cleanup_terminal_verification_staging(&task_paths, &spec, task.id).is_err());
+        assert!(sentinel.exists());
+        cleanup_terminal_verification_staging_and_record(&task_paths, &spec, task.id).unwrap();
+        let stored = TaskStore::open(&paths.database)
+            .unwrap()
+            .get(task.id)
+            .unwrap()
+            .unwrap();
+        assert!(stored
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("verification staging cleanup failed")));
+    }
+
+    #[tokio::test]
+    async fn deferred_startup_sweep_removes_terminal_verification_staging() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let spec = verification_spec();
+        let task = TaskRecord::queued_for_spec(&spec);
+        let store = TaskStore::open(&paths.database).unwrap();
+        store.insert_with_spec(&task, &spec).unwrap();
+        store
+            .update_state(task.id, TaskState::Completed, None)
+            .unwrap();
+        let task_paths = paths
+            .for_task(spec.account_id(), spec.space_id(), task.id)
+            .unwrap();
+        task_paths.ensure_dirs().unwrap();
+        fs::write(task_paths.staging.join("cached.lios"), b"cached").unwrap();
+
+        cleanup_terminal_verification_staging_after_restart_async(paths.clone())
+            .await
+            .unwrap();
+
+        assert!(!task_paths.staging.exists());
+    }
+
+    #[tokio::test]
+    async fn cached_file_hashing_observes_cancellation() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("cached.lios");
+        fs::write(&path, vec![7u8; 2 * 1024 * 1024]).unwrap();
+        let file = CatalogRemoteFile {
+            path: "objects/files/a/chunks/b.lios".to_string(),
+            expected_size: Some(2 * 1024 * 1024),
+            sha256: Some("unused-after-cancel".to_string()),
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let outcome = validate_local_remote_file(&path, &file, &cancellation)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, LocalRemoteFileValidation::Canceled);
+    }
+
+    #[test]
+    fn cleanup_warning_is_persisted_for_a_canceled_task() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let spec = verification_spec();
+        let task = TaskRecord::queued_for_spec(&spec);
+        let store = TaskStore::open(&paths.database).unwrap();
+        store.insert_with_spec(&task, &spec).unwrap();
+        store
+            .update_state(task.id, TaskState::Canceled, None)
+            .unwrap();
+
+        append_task_warning(&paths, task.id, "cleanup failed").unwrap();
+
+        assert_eq!(
+            TaskStore::open(&paths.database)
+                .unwrap()
+                .get(task.id)
+                .unwrap()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("cleanup failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_terminal_verification_removes_staging_before_the_record() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let spec = verification_spec();
+        let task = TaskRecord::queued_for_spec(&spec);
+        let store = TaskStore::open(&paths.database).unwrap();
+        store.insert_with_spec(&task, &spec).unwrap();
+        store
+            .update_state(task.id, TaskState::Completed, None)
+            .unwrap();
+        let task_paths = paths
+            .for_task(spec.account_id(), spec.space_id(), task.id)
+            .unwrap();
+        task_paths.ensure_dirs().unwrap();
+        fs::write(task_paths.staging.join("cached.lios"), b"cached").unwrap();
+
+        clear_task_record(&paths, &Mutex::new(TaskLifecycleState::default()), task.id)
+            .await
+            .unwrap();
+
+        assert!(!task_paths.staging.exists());
+        assert!(TaskStore::open(&paths.database)
+            .unwrap()
+            .get(task.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn remote_integrity_error_preserves_the_affected_object() {
+        let reason = "remote object LFS OID mismatch: objects/files/a/chunks/b.lios".to_string();
+
+        let error = map_remote_integrity_error(LiosError::DataCorruption(reason.clone()));
+
+        assert_eq!(error.code, CommandErrorCode::CorruptedData);
+        assert!(error.message.contains(&reason));
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details["reason"].as_str()),
+            Some(reason.as_str())
+        );
     }
 }

@@ -688,6 +688,14 @@ select:focus {
   min-width: 0;
 }
 
+.settingsActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .cleanupResult {
   border: 1px solid #f4d5e6;
   border-radius: 8px;
@@ -1140,6 +1148,15 @@ select:focus {
   .manualGrid,
   .tokenRow {
     grid-template-columns: 1fr;
+  }
+
+  .settingsHeaderRow {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .settingsActions {
+    justify-content: flex-start;
   }
 
   .taskDrawer {
