@@ -2,7 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use lios_core::{
-    catalog::{Catalog, CatalogTreeNodeKind, PackOutcome, SkippedPathReason},
+    catalog::{
+        snapshot_source_files, verify_source_file_unchanged, Catalog, CatalogTreeNodeKind,
+        PackOutcome, SkippedPathReason,
+    },
     crypto::KeyFile,
     pack::{PackOptions, PackSource},
     LiosError,
@@ -24,6 +27,149 @@ fn assert_skipped_error<T>(result: Result<T, LiosError>, skipped: &Path) {
         panic!("expected skipped-path error");
     };
     assert_eq!(message, format!("skipped 1 path: {}", skipped.display()));
+}
+
+#[test]
+fn source_file_snapshots_preserve_relative_names_sizes_and_mtime() {
+    let tmp = tempdir().unwrap();
+    let album = tmp.path().join("album");
+    let nested = album.join("nested");
+    let empty = album.join("empty");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&empty).unwrap();
+    fs::write(album.join("cover.bin"), b"cover").unwrap();
+    fs::write(nested.join("track.bin"), b"track-data").unwrap();
+
+    let report = snapshot_source_files(std::slice::from_ref(&album)).unwrap();
+
+    assert!(report.skipped_paths.is_empty());
+    assert_eq!(report.directories.len(), 3);
+    assert_eq!(report.directories[0].relative_path, Path::new("album"));
+    assert_eq!(
+        report.directories[1].relative_path,
+        Path::new("album/empty")
+    );
+    assert_eq!(
+        report.directories[2].relative_path,
+        Path::new("album/nested")
+    );
+    assert_eq!(report.files.len(), 2);
+    assert_eq!(report.files[0].source_path, album.join("cover.bin"));
+    assert_eq!(report.files[0].relative_path, Path::new("album/cover.bin"));
+    assert_eq!(report.files[0].size, 5);
+    assert!(report.files[0].modified_at_ns.is_some());
+    assert_eq!(report.files[1].source_path, nested.join("track.bin"));
+    assert_eq!(
+        report.files[1].relative_path,
+        Path::new("album/nested/track.bin")
+    );
+    assert_eq!(report.files[1].size, 10);
+}
+
+#[test]
+fn source_file_verification_rejects_changes_during_packing() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    fs::write(&source, [1u8; 4]).unwrap();
+    let snapshot = snapshot_source_files(std::slice::from_ref(&source))
+        .unwrap()
+        .files
+        .remove(0);
+    fs::write(&source, [2u8; 8]).unwrap();
+
+    let error = verify_source_file_unchanged(&snapshot).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LiosError::Unsupported(message)
+            if message.contains("source file changed while it was being packed")
+    ));
+}
+
+#[test]
+fn source_file_verification_reports_a_file_removed_during_packing() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    fs::write(&source, [1u8; 4]).unwrap();
+    let snapshot = snapshot_source_files(std::slice::from_ref(&source))
+        .unwrap()
+        .files
+        .remove(0);
+    fs::remove_file(&source).unwrap();
+
+    let error = verify_source_file_unchanged(&snapshot).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LiosError::Unsupported(message)
+            if message.contains("source file no longer exists")
+                && message.contains("source.bin")
+    ));
+}
+
+#[test]
+fn folder_upload_report_records_the_exact_packed_source_snapshot() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("album");
+    fs::create_dir_all(source.join("empty")).unwrap();
+    fs::write(source.join("track.bin"), b"track").unwrap();
+    let expected = snapshot_source_files(std::slice::from_ref(&source)).unwrap();
+    let staging = tmp.path().join("staging");
+    let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
+    let catalog = Catalog::initialize_empty("Space", &key, staging.clone()).unwrap();
+    let root_id = catalog.decrypt_tree(&key).unwrap().id;
+
+    let report = catalog
+        .add_paths_to_folder_with_progress_and_report(
+            &root_id,
+            std::slice::from_ref(&source),
+            &[],
+            &key,
+            PackOptions {
+                chunk_size: 4,
+                staging_dir: staging,
+            },
+            |_| {},
+        )
+        .unwrap();
+
+    assert_eq!(report.source_snapshot(), expected);
+}
+
+#[test]
+fn packed_snapshot_exposes_a_temporary_file_that_disappears_before_post_validation() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("album");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("original.bin"), b"original").unwrap();
+    let queued_snapshot = snapshot_source_files(std::slice::from_ref(&source)).unwrap();
+    let temporary = source.join("temporary.bin");
+    fs::write(&temporary, b"temporary").unwrap();
+    let staging = tmp.path().join("staging");
+    let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
+    let catalog = Catalog::initialize_empty("Space", &key, staging.clone()).unwrap();
+    let root_id = catalog.decrypt_tree(&key).unwrap().id;
+
+    let report = catalog
+        .add_paths_to_folder_with_progress_and_report(
+            &root_id,
+            std::slice::from_ref(&source),
+            &[],
+            &key,
+            PackOptions {
+                chunk_size: 4,
+                staging_dir: staging,
+            },
+            |_| {},
+        )
+        .unwrap();
+    fs::remove_file(temporary).unwrap();
+
+    assert_ne!(report.source_snapshot(), queued_snapshot);
+    assert_eq!(
+        snapshot_source_files(std::slice::from_ref(&source)).unwrap(),
+        queued_snapshot
+    );
 }
 
 #[test]

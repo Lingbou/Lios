@@ -665,6 +665,18 @@ pub trait StorageAdapter: Send + Sync {
             "blob upload is not implemented by this storage adapter".to_string(),
         ))
     }
+    async fn upload_blob_with_progress(
+        &self,
+        blob: &BlobSpec,
+        validated: ValidatedBlobUpload,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
+    ) -> Result<BlobCheckpoint> {
+        let checkpoint = self.upload_blob(blob, validated).await?;
+        if let Some(progress) = progress {
+            let _ = progress.send(blob.size);
+        }
+        Ok(checkpoint)
+    }
     async fn commit_actions(
         &self,
         _namespace: &str,
