@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,7 +8,9 @@ use lios_core::{
     modelscope::ModelScopeAdapter,
     pack::{PackOptions, PackSource},
     restore::{RestoreConflictPolicy, RestoreOptions},
-    storage::StorageAdapter,
+    storage::{
+        current_catalog_sha256, BlobSpec, BlobValidation, CommitPlan, RemoteAction, StorageAdapter,
+    },
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -70,6 +72,70 @@ fn read_all_files(root: &Path) -> Vec<(String, String)> {
     entries
 }
 
+async fn commit_staged_snapshot(
+    adapter: &ModelScopeAdapter,
+    namespace: &str,
+    dataset: &str,
+    staging: &Path,
+    delete_paths: Vec<String>,
+    message: &str,
+) -> lios_core::Result<()> {
+    let remote_inventory = adapter.list_objects(namespace, dataset, "").await?;
+    let inventory_paths = remote_inventory
+        .iter()
+        .map(|object| object.path.as_str())
+        .collect::<HashSet<_>>();
+    let staged = staged_files(staging);
+    let mut blobs = Vec::with_capacity(staged.len());
+    let mut staged_paths = Vec::with_capacity(staged.len());
+    for (local_path, remote_path) in staged {
+        blobs.push(BlobSpec::from_path(local_path).await?);
+        staged_paths.push(remote_path);
+    }
+    let validations = adapter.validate_blobs(namespace, dataset, &blobs).await?;
+    let mut actions = Vec::with_capacity(staged_paths.len());
+    for ((remote_path, blob), validation) in staged_paths.iter().zip(&blobs).zip(validations) {
+        let checkpoint = match validation {
+            BlobValidation::Reusable(checkpoint) => checkpoint,
+            BlobValidation::UploadRequired(validated) => {
+                adapter.upload_blob(blob, validated).await?
+            }
+        };
+        actions.push(RemoteAction::lfs_upsert(remote_path.clone(), checkpoint));
+    }
+    let prepublish_safe_paths = actions
+        .iter()
+        .filter(|action| action.path() != CATALOG_FILE && !inventory_paths.contains(action.path()))
+        .map(|action| action.path().to_string())
+        .collect();
+    let plan = CommitPlan::build(
+        actions,
+        delete_paths,
+        &remote_inventory,
+        &prepublish_safe_paths,
+        current_catalog_sha256(&remote_inventory).map(ToOwned::to_owned),
+    )?;
+    for batch in &plan.prepublish {
+        adapter
+            .commit_actions(
+                namespace,
+                dataset,
+                "Prepublish live encrypted objects",
+                batch,
+            )
+            .await?;
+    }
+    adapter
+        .commit_actions(namespace, dataset, message, &plan.publish)
+        .await?;
+    for batch in &plan.cleanup {
+        adapter
+            .commit_actions(namespace, dataset, "Clean live encrypted objects", batch)
+            .await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires LIOS_MODELSCOPE_LIVE=1, LIOS_MODELSCOPE_TOKEN, and LIOS_MODELSCOPE_NAMESPACE"]
 async fn modelscope_private_dataset_roundtrip() {
@@ -112,11 +178,15 @@ async fn modelscope_private_dataset_roundtrip() {
         let tree = catalog.decrypt_tree(&key)?;
         assert_eq!(tree.name, "source-tree");
 
-        for (local, remote) in staged_files(&staging) {
-            adapter
-                .upload_object(&namespace, &dataset, &remote, &local)
-                .await?;
-        }
+        commit_staged_snapshot(
+            &adapter,
+            &namespace,
+            &dataset,
+            &staging,
+            Vec::new(),
+            "Publish live encrypted snapshot",
+        )
+        .await?;
 
         let remote_listing = adapter.list_objects(&namespace, &dataset, "").await?;
         assert!(remote_listing
@@ -156,22 +226,24 @@ async fn modelscope_private_dataset_roundtrip() {
             read_all_files(&restore_dir.join("source-tree"))
         );
 
-        let object_prefixes = remote_files
-            .iter()
-            .filter_map(|file| {
-                let mut parts = file.path.split('/');
-                match (parts.next(), parts.next()) {
-                    (Some("objects"), Some(object_id)) => Some(format!("objects/{object_id}")),
-                    _ => None,
-                }
+        let cleanup_staging = tmp.path().join("cleanup-staging");
+        Catalog::initialize_empty("empty", &key, cleanup_staging.clone())?;
+        let stale_paths = remote_listing
+            .into_iter()
+            .filter(|object| {
+                object.path.starts_with("objects/") || object.path.starts_with("recovery/nodes/")
             })
-            .collect::<BTreeSet<_>>();
-        for prefix in object_prefixes {
-            adapter.delete_prefix(&namespace, &dataset, &prefix).await?;
-        }
-        adapter
-            .delete_prefix(&namespace, &dataset, CATALOG_FILE)
-            .await?;
+            .map(|object| object.path)
+            .collect();
+        commit_staged_snapshot(
+            &adapter,
+            &namespace,
+            &dataset,
+            &cleanup_staging,
+            stale_paths,
+            "Reset live encrypted snapshot",
+        )
+        .await?;
 
         Ok::<(), lios_core::LiosError>(())
     }

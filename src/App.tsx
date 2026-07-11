@@ -127,6 +127,7 @@ type CatalogLoadResult = {
   local_path: string;
   bytes: number;
   tree: CatalogTreeNode;
+  warnings: string[];
 };
 
 type Snapshot = {
@@ -565,7 +566,7 @@ function App() {
       setCatalogTree(result.tree);
       setCurrentFolderId(result.tree.id);
       setCatalogStatus("ready");
-      setMessage("");
+      setMessage(result.warnings.join("; "));
     } catch (error) {
       setCatalogTree(null);
       setCurrentFolderId(null);
@@ -588,6 +589,7 @@ function App() {
           setCurrentFolderId(result.tree.id);
           setCatalogStatus("ready");
           setSelectedIds(new Set());
+          setMessage(result.warnings.join("; "));
         },
         () => reloadCatalog(true)
       );
@@ -619,6 +621,7 @@ function App() {
       if (!currentFolderId) setCurrentFolderId(result.tree.id);
       setCatalogStatus("ready");
       setSelectedIds(new Set());
+      setMessage(result.warnings.join("; "));
       if (query.trim()) await searchCatalog(query);
     } catch (error) {
       setCatalogTree(null);
@@ -707,6 +710,7 @@ function App() {
       });
       setCatalogTree(result.tree);
       setCatalogStatus("ready");
+      setMessage(result.warnings.join("; "));
     });
   }
 
@@ -721,6 +725,7 @@ function App() {
       setCatalogTree(result.tree);
       setCatalogStatus("ready");
       setSelectedIds(new Set());
+      setMessage(result.warnings.join("; "));
     });
   }
 

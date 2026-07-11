@@ -676,14 +676,6 @@ pub trait StorageAdapter: Send + Sync {
             "commit actions are not implemented by this storage adapter".to_string(),
         ))
     }
-    /// Compatibility wrapper for current Tauri flows. Remove in the next integration task.
-    async fn upload_object(
-        &self,
-        namespace: &str,
-        dataset: &str,
-        remote_path: &str,
-        local_path: &std::path::Path,
-    ) -> Result<()>;
     async fn download_object(
         &self,
         namespace: &str,
@@ -691,13 +683,4 @@ pub trait StorageAdapter: Send + Sync {
         remote_path: &str,
         local_path: &std::path::Path,
     ) -> Result<()>;
-    /// Compatibility wrapper for current Tauri flows. Remove in the next integration task.
-    async fn delete_objects(
-        &self,
-        namespace: &str,
-        dataset: &str,
-        remote_paths: &[String],
-    ) -> Result<()>;
-    /// Compatibility wrapper for current Tauri flows. Remove in the next integration task.
-    async fn delete_prefix(&self, namespace: &str, dataset: &str, prefix: &str) -> Result<()>;
 }

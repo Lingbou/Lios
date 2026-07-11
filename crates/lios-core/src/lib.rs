@@ -2,6 +2,7 @@ mod atomic;
 
 pub mod cache;
 pub mod catalog;
+pub mod catalog_transaction;
 pub mod config;
 pub mod credentials;
 pub mod crypto;

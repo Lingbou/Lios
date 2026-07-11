@@ -788,39 +788,6 @@ impl StorageAdapter for ModelScopeAdapter {
         Ok(())
     }
 
-    async fn upload_object(
-        &self,
-        namespace: &str,
-        dataset: &str,
-        remote_path: &str,
-        local_path: &Path,
-    ) -> Result<()> {
-        let blob = BlobSpec::from_path(local_path.to_path_buf()).await?;
-        RemoteAction::lfs_upsert(
-            remote_path,
-            BlobCheckpoint::new(blob.oid.clone(), blob.size),
-        )
-        .validate()?;
-        let validation = self
-            .validate_blobs(namespace, dataset, std::slice::from_ref(&blob))
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Self::invalid_response(StatusCode::OK))?;
-        let checkpoint = match validation {
-            BlobValidation::Reusable(checkpoint) => checkpoint,
-            BlobValidation::UploadRequired(validated) => self.upload_blob(&blob, validated).await?,
-        };
-        let action = RemoteAction::lfs_upsert(remote_path, checkpoint);
-        self.commit_actions(
-            namespace,
-            dataset,
-            &format!("Upload {remote_path}"),
-            std::slice::from_ref(&action),
-        )
-        .await
-    }
-
     async fn download_object(
         &self,
         namespace: &str,
@@ -830,53 +797,6 @@ impl StorageAdapter for ModelScopeAdapter {
     ) -> Result<()> {
         self.download_object_with_progress(namespace, dataset, remote_path, local_path, |_| {})
             .await
-    }
-
-    async fn delete_objects(
-        &self,
-        namespace: &str,
-        dataset: &str,
-        remote_paths: &[String],
-    ) -> Result<()> {
-        let mut paths = remote_paths.to_vec();
-        paths.sort();
-        paths.dedup();
-        let actions = paths
-            .into_iter()
-            .map(RemoteAction::delete)
-            .collect::<Vec<_>>();
-        if actions.is_empty() {
-            return Ok(());
-        }
-        for batch in actions.chunks(MODELSCOPE_COMMIT_ACTION_LIMIT) {
-            self.commit_actions(namespace, dataset, "Delete stale snapshot objects", batch)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn delete_prefix(&self, namespace: &str, dataset: &str, prefix: &str) -> Result<()> {
-        let objects = self.list_objects(namespace, dataset, prefix).await?;
-        let mut paths = objects
-            .into_iter()
-            .filter(|object| object.path.starts_with(prefix))
-            .map(|object| object.path)
-            .collect::<Vec<_>>();
-        paths.sort();
-        paths.dedup();
-        let actions = paths
-            .into_iter()
-            .map(RemoteAction::delete)
-            .collect::<Vec<_>>();
-        if actions.is_empty() {
-            return Ok(());
-        }
-        let commit_message = format!("Delete {prefix}");
-        for batch in actions.chunks(MODELSCOPE_COMMIT_ACTION_LIMIT) {
-            self.commit_actions(namespace, dataset, &commit_message, batch)
-                .await?;
-        }
-        Ok(())
     }
 }
 
