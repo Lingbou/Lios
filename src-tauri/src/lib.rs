@@ -515,9 +515,12 @@ async fn clear_task_record(
         ));
     }
     let store = task_store(paths)?;
-    if store.list().map_err(to_err)?.iter().any(|task| {
-        task.id == task_id && matches!(task.state, TaskState::Queued | TaskState::Running)
-    }) {
+    if store
+        .list()
+        .map_err(to_err)?
+        .iter()
+        .any(|task| task.id == task_id && task_state_blocks_clear(&task.state))
+    {
         return Err(CommandError::invalid_input("active task cannot be cleared"));
     }
     let result = store.delete(task_id).map_err(to_err);
@@ -525,9 +528,26 @@ async fn clear_task_record(
     result
 }
 
+fn task_state_blocks_clear(state: &TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::Queued
+            | TaskState::Preparing
+            | TaskState::Running
+            | TaskState::Paused
+            | TaskState::Retrying
+            | TaskState::Committing
+    )
+}
+
 fn task_state_is_active(state: &TaskState) -> bool {
     match state {
-        TaskState::Queued | TaskState::Running | TaskState::Paused => true,
+        TaskState::Queued
+        | TaskState::Preparing
+        | TaskState::Running
+        | TaskState::Paused
+        | TaskState::Retrying
+        | TaskState::Committing => true,
         TaskState::Failed | TaskState::Completed | TaskState::Canceled => false,
     }
 }
@@ -1696,8 +1716,60 @@ mod task_cleanup_tests {
     use super::{
         activate_existing_task, activate_new_task, cleanup_current_staging_cache, cleanup_if_idle,
         clear_task_record, finish_active_worker, finish_committed_worker, set_task_state,
-        CatalogMutationGate, CommandErrorCode, TaskLifecycleState,
+        task_state_blocks_clear, task_state_is_active, CatalogMutationGate, CommandErrorCode,
+        TaskLifecycleState,
     };
+
+    #[test]
+    fn every_nonterminal_task_state_is_active() {
+        for state in [
+            TaskState::Queued,
+            TaskState::Preparing,
+            TaskState::Running,
+            TaskState::Paused,
+            TaskState::Retrying,
+            TaskState::Committing,
+        ] {
+            assert!(task_state_is_active(&state), "{state:?} must be active");
+        }
+
+        for state in [TaskState::Failed, TaskState::Completed, TaskState::Canceled] {
+            assert!(!task_state_is_active(&state), "{state:?} must be terminal");
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_rejects_every_persisted_nonterminal_state() {
+        for state in [
+            TaskState::Queued,
+            TaskState::Preparing,
+            TaskState::Running,
+            TaskState::Paused,
+            TaskState::Retrying,
+            TaskState::Committing,
+        ] {
+            assert!(task_state_blocks_clear(&state));
+            let temp = tempdir().unwrap();
+            let paths = LiosPaths::from_home(temp.path());
+            let task = TaskRecord::queued("persisted active", 0);
+            let store = TaskStore::open(&paths.database).unwrap();
+            store.insert(&task).unwrap();
+            store.update_state(task.id, state.clone(), None).unwrap();
+            let lifecycle = Mutex::new(TaskLifecycleState::default());
+
+            let error = clear_task_record(&paths, &lifecycle, task.id)
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.code, CommandErrorCode::InvalidInput, "{state:?}");
+            assert!(TaskStore::open(&paths.database)
+                .unwrap()
+                .list()
+                .unwrap()
+                .iter()
+                .any(|record| record.id == task.id));
+        }
+    }
 
     #[tokio::test]
     async fn active_task_staging_survives_another_task_finishing() {
@@ -1975,6 +2047,15 @@ mod task_cleanup_tests {
             .unwrap();
             assert_eq!(final_state, controlled_state);
 
+            if controlled_state == TaskState::Paused {
+                let error = clear_task_record(&paths, &lifecycle, task.id)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, CommandErrorCode::InvalidInput);
+                set_task_state(&paths, &lifecycle, task.id, TaskState::Canceled, None)
+                    .await
+                    .unwrap();
+            }
             clear_task_record(&paths, &lifecycle, task.id)
                 .await
                 .unwrap();
