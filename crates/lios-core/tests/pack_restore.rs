@@ -1,50 +1,30 @@
 use std::fs;
 use std::path::Path;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
-use chacha20poly1305::{
-    aead::{Aead, AeadCore, OsRng},
-    ChaCha20Poly1305, Key, KeyInit, Nonce,
-};
 use lios_core::{
-    catalog::{Catalog, CatalogSelection, CatalogTreeNodeKind},
+    catalog::{
+        Catalog, CatalogSelection, CatalogTreeNodeKind, CatalogV2, NodeDescriptorKindV2,
+        ObjectManifestV2, StorageRef,
+    },
     crypto::KeyFile,
+    format_v2::{decrypt_envelope_v2, encrypt_envelope_v2, EnvelopeKindV2},
     pack::{PackOptions, PackProgress, PackSource},
     restore::{RestoreConflictPolicy, RestoreOptions},
     LiosError,
 };
-use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
-#[derive(Deserialize)]
-struct TestKeyFile {
-    key: Option<String>,
-    master_key: Option<String>,
+fn read_catalog_v2(catalog: &Catalog, key: &KeyFile) -> CatalogV2 {
+    let encrypted = fs::read(catalog.encrypted_catalog_path()).unwrap();
+    let plaintext = decrypt_envelope_v2(key, EnvelopeKindV2::Catalog, &encrypted).unwrap();
+    serde_json::from_slice(&plaintext).unwrap()
 }
 
-fn raw_test_key(key_path: &Path) -> [u8; 32] {
-    let key_file: TestKeyFile =
-        serde_yaml::from_str(&fs::read_to_string(key_path).unwrap()).unwrap();
-    let encoded = key_file.key.or(key_file.master_key).unwrap();
-    STANDARD.decode(encoded).unwrap().try_into().unwrap()
-}
-
-fn decrypt_test_blob(key_path: &Path, encrypted: &[u8]) -> Vec<u8> {
-    let key = raw_test_key(key_path);
-    let (nonce, ciphertext) = encrypted.split_at(12);
-    ChaCha20Poly1305::new(Key::from_slice(&key))
-        .decrypt(Nonce::from_slice(nonce), ciphertext)
-        .unwrap()
-}
-
-fn encrypt_test_blob(key_path: &Path, plaintext: &[u8]) -> Vec<u8> {
-    let key = raw_test_key(key_path);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let ciphertext = cipher.encrypt(&nonce, plaintext).unwrap();
-    let mut encrypted = nonce.to_vec();
-    encrypted.extend_from_slice(&ciphertext);
-    encrypted
+fn write_catalog_v2(catalog: &Catalog, key: &KeyFile, value: &CatalogV2) {
+    let plaintext = serde_json::to_vec(value).unwrap();
+    let encrypted = encrypt_envelope_v2(key, EnvelopeKindV2::Catalog, &plaintext).unwrap();
+    fs::write(catalog.encrypted_catalog_path(), encrypted).unwrap();
 }
 
 fn write_file(path: &Path, contents: &[u8]) {
@@ -114,6 +94,72 @@ fn golden_v1_catalog_and_chunk_restore_end_to_end() {
 }
 
 #[test]
+fn oversized_legacy_zstd_chunk_is_rejected_at_declared_bound() {
+    let tmp = tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto_v1");
+    let staging = tmp.path().join("staging");
+    let restore = tmp.path().join("restore");
+    write_file(
+        &staging.join("catalog.enc"),
+        &fs::read(fixtures.join("legacy_catalog_v1.enc")).unwrap(),
+    );
+    write_file(
+        &staging.join("objects/files/legacy-object/chunks/golden.lios"),
+        &fs::read(fixtures.join("legacy_chunk_v1.enc")).unwrap(),
+    );
+    let key = KeyFile::load_from_path(fixtures.join("legacy_v1.key")).unwrap();
+    let catalog = Catalog::from_staging(staging);
+    catalog
+        .create_folder("legacy-root", "migration-marker", &key)
+        .unwrap();
+
+    let mut value = read_catalog_v2(&catalog, &key);
+    let (file_id, object_id) = value
+        .nodes
+        .iter()
+        .find_map(|(node_id, node)| match &node.descriptor.kind {
+            NodeDescriptorKindV2::File { object_id, .. } => {
+                Some((node_id.clone(), object_id.clone()))
+            }
+            NodeDescriptorKindV2::Directory => None,
+        })
+        .unwrap();
+    let declared_size = value.content_objects[&object_id]
+        .original_size
+        .checked_sub(1)
+        .unwrap();
+    let NodeDescriptorKindV2::File { original_size, .. } =
+        &mut value.nodes.get_mut(&file_id).unwrap().descriptor.kind
+    else {
+        panic!("expected legacy file node");
+    };
+    *original_size = declared_size;
+    let object = value.content_objects.get_mut(&object_id).unwrap();
+    object.original_size = declared_size;
+    let StorageRef::Legacy(storage) = &mut object.storage else {
+        panic!("expected legacy storage");
+    };
+    assert_eq!(storage.chunks.len(), 1);
+    storage.chunks[0].original_size = declared_size;
+    write_catalog_v2(&catalog, &key, &value);
+
+    let result = catalog.restore(
+        CatalogSelection::Node(file_id),
+        &key,
+        RestoreOptions {
+            output_dir: restore.clone(),
+            conflict_policy: RestoreConflictPolicy::Rename,
+        },
+    );
+
+    let Err(LiosError::DataCorruption(message)) = result else {
+        panic!("expected declared-size rejection");
+    };
+    assert!(message.contains("legacy chunk exceeds declared size"));
+    assert!(read_all_files(&restore).is_empty());
+}
+
+#[test]
 fn packed_file_restores_to_identical_bytes() {
     let tmp = tempdir().unwrap();
     let source = tmp.path().join("source.bin");
@@ -162,7 +208,7 @@ fn pack_reports_progress_for_each_chunk() {
         &key,
         PackOptions {
             chunk_size: 4,
-            staging_dir: staging,
+            staging_dir: staging.clone(),
         },
         |progress| events.push(progress),
     )
@@ -287,29 +333,57 @@ fn whole_file_hash_mismatch_leaves_no_final_or_partial_file() {
     let source = tmp.path().join("source.bin");
     let staging = tmp.path().join("staging");
     let restore = tmp.path().join("restore");
-    let key_path = tmp.path().join("key");
     write_file(&source, b"0123456789abcdef");
 
-    let key = KeyFile::generate_to_path(&key_path).unwrap();
+    let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
         PackSource::Path(source),
         &key,
         PackOptions {
             chunk_size: 4,
-            staging_dir: staging,
+            staging_dir: staging.clone(),
         },
     )
     .unwrap();
 
-    let catalog_path = catalog.encrypted_catalog_path();
-    let plain = decrypt_test_blob(&key_path, &fs::read(catalog_path).unwrap());
-    let mut value: serde_json::Value = serde_json::from_slice(&plain).unwrap();
-    value["root"]["kind"]["sha256"] = serde_json::Value::String("00".repeat(32));
-    fs::write(
-        catalog_path,
-        encrypt_test_blob(&key_path, &serde_json::to_vec(&value).unwrap()),
+    let mut value = read_catalog_v2(&catalog, &key);
+    let root_id = value.root_id.clone();
+    let NodeDescriptorKindV2::File {
+        object_id,
+        content_sha256,
+        ..
+    } = &mut value.nodes.get_mut(&root_id).unwrap().descriptor.kind
+    else {
+        panic!("expected file root");
+    };
+    let object_id = object_id.clone();
+    let original_sha256 = content_sha256.clone();
+    let wrong_sha256 = "00".repeat(32);
+    *content_sha256 = wrong_sha256.clone();
+    let object = value.content_objects.get_mut(&object_id).unwrap();
+    object.content_sha256 = wrong_sha256.clone();
+    value.content_index.remove(&original_sha256);
+    value
+        .content_index
+        .insert(wrong_sha256.clone(), object_id.clone());
+    let StorageRef::V2(storage) = &mut object.storage else {
+        panic!("expected v2 storage");
+    };
+    let manifest_path = staging.join(&storage.manifest_path);
+    let manifest_encrypted = fs::read(&manifest_path).unwrap();
+    let manifest_plaintext =
+        decrypt_envelope_v2(&key, EnvelopeKindV2::Manifest, &manifest_encrypted).unwrap();
+    let mut manifest: ObjectManifestV2 = serde_json::from_slice(&manifest_plaintext).unwrap();
+    manifest.content_sha256 = wrong_sha256;
+    let manifest_encrypted = encrypt_envelope_v2(
+        &key,
+        EnvelopeKindV2::Manifest,
+        &serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
+    storage.manifest_encrypted_sha256 = hex::encode(Sha256::digest(&manifest_encrypted));
+    fs::write(&manifest_path, manifest_encrypted).unwrap();
+    write_catalog_v2(&catalog, &key, &value);
 
     let result = catalog.restore(
         CatalogSelection::All,
@@ -340,10 +414,9 @@ fn legacy_invalid_logical_name_restores_to_deterministic_safe_local_name() {
     let staging = tmp.path().join("staging");
     let first_restore = tmp.path().join("first-restore");
     let second_restore = tmp.path().join("second-restore");
-    let key_path = tmp.path().join("key");
     write_file(&source, b"legacy contents");
 
-    let key = KeyFile::generate_to_path(&key_path).unwrap();
+    let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
         PackSource::Path(source),
         &key,
@@ -354,15 +427,14 @@ fn legacy_invalid_logical_name_restores_to_deterministic_safe_local_name() {
     )
     .unwrap();
     let legacy_name = "CON:legacy?.txt";
-    let catalog_path = catalog.encrypted_catalog_path();
-    let plain = decrypt_test_blob(&key_path, &fs::read(catalog_path).unwrap());
-    let mut value: serde_json::Value = serde_json::from_slice(&plain).unwrap();
-    value["root"]["name"] = serde_json::Value::String(legacy_name.to_string());
-    fs::write(
-        catalog_path,
-        encrypt_test_blob(&key_path, &serde_json::to_vec(&value).unwrap()),
-    )
-    .unwrap();
+    let mut value = read_catalog_v2(&catalog, &key);
+    value
+        .nodes
+        .get_mut(&value.root_id.clone())
+        .unwrap()
+        .descriptor
+        .name = legacy_name.to_string();
+    write_catalog_v2(&catalog, &key, &value);
 
     assert_eq!(catalog.decrypt_tree(&key).unwrap().name, legacy_name);
     for output_dir in [&first_restore, &second_restore] {
@@ -418,50 +490,87 @@ fn encrypted_manifest_does_not_contain_plaintext_names() {
 }
 
 #[test]
-fn immutable_manifest_is_reused_but_never_replaced() {
+fn immutable_manifest_is_reused_or_abandoned_but_never_replaced() {
     let tmp = tempdir().unwrap();
     let source = tmp.path().join("source.bin");
+    let duplicate = tmp.path().join("duplicate.bin");
+    let third = tmp.path().join("third.bin");
     let staging = tmp.path().join("staging");
     write_file(&source, b"same bytes");
+    write_file(&duplicate, b"same bytes");
+    write_file(&third, b"same bytes");
 
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let options = PackOptions {
         chunk_size: 4,
         staging_dir: staging.clone(),
     };
-    let catalog = Catalog::pack(PackSource::Path(source.clone()), &key, options.clone()).unwrap();
+    let catalog = Catalog::initialize_empty("Space", &key, staging.clone()).unwrap();
+    let root_id = catalog.decrypt_tree(&key).unwrap().id;
+    catalog
+        .add_paths_to_folder(&root_id, &[source], &[], &key, options.clone())
+        .unwrap();
     let manifest = catalog
         .remote_files_for_selection(&CatalogSelection::All, &key)
         .unwrap()
         .into_iter()
         .find(|file| file.path.ends_with("/manifest.enc"))
         .unwrap();
-    let manifest_path = staging.join(manifest.path);
+    let original_manifest_path = manifest.path;
+    let manifest_path = staging.join(&original_manifest_path);
     let original_manifest = fs::read(&manifest_path).unwrap();
 
-    Catalog::pack(PackSource::Path(source.clone()), &key, options.clone()).unwrap();
+    catalog
+        .add_paths_to_folder(&root_id, &[duplicate], &[], &key, options.clone())
+        .unwrap();
     assert_eq!(fs::read(&manifest_path).unwrap(), original_manifest);
 
     fs::write(&manifest_path, b"conflicting manifest").unwrap();
-    let result = Catalog::pack(PackSource::Path(source), &key, options);
+    catalog
+        .add_paths_to_folder(&root_id, &[third], &[], &key, options)
+        .unwrap();
 
-    assert!(result.is_err());
     assert_eq!(fs::read(&manifest_path).unwrap(), b"conflicting manifest");
+    let repaired = read_catalog_v2(&catalog, &key);
+    assert_eq!(repaired.content_objects.len(), 1);
+    let replacement = repaired.content_objects.values().next().unwrap();
+    let StorageRef::V2(storage) = &replacement.storage else {
+        panic!("expected v2 replacement storage");
+    };
+    assert_ne!(storage.manifest_path, original_manifest_path);
+    assert!(staging.join(&storage.manifest_path).is_file());
+    for node in repaired.nodes.values() {
+        if let NodeDescriptorKindV2::File { object_id, .. } = &node.descriptor.kind {
+            assert_eq!(object_id, &replacement.object_id);
+        }
+    }
 }
 
 #[test]
-fn corrupted_reused_chunk_blocks_repack_before_catalog_publication() {
+fn corrupted_reused_chunk_falls_back_without_overwriting_staged_bytes() {
     let tmp = tempdir().unwrap();
     let source = tmp.path().join("source.bin");
+    let duplicate = tmp.path().join("duplicate.bin");
     let staging = tmp.path().join("staging");
     write_file(&source, b"same bytes across packs");
+    write_file(&duplicate, b"same bytes across packs");
 
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let options = PackOptions {
         chunk_size: 4,
         staging_dir: staging.clone(),
     };
-    let catalog = Catalog::pack(PackSource::Path(source.clone()), &key, options.clone()).unwrap();
+    let catalog = Catalog::initialize_empty("Space", &key, staging.clone()).unwrap();
+    let root_id = catalog.decrypt_tree(&key).unwrap().id;
+    catalog
+        .add_paths_to_folder(&root_id, &[source], &[], &key, options.clone())
+        .unwrap();
+    let original_object_id = read_catalog_v2(&catalog, &key)
+        .content_objects
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
     let catalog_path = catalog.encrypted_catalog_path().to_path_buf();
     let original_catalog = fs::read(&catalog_path).unwrap();
     let chunk = catalog
@@ -475,11 +584,21 @@ fn corrupted_reused_chunk_blocks_repack_before_catalog_publication() {
     corrupted_chunk[0] ^= 0xff;
     fs::write(&chunk_path, &corrupted_chunk).unwrap();
 
-    let result = Catalog::pack(PackSource::Path(source), &key, options);
+    catalog
+        .add_paths_to_folder(&root_id, &[duplicate], &[], &key, options)
+        .unwrap();
 
-    assert!(matches!(result, Err(LiosError::Crypto)));
-    assert_eq!(fs::read(&catalog_path).unwrap(), original_catalog);
+    assert_ne!(fs::read(&catalog_path).unwrap(), original_catalog);
     assert_eq!(fs::read(&chunk_path).unwrap(), corrupted_chunk);
+    let repaired = read_catalog_v2(&catalog, &key);
+    assert_eq!(repaired.content_objects.len(), 1);
+    let replacement = repaired.content_objects.values().next().unwrap();
+    assert_ne!(replacement.object_id, original_object_id);
+    for node in repaired.nodes.values() {
+        if let NodeDescriptorKindV2::File { object_id, .. } = &node.descriptor.kind {
+            assert_eq!(object_id, &replacement.object_id);
+        }
+    }
 }
 
 #[test]
@@ -642,7 +761,7 @@ fn catalog_exposes_decrypted_tree_and_remote_files_for_selected_node() {
 }
 
 #[test]
-fn unchanged_chunks_keep_encrypted_hashes_but_live_under_file_object_directories() {
+fn fresh_spaces_randomize_chunk_ciphertext_under_file_object_directories() {
     let tmp = tempdir().unwrap();
     let first = tmp.path().join("first.bin");
     let second = tmp.path().join("second.bin");
@@ -684,10 +803,10 @@ fn unchanged_chunks_keep_encrypted_hashes_but_live_under_file_object_directories
 
     assert_eq!(first_chunks.len(), 2);
     assert_eq!(second_chunks.len(), 2);
-    assert!(first_chunks.iter().any(|first| {
+    assert!(first_chunks.iter().all(|first| {
         second_chunks
             .iter()
-            .any(|second| first.path != second.path && first.sha256 == second.sha256)
+            .all(|second| first.path != second.path && first.sha256 != second.sha256)
     }));
     assert!(first_chunks
         .iter()
