@@ -75,6 +75,7 @@ pub enum CatalogTreeNodeKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CatalogRemoteFile {
     pub path: String,
+    pub expected_size: Option<u64>,
     pub sha256: Option<String>,
 }
 
@@ -85,6 +86,21 @@ pub struct CatalogIntegrityReport {
     pub chunks_verified: u64,
     pub encoded_bytes_verified: u64,
     pub original_bytes_verified: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatalogIntegrityOutcome {
+    Completed(CatalogIntegrityReport),
+    Canceled(CatalogIntegrityReport),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CatalogRemoteIntegrityReport {
+    pub expected_objects: u64,
+    pub verified_objects: u64,
+    pub metadata_limited_objects: u64,
+    pub encoded_bytes_verified: u64,
+    pub unreferenced_managed_objects: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -373,7 +389,7 @@ pub struct ObjectManifestV2 {
     pub chunks: Vec<V2ChunkRef>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ObjectManifestV1 {
     version: u8,
@@ -989,12 +1005,22 @@ impl Catalog {
             collect_descendant_ids(&loaded.catalog, &id, &mut node_ids);
         }
         for (id, node) in &loaded.catalog.nodes {
-            if let Some(sha256) = &node.descriptor_encrypted_sha256 {
-                files.push(CatalogRemoteFile {
-                    path: format!("{NODE_DESCRIPTORS_DIR}/{id}.enc"),
-                    sha256: Some(sha256.clone()),
-                });
-            }
+            let sha256 = match &node.descriptor_encrypted_sha256 {
+                Some(sha256) => sha256,
+                None if loaded.migrated_from_v1 => continue,
+                None => {
+                    return Err(LiosError::DataCorruption(format!(
+                        "native v2 node descriptor hash is missing: {id}"
+                    )))
+                }
+            };
+            let expected_size =
+                envelope_encoded_len_v2(serde_json::to_vec(&node.descriptor)?.len())?;
+            files.push(CatalogRemoteFile {
+                path: format!("{NODE_DESCRIPTORS_DIR}/{id}.enc"),
+                expected_size: Some(expected_size),
+                sha256: Some(sha256.clone()),
+            });
         }
         for id in &node_ids {
             let node = catalog_node(&loaded.catalog, id)?;
@@ -1010,17 +1036,146 @@ impl Catalog {
                 .ok_or_else(|| {
                     LiosError::DataCorruption(format!("missing content object: {object_id}"))
                 })?;
-            collect_content_remote_files(object, &mut files);
+            collect_content_remote_files(object, key, &mut files)?;
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         files.dedup_by(|a, b| a.path == b.path);
         Ok(files)
     }
 
+    pub fn verify_remote_inventory(
+        &self,
+        key: &KeyFile,
+        remote_objects: &[StorageObject],
+    ) -> Result<CatalogRemoteIntegrityReport> {
+        let mut expected = self.remote_files_for_selection(&CatalogSelection::All, key)?;
+        let catalog_bytes =
+            read_verified_encrypted_file(&self.staging_dir, CATALOG_FILE, None, None)?;
+        expected.push(CatalogRemoteFile {
+            path: CATALOG_FILE.to_string(),
+            expected_size: Some(
+                u64::try_from(catalog_bytes.len()).map_err(|_| {
+                    LiosError::DataCorruption("catalog size overflowed".to_string())
+                })?,
+            ),
+            sha256: Some(sha256_hex(&catalog_bytes)),
+        });
+
+        let mut expected_paths = HashSet::with_capacity(expected.len());
+        for file in &expected {
+            if !expected_paths.insert(file.path.as_str()) {
+                return Err(LiosError::DataCorruption(format!(
+                    "duplicate expected remote object: {}",
+                    file.path
+                )));
+            }
+        }
+        let mut remote_by_path = HashMap::with_capacity(remote_objects.len());
+        let mut remote_windows_paths = HashSet::with_capacity(remote_objects.len());
+        for object in remote_objects {
+            if !remote_windows_paths.insert(windows_name_key(&object.path))
+                || remote_by_path
+                    .insert(object.path.as_str(), object)
+                    .is_some()
+            {
+                return Err(LiosError::DataCorruption(format!(
+                    "duplicate remote object path: {}",
+                    object.path
+                )));
+            }
+        }
+
+        let mut report = CatalogRemoteIntegrityReport {
+            expected_objects: u64::try_from(expected.len()).map_err(|_| {
+                LiosError::DataCorruption("expected remote object count overflowed".to_string())
+            })?,
+            ..CatalogRemoteIntegrityReport::default()
+        };
+        for file in &expected {
+            let remote = remote_by_path.get(file.path.as_str()).ok_or_else(|| {
+                LiosError::DataCorruption(format!(
+                    "referenced remote object is missing: {}",
+                    file.path
+                ))
+            })?;
+            if file
+                .expected_size
+                .is_some_and(|expected_size| remote.size != expected_size)
+            {
+                return Err(LiosError::DataCorruption(format!(
+                    "remote object size mismatch: {}",
+                    file.path
+                )));
+            }
+            if file
+                .sha256
+                .as_deref()
+                .is_some_and(|expected_sha256| remote.sha256.as_deref() != Some(expected_sha256))
+            {
+                return Err(LiosError::DataCorruption(format!(
+                    "remote object LFS OID mismatch: {}",
+                    file.path
+                )));
+            }
+            if file.expected_size.is_some() && file.sha256.is_some() {
+                report.verified_objects =
+                    report.verified_objects.checked_add(1).ok_or_else(|| {
+                        LiosError::DataCorruption(
+                            "verified remote object count overflowed".to_string(),
+                        )
+                    })?;
+            } else {
+                report.metadata_limited_objects = report
+                    .metadata_limited_objects
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        LiosError::DataCorruption(
+                            "metadata-limited object count overflowed".to_string(),
+                        )
+                    })?;
+            }
+            report.encoded_bytes_verified = report
+                .encoded_bytes_verified
+                .checked_add(remote.size)
+                .ok_or_else(|| {
+                    LiosError::DataCorruption("verified remote byte count overflowed".to_string())
+                })?;
+        }
+        report.unreferenced_managed_objects = u64::try_from(
+            remote_objects
+                .iter()
+                .filter(|object| {
+                    is_managed_integrity_path(&object.path)
+                        && !expected_paths.contains(object.path.as_str())
+                })
+                .count(),
+        )
+        .map_err(|_| {
+            LiosError::DataCorruption("unreferenced remote object count overflowed".to_string())
+        })?;
+        Ok(report)
+    }
+
     pub fn verify_staged_integrity(&self, key: &KeyFile) -> Result<CatalogIntegrityReport> {
+        match self.verify_staged_integrity_with_cancel(key, || false)? {
+            CatalogIntegrityOutcome::Completed(report) => Ok(report),
+            CatalogIntegrityOutcome::Canceled(_) => Err(LiosError::Unsupported(
+                "integrity verification was unexpectedly canceled".to_string(),
+            )),
+        }
+    }
+
+    pub fn verify_staged_integrity_with_cancel(
+        &self,
+        key: &KeyFile,
+        mut should_cancel: impl FnMut() -> bool,
+    ) -> Result<CatalogIntegrityOutcome> {
         let loaded = self.load_catalog_v2(key)?;
         let mut report = CatalogIntegrityReport::default();
         for (node_id, node) in &loaded.catalog.nodes {
+            if should_cancel() {
+                return Ok(CatalogIntegrityOutcome::Canceled(report));
+            }
             let expected_sha256 = match &node.descriptor_encrypted_sha256 {
                 Some(expected_sha256) => expected_sha256,
                 None if loaded.migrated_from_v1 => continue,
@@ -1052,7 +1207,17 @@ impl Catalog {
         }
 
         for object in loaded.catalog.content_objects.values() {
-            verify_content_object_integrity(object, key, &self.staging_dir, &mut report)?;
+            if should_cancel()
+                || !verify_content_object_integrity(
+                    object,
+                    key,
+                    &self.staging_dir,
+                    &mut report,
+                    &mut should_cancel,
+                )?
+            {
+                return Ok(CatalogIntegrityOutcome::Canceled(report));
+            }
             report.objects_verified = report.objects_verified.checked_add(1).ok_or_else(|| {
                 LiosError::DataCorruption("verified object count overflowed".to_string())
             })?;
@@ -1063,7 +1228,7 @@ impl Catalog {
                     LiosError::DataCorruption("verified original byte count overflowed".to_string())
                 })?;
         }
-        Ok(report)
+        Ok(CatalogIntegrityOutcome::Completed(report))
     }
 
     pub fn legacy_content_objects_needing_optimization(
@@ -1734,29 +1899,60 @@ fn storage_chunk_count(storage: &StorageRef) -> usize {
     }
 }
 
-fn collect_content_remote_files(object: &ContentObject, files: &mut Vec<CatalogRemoteFile>) {
+fn collect_content_remote_files(
+    object: &ContentObject,
+    key: &KeyFile,
+    files: &mut Vec<CatalogRemoteFile>,
+) -> Result<()> {
     match &object.storage {
         StorageRef::Legacy(storage) => {
+            let manifest_plaintext =
+                legacy_manifest_plaintext(object.object_id.as_str(), storage.chunks.as_slice())?;
+            let encrypted_manifest =
+                key.encrypt_deterministic("file-manifest", &manifest_plaintext)?;
             files.push(CatalogRemoteFile {
                 path: storage.manifest_path.clone(),
-                sha256: storage.manifest_encrypted_sha256.clone(),
+                expected_size: Some(u64::try_from(encrypted_manifest.len()).map_err(|_| {
+                    LiosError::DataCorruption("legacy manifest size overflowed".to_string())
+                })?),
+                sha256: Some(sha256_hex(&encrypted_manifest)),
             });
             files.extend(storage.chunks.iter().map(|chunk| CatalogRemoteFile {
                 path: chunk.path.clone(),
+                expected_size: None,
                 sha256: Some(chunk.encrypted_sha256.clone()),
             }));
         }
         StorageRef::V2(storage) => {
+            let manifest = expected_v2_manifest(object, storage);
             files.push(CatalogRemoteFile {
                 path: storage.manifest_path.clone(),
+                expected_size: Some(envelope_encoded_len_v2(
+                    serde_json::to_vec(&manifest)?.len(),
+                )?),
                 sha256: Some(storage.manifest_encrypted_sha256.clone()),
             });
             files.extend(storage.chunks.iter().map(|chunk| CatalogRemoteFile {
                 path: chunk.path.clone(),
+                expected_size: Some(chunk.encoded_size),
                 sha256: Some(chunk.encoded_sha256.clone()),
             }));
         }
     }
+    Ok(())
+}
+
+fn legacy_manifest_plaintext(object_id: &str, chunks: &[LegacyChunkRef]) -> Result<Vec<u8>> {
+    // v1 used json!, whose map ordering is part of the deterministic ciphertext format.
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "object_id": object_id,
+        "chunks": chunks,
+    }))?)
+}
+
+fn is_managed_integrity_path(path: &str) -> bool {
+    path == CATALOG_FILE || path.starts_with("objects/") || path.starts_with("recovery/nodes/")
 }
 
 struct PackProgressTracker<'a> {
@@ -2669,9 +2865,13 @@ fn verify_content_object_integrity(
     key: &KeyFile,
     staging_dir: &Path,
     report: &mut CatalogIntegrityReport,
-) -> Result<()> {
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<bool> {
     let mut file_hasher = Sha256::new();
     let mut restored_size = 0u64;
+    if should_cancel() {
+        return Ok(false);
+    }
     match &object.storage {
         StorageRef::Legacy(storage) => {
             let encrypted_manifest = read_verified_encrypted_file(
@@ -2698,6 +2898,9 @@ fn verify_content_object_integrity(
             let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
             chunks.sort_by_key(|chunk| chunk.index);
             for chunk in chunks {
+                if should_cancel() {
+                    return Ok(false);
+                }
                 let encrypted = read_verified_encrypted_file(
                     staging_dir,
                     &chunk.path,
@@ -2742,6 +2945,9 @@ fn verify_content_object_integrity(
             let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
             chunks.sort_by_key(|chunk| chunk.index);
             for chunk in chunks {
+                if should_cancel() {
+                    return Ok(false);
+                }
                 if chunk.format_version != 2 {
                     return Err(LiosError::Unsupported(format!(
                         "unknown chunk format version: {}",
@@ -2792,7 +2998,7 @@ fn verify_content_object_integrity(
     {
         return Err(LiosError::Crypto);
     }
-    Ok(())
+    Ok(true)
 }
 
 fn validate_v2_manifest(

@@ -6,7 +6,10 @@ export default defineConfig({
   clearScreen: false,
   server: {
     port: 5173,
-    strictPort: true
+    strictPort: true,
+    watch: {
+      ignored: ["**/target/**", "**/src-tauri/**", "**/crates/**"]
+    }
   },
   envPrefix: ["VITE_", "TAURI_"]
 });

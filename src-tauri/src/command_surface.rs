@@ -13,6 +13,7 @@ macro_rules! with_registered_commands {
             enqueue_upload_to_folder,
             enqueue_download,
             enqueue_delete_nodes,
+            enqueue_verify_space,
             rename_node,
             create_folder,
             search_catalog,
@@ -75,6 +76,7 @@ mod tests {
             "enqueue_upload_to_folder",
             "enqueue_delete_nodes",
             "enqueue_download",
+            "enqueue_verify_space",
             "retry_task",
         ] {
             assert!(REGISTERED_COMMANDS.contains(&command), "{command}");

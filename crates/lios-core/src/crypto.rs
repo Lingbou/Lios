@@ -7,7 +7,6 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
 };
 use hkdf::Hkdf;
-#[cfg(test)]
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -16,7 +15,6 @@ use sha2::Sha256;
 use crate::atomic::write_private_atomic_new;
 use crate::{LiosError, Result};
 
-#[cfg(test)]
 type HmacSha256 = Hmac<Sha256>;
 
 const KEY_FILE_V1_ALGORITHM: &str = "XChaCha20Poly1305-compatible-32-byte-key";
@@ -109,7 +107,6 @@ impl KeyFile {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn encrypt_deterministic(&self, domain: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
         let digest = self.keyed_digest(domain.as_bytes(), plaintext)?;
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
@@ -142,7 +139,6 @@ impl KeyFile {
         Ok(derived)
     }
 
-    #[cfg(test)]
     fn keyed_digest(&self, domain: &[u8], bytes: &[u8]) -> Result<[u8; 32]> {
         let mut mac =
             <HmacSha256 as Mac>::new_from_slice(&self.key).map_err(|_| LiosError::Crypto)?;

@@ -3,13 +3,14 @@ use std::path::Path;
 
 use lios_core::{
     catalog::{
-        Catalog, CatalogSelection, CatalogTreeNodeKind, CatalogV2, NodeDescriptorKindV2,
-        ObjectManifestV2, StorageRef,
+        Catalog, CatalogIntegrityOutcome, CatalogSelection, CatalogTreeNodeKind, CatalogV2,
+        NodeDescriptorKindV2, ObjectManifestV2, StorageRef,
     },
     crypto::KeyFile,
     format_v2::{decrypt_envelope_v2, encrypt_envelope_v2, EnvelopeKindV2},
     pack::{PackOptions, PackProgress, PackSource},
     restore::{RestoreConflictPolicy, RestoreOptions},
+    storage::StorageObject,
     LiosError,
 };
 use sha2::{Digest, Sha256};
@@ -39,6 +40,32 @@ fn tamper_file(path: &Path) {
     let midpoint = encoded.len() / 2;
     encoded[midpoint] ^= 0x40;
     fs::write(path, encoded).unwrap();
+}
+
+fn staged_remote_inventory(catalog: &Catalog, key: &KeyFile) -> Vec<StorageObject> {
+    let staging = catalog.encrypted_catalog_path().parent().unwrap();
+    let mut remote = catalog
+        .remote_files_for_selection(&CatalogSelection::All, key)
+        .unwrap()
+        .into_iter()
+        .map(|file| {
+            let local_path = staging.join(&file.path);
+            let bytes = fs::read(&local_path).unwrap();
+            assert_eq!(file.expected_size, Some(bytes.len() as u64));
+            StorageObject {
+                path: file.path,
+                size: bytes.len() as u64,
+                sha256: Some(hex::encode(Sha256::digest(bytes))),
+            }
+        })
+        .collect::<Vec<_>>();
+    let catalog_bytes = fs::read(catalog.encrypted_catalog_path()).unwrap();
+    remote.push(StorageObject {
+        path: "catalog.enc".to_string(),
+        size: catalog_bytes.len() as u64,
+        sha256: Some(hex::encode(Sha256::digest(catalog_bytes))),
+    });
+    remote
 }
 
 fn read_all_files(root: &Path) -> Vec<(String, Vec<u8>)> {
@@ -347,6 +374,36 @@ fn full_integrity_check_rejects_missing_native_v2_descriptor_hash() {
 }
 
 #[test]
+fn quick_inventory_enumeration_rejects_missing_native_v2_descriptor_hash() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    write_file(&source, b"integrity payload");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 4,
+            staging_dir: staging,
+        },
+    )
+    .unwrap();
+    let mut value = read_catalog_v2(&catalog, &key);
+    value
+        .nodes
+        .get_mut(&value.root_id.clone())
+        .unwrap()
+        .descriptor_encrypted_sha256 = None;
+    write_catalog_v2(&catalog, &key, &value);
+
+    assert!(matches!(
+        catalog.remote_files_for_selection(&CatalogSelection::All, &key),
+        Err(LiosError::DataCorruption(_))
+    ));
+}
+
+#[test]
 fn full_integrity_check_authenticates_migrated_legacy_manifest() {
     let tmp = tempdir().unwrap();
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto_v1");
@@ -448,6 +505,180 @@ fn full_integrity_check_rejects_linked_staging_ancestor() {
     create_directory_link(&linked_target, &staging.join("recovery"));
 
     assert!(catalog.verify_staged_integrity(&key).is_err());
+}
+
+#[test]
+fn full_integrity_check_can_cancel_before_scanning_objects() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    write_file(&source, b"cancel integrity payload");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 4,
+            staging_dir: staging,
+        },
+    )
+    .unwrap();
+
+    let outcome = catalog
+        .verify_staged_integrity_with_cancel(&key, || true)
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        CatalogIntegrityOutcome::Canceled(Default::default())
+    );
+}
+
+#[test]
+fn remote_inventory_check_authenticates_current_references_and_reports_stale_objects() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    write_file(&source, b"remote inventory payload");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 4,
+            staging_dir: staging,
+        },
+    )
+    .unwrap();
+    let mut remote = staged_remote_inventory(&catalog, &key);
+    remote.push(StorageObject {
+        path: "objects/files/stale/chunks/old.lios".to_string(),
+        size: 9,
+        sha256: Some("stale-oid".to_string()),
+    });
+
+    let report = catalog.verify_remote_inventory(&key, &remote).unwrap();
+
+    assert_eq!(report.expected_objects, remote.len() as u64 - 1);
+    assert_eq!(report.verified_objects, report.expected_objects);
+    assert_eq!(report.unreferenced_managed_objects, 1);
+    assert_eq!(
+        report.encoded_bytes_verified,
+        remote[..remote.len() - 1]
+            .iter()
+            .map(|object| object.size)
+            .sum::<u64>()
+    );
+}
+
+#[test]
+fn remote_inventory_check_rejects_missing_referenced_object() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    write_file(&source, b"remote inventory payload");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 4,
+            staging_dir: staging,
+        },
+    )
+    .unwrap();
+    let mut remote = staged_remote_inventory(&catalog, &key);
+    remote.retain(|object| !object.path.ends_with(".lios"));
+
+    assert!(matches!(
+        catalog.verify_remote_inventory(&key, &remote),
+        Err(LiosError::DataCorruption(_))
+    ));
+}
+
+#[test]
+fn remote_inventory_check_rejects_size_and_lfs_oid_mismatch() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    write_file(&source, b"remote inventory payload");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 4,
+            staging_dir: staging,
+        },
+    )
+    .unwrap();
+    let remote = staged_remote_inventory(&catalog, &key);
+    let mut wrong_size = remote.clone();
+    wrong_size[0].size = wrong_size[0].size.saturating_add(1);
+    let mut wrong_oid = remote.clone();
+    wrong_oid[0].sha256 = Some("wrong-oid".to_string());
+
+    assert!(matches!(
+        catalog.verify_remote_inventory(&key, &wrong_size),
+        Err(LiosError::DataCorruption(_))
+    ));
+    assert!(matches!(
+        catalog.verify_remote_inventory(&key, &wrong_oid),
+        Err(LiosError::DataCorruption(_))
+    ));
+}
+
+#[test]
+fn legacy_remote_inventory_uses_historical_manifest_encoding() {
+    let tmp = tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto_v1");
+    let staging = tmp.path().join("staging");
+    write_file(
+        &staging.join("catalog.enc"),
+        &fs::read(fixtures.join("legacy_catalog_v1.enc")).unwrap(),
+    );
+    let key = KeyFile::load_from_path(fixtures.join("legacy_v1.key")).unwrap();
+    let catalog = Catalog::from_staging(staging.clone());
+    let expected = catalog
+        .remote_files_for_selection(&CatalogSelection::All, &key)
+        .unwrap();
+    let manifest = expected
+        .iter()
+        .find(|file| file.path.ends_with("/manifest.enc"))
+        .unwrap();
+    let chunk = expected
+        .iter()
+        .find(|file| file.path.ends_with(".lios"))
+        .unwrap();
+    assert_eq!(manifest.expected_size, Some(338));
+    assert_eq!(
+        manifest.sha256.as_deref(),
+        Some("e323494296cd2dfee9c0c684f876712cde09473d4d8703805f95c9e689b303b8")
+    );
+    assert_eq!(chunk.expected_size, None);
+
+    let mut remote = expected
+        .into_iter()
+        .map(|file| StorageObject {
+            path: file.path,
+            size: file.expected_size.unwrap_or(106),
+            sha256: file.sha256,
+        })
+        .collect::<Vec<_>>();
+    let catalog_bytes = fs::read(staging.join("catalog.enc")).unwrap();
+    remote.push(StorageObject {
+        path: "catalog.enc".to_string(),
+        size: catalog_bytes.len() as u64,
+        sha256: Some(hex::encode(Sha256::digest(catalog_bytes))),
+    });
+
+    let report = catalog.verify_remote_inventory(&key, &remote).unwrap();
+
+    assert_eq!(report.metadata_limited_objects, 1);
+    assert_eq!(
+        report.verified_objects + report.metadata_limited_objects,
+        report.expected_objects
+    );
 }
 
 #[test]

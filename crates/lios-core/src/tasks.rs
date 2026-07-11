@@ -128,7 +128,8 @@ impl TaskSpec {
             Self::Upload { .. } => "upload",
             Self::Delete { .. } => "delete",
             Self::Download { .. } => "download",
-            Self::VerifySpace { .. } => "verify",
+            Self::VerifySpace { full: false, .. } => "verify_quick",
+            Self::VerifySpace { full: true, .. } => "verify_full",
             Self::RebuildCatalog { .. } => "rebuild",
         }
     }

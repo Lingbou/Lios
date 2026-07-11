@@ -973,6 +973,39 @@ async fn blob_upload_errors_do_not_expose_token_or_signed_url() {
 }
 
 #[tokio::test]
+async fn pinned_commit_revision_is_used_for_read_requests() {
+    let server = MockServer::start();
+    let tmp = tempdir().unwrap();
+    let download_path = tmp.path().join("catalog.enc");
+    let list = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v1/datasets/novix/cold/repo/tree")
+            .query_param("Revision", "commit-123")
+            .query_param("Recursive", "true")
+            .query_param("Root", "");
+        then.status(200).json_body(json!({ "Data": [] }));
+    });
+    let download = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v1/datasets/novix/cold/repo")
+            .query_param("Revision", "commit-123")
+            .query_param("FilePath", "catalog.enc");
+        then.status(200).body("encrypted catalog");
+    });
+    let adapter = ModelScopeAdapter::new(server.base_url(), "token").with_revision("commit-123");
+
+    adapter.list_objects("novix", "cold", "").await.unwrap();
+    adapter
+        .download_object("novix", "cold", "catalog.enc", &download_path)
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read(download_path).unwrap(), b"encrypted catalog");
+    list.assert_hits(1);
+    download.assert_hits(1);
+}
+
+#[tokio::test]
 async fn list_download_and_explicit_delete_commit_use_dataset_routes() {
     let server = MockServer::start();
     let tmp = tempdir().unwrap();

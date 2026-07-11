@@ -1596,6 +1596,30 @@ fn legacy_upload_task_spec_defaults_to_128mb_chunks() {
 }
 
 #[test]
+fn verify_task_labels_distinguish_quick_and_full_checks() {
+    let repo = RepoConfig {
+        namespace: "novix".to_string(),
+        dataset: "archive".to_string(),
+        endpoint: "https://modelscope.cn".to_string(),
+    };
+    let quick = TaskSpec::VerifySpace {
+        account_id: "account".to_string(),
+        space_id: "space".to_string(),
+        repo: repo.clone(),
+        full: false,
+    };
+    let full = TaskSpec::VerifySpace {
+        account_id: "account".to_string(),
+        space_id: "space".to_string(),
+        repo,
+        full: true,
+    };
+
+    assert_eq!(quick.label(), "verify_quick");
+    assert_eq!(full.label(), "verify_full");
+}
+
+#[test]
 fn upload_task_spec_roundtrips_the_persisted_source_snapshot() {
     let snapshot = SourceSnapshotReport::default();
     let spec = TaskSpec::Upload {

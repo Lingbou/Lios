@@ -35,7 +35,8 @@ import {
   taskItemProgressPercent,
   taskItemStatusText,
   taskProgressPercent,
-  taskProgressText
+  taskProgressText,
+  taskStatusText
 } from "./taskPresentation.ts";
 
 type RepoConfig = {
@@ -268,24 +269,9 @@ function taskLabel(label: string) {
   if (label === "download") return "下载";
   if (label === "delete" || label.startsWith("delete ")) return "删除";
   if (label === "restore") return "恢复";
+  if (label === "verify_quick") return "快速检查";
+  if (label === "verify_full") return "完整检查";
   return label;
-}
-
-function taskStatusText(task: TaskRecord) {
-  if (task.state === "Queued") return "等待中";
-  if (task.state === "Paused") return "已暂停：等待继续或取消";
-  if (task.state === "Completed") return "已完成";
-  if (task.state === "Canceled") return "已取消";
-  if (task.state === "Failed") return task.error ? `失败：${task.error}` : "失败";
-  if (task.state === "Preparing" || task.phase === "preparing") return "正在切片加密";
-  if (task.state === "Running" && task.phase === "uploading") return "正在同步到远端";
-  if (task.state === "Running" && task.phase === "downloading") return "正在下载";
-  if (task.state === "Running" && task.phase === "restoring") return "正在恢复到本地";
-  if (task.state === "Running") return task.progress_total > 0 ? "正在处理" : "正在准备";
-  if (task.state === "Retrying") return `正在重试${task.attempt > 0 ? `（第 ${task.attempt} 次）` : ""}`;
-  if (task.state === "Committing" && task.phase === "reconciling") return "正在核对远端提交结果";
-  if (task.state === "Committing") return "正在提交远端变更";
-  return "处理中";
 }
 
 function nodeKind(node: CatalogTreeNode): "Directory" | "File" {
@@ -398,6 +384,7 @@ function App() {
   const failedTasks = tasks.filter((task) => task.state === "Failed").length;
   const totalTasks = tasks.length;
   const hasToken = Boolean(snapshot?.has_token);
+  const selectedSpace = activeSpace ?? snapshot?.config.active_repo ?? null;
 
   const displayedSpaces = spaces;
   const visibleSpaces = query.trim()
@@ -805,6 +792,16 @@ function App() {
     });
   }
 
+  async function verifySpace(full: boolean) {
+    if (!selectedSpace) {
+      setMessage("先从账号中选择一个空间。");
+      return;
+    }
+    await run(full ? "完整检查" : "快速检查", async () => {
+      await appInvoke("enqueue_verify_space", { space: selectedSpace, full });
+    });
+  }
+
   async function selectAccount() {
     setView("spaces");
     setMessage("");
@@ -1010,6 +1007,29 @@ function App() {
                   <ShieldCheck aria-hidden />
                   连接
                 </button>
+              </div>
+            </div>
+
+            <div className="settingsBlock">
+              <div className="settingsHeaderRow">
+                <div>
+                  <h2>空间检查</h2>
+                  <p>
+                    {selectedSpace
+                      ? `${selectedSpace.namespace}/${selectedSpace.dataset}`
+                      : "未选择空间"}
+                  </p>
+                </div>
+                <div className="settingsActions">
+                  <button onClick={() => verifySpace(false)} disabled={!selectedSpace || busy !== null}>
+                    <ShieldCheck aria-hidden />
+                    快速检查
+                  </button>
+                  <button onClick={() => verifySpace(true)} disabled={!selectedSpace || busy !== null}>
+                    <HardDrive aria-hidden />
+                    完整检查
+                  </button>
+                </div>
               </div>
             </div>
 
