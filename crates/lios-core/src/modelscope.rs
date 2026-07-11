@@ -1,22 +1,29 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::SeekFrom;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::{multipart, Client, RequestBuilder, StatusCode, Url};
+use reqwest::{multipart, Body, Client, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::storage::{StorageAdapter, StorageObject};
+use crate::storage::{
+    validate_blob_oid, validate_remote_actions, BlobCheckpoint, BlobSpec, BlobValidation,
+    RemoteAction, RepoRevision, StorageAdapter, StorageObject, StorageTransactionError,
+    ValidatedBlobUpload, MODELSCOPE_COMMIT_ACTION_LIMIT, MODELSCOPE_LFS_BATCH_SIZE,
+};
 use crate::{LiosError, RemoteError, RemoteErrorKind, Result};
 
 const DATASET_SEGMENT: &str = "datasets";
 const DEFAULT_REVISION: &str = "master";
 const PRIVATE_VISIBILITY: &str = "1";
 const LIST_REPOS_PAGE_SIZE: u32 = 50;
+const BLOB_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
 const USER_AGENT: &str = concat!(
     "lios/",
     env!("CARGO_PKG_VERSION"),
@@ -45,6 +52,20 @@ pub struct ModelScopeAdapter {
     token: String,
     client: Client,
     revision: String,
+}
+
+#[derive(Clone, Default)]
+struct BlobStreamProgress {
+    bytes: u64,
+    hasher: Sha256,
+    integrity_error: bool,
+}
+
+struct BlobStreamState {
+    file: tokio::fs::File,
+    expected_oid: String,
+    expected_size: u64,
+    progress: Arc<Mutex<BlobStreamProgress>>,
 }
 
 impl ModelScopeAdapter {
@@ -130,6 +151,29 @@ impl ModelScopeAdapter {
             .header("X-Request-ID", Uuid::new_v4().simple().to_string())
     }
 
+    fn parse_upload_target(&self, href: &str, status: StatusCode) -> Result<Url> {
+        let upload_url = Url::parse(href).map_err(|_error| Self::invalid_response(status))?;
+        if !matches!(upload_url.scheme(), "http" | "https") {
+            return Err(Self::invalid_response(status));
+        }
+        let endpoint = Url::parse(&self.endpoint).expect("ModelScope endpoint must be a valid URL");
+        if endpoint.scheme() == "https" && upload_url.scheme() != "https" {
+            return Err(Self::invalid_response(status));
+        }
+        Ok(upload_url)
+    }
+
+    fn upload_target_receives_credentials(&self, upload_url: &Url) -> bool {
+        let endpoint = Url::parse(&self.endpoint).expect("ModelScope endpoint must be a valid URL");
+        if same_origin(&endpoint, upload_url) {
+            return true;
+        }
+        is_production_modelscope_endpoint(&endpoint)
+            && upload_url.scheme() == "https"
+            && upload_url.port_or_known_default() == Some(443)
+            && upload_url.host_str().is_some_and(is_modelscope_host)
+    }
+
     fn network_error(_error: reqwest::Error) -> LiosError {
         RemoteError::new(RemoteErrorKind::Network, None).into()
     }
@@ -163,87 +207,43 @@ impl ModelScopeAdapter {
             .unwrap_or(body))
     }
 
-    async fn create_commit(
-        &self,
-        namespace: &str,
-        dataset: &str,
-        commit_message: String,
-        actions: Vec<Value>,
-    ) -> Result<()> {
-        let response = self
-            .auth(self.client.post(self.api_segments(&[
-                "repos",
-                DATASET_SEGMENT,
-                namespace,
-                dataset,
-                "commit",
-                &self.revision,
-            ])))
-            .json(&json!({
-                "commit_message": commit_message,
-                "actions": actions,
-            }))
-            .send()
-            .await
-            .map_err(Self::network_error)?;
-        Self::json_data(response).await?;
-        Ok(())
+    fn invalid_response(status: StatusCode) -> LiosError {
+        RemoteError::new(RemoteErrorKind::InvalidResponse, Some(status.as_u16())).into()
     }
 
-    async fn validate_blob(
-        &self,
-        namespace: &str,
-        dataset: &str,
-        oid: &str,
-        size: u64,
-    ) -> Result<Option<String>> {
-        let response = self
-            .auth(self.client.post(self.api_segments(&[
-                "repos",
-                DATASET_SEGMENT,
-                namespace,
-                dataset,
-                "info",
-                "lfs",
-                "objects",
-                "batch",
-            ])))
-            .json(&json!({
-                "operation": "upload",
-                "objects": [{ "oid": oid, "size": size }],
-            }))
-            .send()
-            .await
-            .map_err(Self::network_error)?;
-        let data = Self::json_data(response).await?;
-        let objects = data
-            .get("objects")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let href = objects
-            .iter()
-            .find(|object| object.get("oid").and_then(Value::as_str) == Some(oid))
-            .and_then(|object| object.pointer("/actions/upload/href"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        Ok(href)
+    async fn open_verified_blob_source(blob: &BlobSpec) -> Result<tokio::fs::File> {
+        let mut file = tokio::fs::File::open(&blob.local_path).await?;
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() || metadata.len() != blob.size {
+            return Err(Self::blob_source_changed(&blob.local_path));
+        }
+
+        let mut hasher = Sha256::new();
+        let mut hashed_bytes = 0u64;
+        let mut buffer = vec![0u8; BLOB_STREAM_BUFFER_SIZE];
+        loop {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            hashed_bytes += read as u64;
+            hasher.update(&buffer[..read]);
+        }
+        let final_metadata = file.metadata().await?;
+        let actual_oid = hex::encode(hasher.finalize());
+        if hashed_bytes != blob.size || final_metadata.len() != blob.size || actual_oid != blob.oid
+        {
+            return Err(Self::blob_source_changed(&blob.local_path));
+        }
+        file.seek(SeekFrom::Start(0)).await?;
+        Ok(file)
     }
 
-    async fn put_blob(&self, upload_url: &str, bytes: Vec<u8>) -> Result<()> {
-        let response = self
-            .client
-            .put(upload_url)
-            .bearer_auth(&self.token)
-            .header("Cookie", format!("m_session_id={}", self.token))
-            .header("X-Request-ID", Uuid::new_v4().simple().to_string())
-            .header("Content-Length", bytes.len().to_string())
-            .body(bytes)
-            .send()
-            .await
-            .map_err(Self::network_error)?;
-        Self::json_data(response).await?;
-        Ok(())
+    fn blob_source_changed(path: &Path) -> LiosError {
+        LiosError::DataCorruption(format!(
+            "blob source changed before or during upload: {}",
+            path.display()
+        ))
     }
 
     fn parse_storage_object(value: &Value) -> Option<StorageObject> {
@@ -479,6 +479,43 @@ impl StorageAdapter for ModelScopeAdapter {
         }
     }
 
+    async fn head_revision(&self, namespace: &str, dataset: &str) -> Result<RepoRevision> {
+        let response = self
+            .auth(self.client.get(self.api_segments(&[
+                DATASET_SEGMENT,
+                namespace,
+                dataset,
+                "revisions",
+            ])))
+            .send()
+            .await
+            .map_err(Self::network_error)?;
+        let status = response.status();
+        let data = Self::json_data(response).await?;
+        let revision_map = data
+            .get("RevisionMap")
+            .or_else(|| data.get("revision_map"))
+            .ok_or_else(|| Self::invalid_response(status))?;
+        let branches = revision_map
+            .get("Branches")
+            .or_else(|| revision_map.get("branches"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| Self::invalid_response(status))?;
+        let branch = branches
+            .iter()
+            .find_map(|branch| {
+                let name = Self::value_string(branch, &["Revision", "revision", "Name", "name"])?;
+                (name == self.revision).then_some((name, branch))
+            })
+            .ok_or_else(|| Self::invalid_response(status))?;
+        let commit_id =
+            Self::value_string(branch.1, &["CommitId", "commit_id", "commitId", "CommitID"]);
+        Ok(RepoRevision {
+            branch: branch.0,
+            commit_id,
+        })
+    }
+
     async fn list_objects(
         &self,
         namespace: &str,
@@ -514,6 +551,243 @@ impl StorageAdapter for ModelScopeAdapter {
             .collect())
     }
 
+    async fn validate_blobs(
+        &self,
+        namespace: &str,
+        dataset: &str,
+        blobs: &[BlobSpec],
+    ) -> Result<Vec<BlobValidation>> {
+        for blob in blobs {
+            validate_blob_oid(&blob.oid)?;
+        }
+        let mut seen = HashSet::with_capacity(blobs.len());
+        if blobs.iter().any(|blob| !seen.insert(blob.oid.as_str())) {
+            return Err(RemoteError::new(RemoteErrorKind::InvalidRequest, None).into());
+        }
+
+        let mut results = Vec::with_capacity(blobs.len());
+        for batch in blobs.chunks(MODELSCOPE_LFS_BATCH_SIZE) {
+            let objects = batch
+                .iter()
+                .map(|blob| json!({ "oid": blob.oid, "size": blob.size }))
+                .collect::<Vec<_>>();
+            let response = self
+                .auth(self.client.post(self.api_segments(&[
+                    "repos",
+                    DATASET_SEGMENT,
+                    namespace,
+                    dataset,
+                    "info",
+                    "lfs",
+                    "objects",
+                    "batch",
+                ])))
+                .json(&json!({
+                    "operation": "upload",
+                    "objects": objects,
+                }))
+                .send()
+                .await
+                .map_err(Self::network_error)?;
+            let status = response.status();
+            let data = Self::json_data(response).await?;
+            let response_objects = data
+                .get("objects")
+                .and_then(Value::as_array)
+                .ok_or_else(|| Self::invalid_response(status))?;
+            let requested = batch
+                .iter()
+                .map(|blob| (blob.oid.as_str(), blob))
+                .collect::<HashMap<_, _>>();
+            let mut parsed = HashMap::with_capacity(response_objects.len());
+
+            for object in response_objects {
+                if object.get("error").is_some() {
+                    return Err(Self::invalid_response(status));
+                }
+                let oid = object
+                    .get("oid")
+                    .and_then(Value::as_str)
+                    .filter(|oid| requested.contains_key(*oid))
+                    .ok_or_else(|| Self::invalid_response(status))?;
+                let blob = requested[oid];
+                if let Some(returned_size) = object.get("size") {
+                    if returned_size.as_u64() != Some(blob.size) {
+                        return Err(Self::invalid_response(status));
+                    }
+                }
+                let checkpoint = BlobCheckpoint::new(oid, blob.size);
+                let validation = match object.get("actions") {
+                    None => BlobValidation::Reusable(checkpoint),
+                    Some(Value::Object(actions)) if actions.is_empty() => {
+                        BlobValidation::Reusable(checkpoint)
+                    }
+                    Some(Value::Object(actions)) => {
+                        let upload = actions
+                            .get("upload")
+                            .and_then(Value::as_object)
+                            .ok_or_else(|| Self::invalid_response(status))?;
+                        let href = upload
+                            .get("href")
+                            .and_then(Value::as_str)
+                            .filter(|href| !href.trim().is_empty())
+                            .ok_or_else(|| Self::invalid_response(status))?;
+                        let upload_url = self.parse_upload_target(href, status)?;
+                        BlobValidation::UploadRequired(ValidatedBlobUpload::new(
+                            checkpoint,
+                            upload_url.into(),
+                        ))
+                    }
+                    Some(_) => return Err(Self::invalid_response(status)),
+                };
+                if parsed.insert(oid.to_string(), validation).is_some() {
+                    return Err(Self::invalid_response(status));
+                }
+            }
+
+            for blob in batch {
+                results.push(
+                    parsed
+                        .remove(&blob.oid)
+                        .ok_or_else(|| Self::invalid_response(status))?,
+                );
+            }
+        }
+        Ok(results)
+    }
+
+    async fn upload_blob(
+        &self,
+        blob: &BlobSpec,
+        validated: ValidatedBlobUpload,
+    ) -> Result<BlobCheckpoint> {
+        let (checkpoint, upload_url) = validated.into_parts();
+        validate_blob_oid(&blob.oid)?;
+        validate_blob_oid(&checkpoint.oid)?;
+        if checkpoint.oid != blob.oid || checkpoint.size != blob.size {
+            return Err(LiosError::DataCorruption(
+                "validated blob does not match the local blob specification".to_string(),
+            ));
+        }
+        let file = Self::open_verified_blob_source(blob).await?;
+        let progress = Arc::new(Mutex::new(BlobStreamProgress::default()));
+        let stream = futures_util::stream::try_unfold(
+            BlobStreamState {
+                file,
+                expected_oid: blob.oid.clone(),
+                expected_size: blob.size,
+                progress: Arc::clone(&progress),
+            },
+            |mut state| async move {
+                let mut buffer = vec![0u8; BLOB_STREAM_BUFFER_SIZE];
+                let read = state.file.read(&mut buffer).await?;
+                if read == 0 {
+                    let mut progress = state.progress.lock().map_err(|_error| {
+                        std::io::Error::other("blob stream progress is unavailable")
+                    })?;
+                    let digest = hex::encode(progress.hasher.clone().finalize());
+                    let mismatch =
+                        progress.bytes != state.expected_size || digest != state.expected_oid;
+                    progress.integrity_error = mismatch;
+                    if mismatch {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "blob source changed during upload",
+                        ));
+                    }
+                    return Ok(None);
+                }
+
+                {
+                    let mut progress = state.progress.lock().map_err(|_error| {
+                        std::io::Error::other("blob stream progress is unavailable")
+                    })?;
+                    progress.bytes += read as u64;
+                    progress.hasher.update(&buffer[..read]);
+                    if progress.bytes > state.expected_size {
+                        progress.integrity_error = true;
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "blob source changed during upload",
+                        ));
+                    }
+                }
+                buffer.truncate(read);
+                Ok(Some((buffer, state)))
+            },
+        );
+        let upload_url = self.parse_upload_target(&upload_url, StatusCode::OK)?;
+        let attach_credentials = self.upload_target_receives_credentials(&upload_url);
+        let mut request = self
+            .client
+            .put(upload_url)
+            .header("X-Request-ID", Uuid::new_v4().simple().to_string())
+            .header("Content-Length", blob.size.to_string())
+            .body(Body::wrap_stream(stream));
+        if attach_credentials {
+            request = request
+                .bearer_auth(&self.token)
+                .header("Cookie", format!("m_session_id={}", self.token));
+        }
+        let response = request.send().await;
+        let stream_progress = progress
+            .lock()
+            .map_err(|_error| {
+                LiosError::Storage("blob stream progress is unavailable".to_string())
+            })?
+            .clone();
+        if stream_progress.integrity_error {
+            return Err(Self::blob_source_changed(&blob.local_path));
+        }
+        let response = response.map_err(Self::network_error)?;
+        let streamed_digest = hex::encode(stream_progress.hasher.finalize());
+        if stream_progress.bytes != blob.size || streamed_digest != blob.oid {
+            return Err(Self::blob_source_changed(&blob.local_path));
+        }
+        if !response.status().is_success() {
+            return Err(Self::response_error(response).await);
+        }
+        Ok(checkpoint)
+    }
+
+    async fn commit_actions(
+        &self,
+        namespace: &str,
+        dataset: &str,
+        commit_message: &str,
+        actions: &[RemoteAction],
+    ) -> Result<()> {
+        if actions.len() > MODELSCOPE_COMMIT_ACTION_LIMIT {
+            return Err(StorageTransactionError::CommitBatchTooLarge {
+                actions: actions.len(),
+                limit: MODELSCOPE_COMMIT_ACTION_LIMIT,
+            }
+            .into());
+        }
+        validate_remote_actions(actions)?;
+        if actions.is_empty() {
+            return Ok(());
+        }
+        let response = self
+            .auth(self.client.post(self.api_segments(&[
+                "repos",
+                DATASET_SEGMENT,
+                namespace,
+                dataset,
+                "commit",
+                &self.revision,
+            ])))
+            .json(&json!({
+                "commit_message": commit_message,
+                "actions": actions,
+            }))
+            .send()
+            .await
+            .map_err(Self::network_error)?;
+        Self::json_data(response).await?;
+        Ok(())
+    }
+
     async fn upload_object(
         &self,
         namespace: &str,
@@ -521,28 +795,28 @@ impl StorageAdapter for ModelScopeAdapter {
         remote_path: &str,
         local_path: &Path,
     ) -> Result<()> {
-        let bytes = tokio::fs::read(local_path).await?;
-        let sha256 = hex::encode(Sha256::digest(&bytes));
-        let size = bytes.len() as u64;
-        if let Some(upload_url) = self
-            .validate_blob(namespace, dataset, &sha256, size)
+        let blob = BlobSpec::from_path(local_path.to_path_buf()).await?;
+        RemoteAction::lfs_upsert(
+            remote_path,
+            BlobCheckpoint::new(blob.oid.clone(), blob.size),
+        )
+        .validate()?;
+        let validation = self
+            .validate_blobs(namespace, dataset, std::slice::from_ref(&blob))
             .await?
-        {
-            self.put_blob(&upload_url, bytes).await?;
-        }
-        self.create_commit(
+            .into_iter()
+            .next()
+            .ok_or_else(|| Self::invalid_response(StatusCode::OK))?;
+        let checkpoint = match validation {
+            BlobValidation::Reusable(checkpoint) => checkpoint,
+            BlobValidation::UploadRequired(validated) => self.upload_blob(&blob, validated).await?,
+        };
+        let action = RemoteAction::lfs_upsert(remote_path, checkpoint);
+        self.commit_actions(
             namespace,
             dataset,
-            format!("Upload {remote_path}"),
-            vec![json!({
-                "action": "create",
-                "path": remote_path,
-                "type": "lfs",
-                "size": size,
-                "sha256": sha256,
-                "content": "",
-                "encoding": "",
-            })],
+            &format!("Upload {remote_path}"),
+            std::slice::from_ref(&action),
         )
         .await
     }
@@ -568,59 +842,68 @@ impl StorageAdapter for ModelScopeAdapter {
         paths.sort();
         paths.dedup();
         let actions = paths
-            .iter()
-            .map(|path| {
-                json!({
-                    "action": "delete",
-                    "path": path,
-                    "type": "normal",
-                    "size": 0,
-                    "sha256": "",
-                    "content": "",
-                    "encoding": "",
-                })
-            })
+            .into_iter()
+            .map(RemoteAction::delete)
             .collect::<Vec<_>>();
         if actions.is_empty() {
             return Ok(());
         }
-        self.create_commit(
-            namespace,
-            dataset,
-            "Delete stale snapshot objects".to_string(),
-            actions,
-        )
-        .await
+        for batch in actions.chunks(MODELSCOPE_COMMIT_ACTION_LIMIT) {
+            self.commit_actions(namespace, dataset, "Delete stale snapshot objects", batch)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn delete_prefix(&self, namespace: &str, dataset: &str, prefix: &str) -> Result<()> {
         let objects = self.list_objects(namespace, dataset, prefix).await?;
-        let actions = objects
+        let mut paths = objects
             .into_iter()
             .filter(|object| object.path.starts_with(prefix))
-            .map(|object| {
-                json!({
-                    "action": "delete",
-                    "path": object.path,
-                    "type": "normal",
-                    "size": 0,
-                    "sha256": "",
-                    "content": "",
-                    "encoding": "",
-                })
-            })
+            .map(|object| object.path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        let actions = paths
+            .into_iter()
+            .map(RemoteAction::delete)
             .collect::<Vec<_>>();
         if actions.is_empty() {
             return Ok(());
         }
-        self.create_commit(namespace, dataset, format!("Delete {prefix}"), actions)
-            .await
+        let commit_message = format!("Delete {prefix}");
+        for batch in actions.chunks(MODELSCOPE_COMMIT_ACTION_LIMIT) {
+            self.commit_actions(namespace, dataset, &commit_message, batch)
+                .await?;
+        }
+        Ok(())
     }
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn is_production_modelscope_endpoint(endpoint: &Url) -> bool {
+    endpoint.scheme() == "https"
+        && endpoint.port_or_known_default() == Some(443)
+        && matches!(
+            endpoint.host_str(),
+            Some("modelscope.cn" | "www.modelscope.cn")
+        )
+}
+
+fn is_modelscope_host(host: &str) -> bool {
+    host == "modelscope.cn" || host.ends_with(".modelscope.cn")
 }
 
 #[cfg(test)]
 mod tests {
     use super::ModelScopeAdapter;
+    use crate::{LiosError, RemoteErrorKind};
+    use reqwest::Url;
 
     #[test]
     fn repository_identifiers_cannot_change_api_route() {
@@ -642,5 +925,38 @@ mod tests {
         );
         assert_eq!(url.query(), None);
         assert_eq!(url.fragment(), None);
+    }
+
+    #[test]
+    fn https_endpoint_rejects_insecure_upload_target() {
+        let adapter = ModelScopeAdapter::new("https://modelscope.cn", "request-token");
+
+        let error = adapter
+            .parse_upload_target("http://uploads.example.test/blob", reqwest::StatusCode::OK)
+            .unwrap_err();
+
+        let LiosError::Remote(error) = error else {
+            panic!("expected typed remote error");
+        };
+        assert_eq!(error.kind, RemoteErrorKind::InvalidResponse);
+        assert_eq!(error.status, Some(200));
+    }
+
+    #[test]
+    fn cross_host_modelscope_credentials_require_an_official_endpoint() {
+        let upload_url = Url::parse("https://uploads.modelscope.cn/blob").unwrap();
+
+        assert!(
+            ModelScopeAdapter::new("https://modelscope.cn", "request-token")
+                .upload_target_receives_credentials(&upload_url)
+        );
+        assert!(
+            ModelScopeAdapter::new("https://www.modelscope.cn", "request-token")
+                .upload_target_receives_credentials(&upload_url)
+        );
+        assert!(
+            !ModelScopeAdapter::new("https://staging.modelscope.cn", "request-token")
+                .upload_target_receives_credentials(&upload_url)
+        );
     }
 }
