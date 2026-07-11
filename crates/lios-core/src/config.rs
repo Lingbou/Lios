@@ -1,11 +1,13 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
+use chrono::NaiveDate;
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::atomic::write_atomic;
+use crate::atomic::{append_private, write_atomic};
 use crate::crypto::KeyFile;
 use crate::{LiosError, Result};
 
@@ -31,6 +33,7 @@ pub struct LiosPaths {
     pub config: PathBuf,
     pub database: PathBuf,
     pub staging: PathBuf,
+    pub logs: PathBuf,
     pub credentials: PathBuf,
 }
 
@@ -68,6 +71,7 @@ impl LiosPaths {
             config: home.join("config.yaml"),
             database: home.join("lios.db"),
             staging: home.join("staging"),
+            logs: home.join("logs"),
             credentials: home.join("credentials.enc"),
             home,
         }
@@ -84,6 +88,15 @@ impl LiosPaths {
         fs::create_dir_all(&self.home)?;
         fs::create_dir_all(&self.staging)?;
         Ok(())
+    }
+
+    pub fn append_private_log(&self, date: NaiveDate, contents: &[u8]) -> io::Result<()> {
+        append_private(
+            &self
+                .logs
+                .join(format!("lios-{}.log", date.format("%Y-%m-%d"))),
+            contents,
+        )
     }
 
     pub fn for_task(&self, account_id: &str, space_id: &str, task_id: Uuid) -> Result<Self> {
