@@ -89,6 +89,8 @@ pub enum LiosError {
     InvalidRelativePath(PathBuf),
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("storage transaction error: {0}")]
+    StorageTransaction(#[from] crate::storage::StorageTransactionError),
     #[error("remote error: {0}")]
     Remote(#[from] RemoteError),
     #[error("unsupported operation: {0}")]

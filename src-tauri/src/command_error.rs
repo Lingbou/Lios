@@ -126,6 +126,9 @@ impl From<LiosError> for CommandError {
             LiosError::Storage(message) => {
                 Self::new(CommandErrorCode::Storage, message, false, None)
             }
+            LiosError::StorageTransaction(error) => {
+                Self::new(CommandErrorCode::Storage, error.to_string(), false, None)
+            }
             LiosError::Io(error) => error.into(),
             LiosError::Database(error) => {
                 Self::new(CommandErrorCode::Storage, error.to_string(), false, None)
