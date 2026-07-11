@@ -3,10 +3,11 @@ use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
-    AeadCore, ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Key, Nonce,
 };
 use hkdf::Hkdf;
+#[cfg(test)]
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use sha2::Sha256;
 use crate::atomic::write_private_atomic_new;
 use crate::{LiosError, Result};
 
+#[cfg(test)]
 type HmacSha256 = Hmac<Sha256>;
 
 const KEY_FILE_V1_ALGORITHM: &str = "XChaCha20Poly1305-compatible-32-byte-key";
@@ -35,14 +37,6 @@ struct KeyFileYaml {
     master_key: Option<String>,
 }
 
-#[derive(Serialize)]
-struct KeyFileYamlV1 {
-    version: u8,
-    algorithm: &'static str,
-    key: String,
-}
-
-#[allow(dead_code)]
 #[derive(Serialize)]
 struct KeyFileYamlV2 {
     version: u8,
@@ -100,16 +94,6 @@ impl KeyFile {
     }
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
-        let yaml = KeyFileYamlV1 {
-            version: 1,
-            algorithm: KEY_FILE_V1_ALGORITHM,
-            key: STANDARD.encode(self.key),
-        };
-        self.write_yaml(path.as_ref(), &yaml)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn save_v2_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
         let yaml = KeyFileYamlV2 {
             version: 2,
             kdf: KEY_FILE_V2_KDF,
@@ -125,18 +109,7 @@ impl KeyFile {
         Ok(())
     }
 
-    pub(crate) fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = cipher
-            .encrypt(&nonce, plaintext)
-            .map_err(|_| LiosError::Crypto)?;
-        let mut output = Vec::with_capacity(nonce.len() + ciphertext.len());
-        output.extend_from_slice(&nonce);
-        output.extend_from_slice(&ciphertext);
-        Ok(output)
-    }
-
+    #[cfg(test)]
     pub(crate) fn encrypt_deterministic(&self, domain: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
         let digest = self.keyed_digest(domain.as_bytes(), plaintext)?;
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
@@ -148,10 +121,6 @@ impl KeyFile {
         output.extend_from_slice(nonce);
         output.extend_from_slice(&ciphertext);
         Ok(output)
-    }
-
-    pub(crate) fn stable_id(&self, domain: &str, bytes: &[u8]) -> Result<String> {
-        Ok(hex::encode(self.keyed_digest(domain.as_bytes(), bytes)?))
     }
 
     pub(crate) fn decrypt(&self, encrypted: &[u8]) -> Result<Vec<u8>> {
@@ -173,6 +142,7 @@ impl KeyFile {
         Ok(derived)
     }
 
+    #[cfg(test)]
     fn keyed_digest(&self, domain: &[u8], bytes: &[u8]) -> Result<[u8; 32]> {
         let mut mac =
             <HmacSha256 as Mac>::new_from_slice(&self.key).map_err(|_| LiosError::Crypto)?;
@@ -263,7 +233,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("phase-2b.key");
 
-        legacy_key().save_v2_to_path(&path).unwrap();
+        legacy_key().save_to_path(&path).unwrap();
 
         let yaml: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();

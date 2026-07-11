@@ -286,7 +286,7 @@ fn delete_removes_catalog_references_to_remote_objects() {
 }
 
 #[test]
-fn rename_and_create_folder_only_change_catalog_references() {
+fn rename_and_create_folder_only_change_catalog_and_descriptor_references() {
     let tmp = tempdir().unwrap();
     let staging = tmp.path().join("staging");
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
@@ -320,7 +320,25 @@ fn rename_and_create_folder_only_change_catalog_references() {
         .unwrap();
     let tree = catalog.decrypt_tree(&key).unwrap();
 
-    assert_eq!(before, after);
+    let before_objects = before
+        .iter()
+        .filter(|file| file.path.starts_with("objects/"))
+        .collect::<Vec<_>>();
+    let after_objects = after
+        .iter()
+        .filter(|file| file.path.starts_with("objects/"))
+        .collect::<Vec<_>>();
+    assert_eq!(before_objects, after_objects);
+    assert!(
+        after
+            .iter()
+            .filter(|file| file.path.starts_with("recovery/nodes/"))
+            .count()
+            > before
+                .iter()
+                .filter(|file| file.path.starts_with("recovery/nodes/"))
+                .count()
+    );
     assert!(child_names(&tree).contains(&"renamed.txt".to_string()));
     assert!(child_names(&tree).contains(&"empty".to_string()));
 }
