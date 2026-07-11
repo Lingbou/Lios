@@ -344,74 +344,6 @@ async fn list_dataset_repos_uses_legacy_owner_listing_with_service_page_limit() 
 }
 
 #[tokio::test]
-async fn upload_object_uses_lfs_blob_then_commit_for_dataset_repo() {
-    let server = MockServer::start();
-    let tmp = tempdir().unwrap();
-    let local_file = tmp.path().join("chunk.lios");
-    fs::write(&local_file, b"encrypted chunk").unwrap();
-    let sha = hex::encode(Sha256::digest(b"encrypted chunk"));
-    let upload_url = server.url("/blob/upload-url");
-
-    let validate = server.mock(|when, then| {
-        when.method(POST)
-            .path("/api/v1/repos/datasets/novix/cold/info/lfs/objects/batch")
-            .header("authorization", "Bearer token")
-            .json_body(json!({
-                "operation": "upload",
-                "objects": [{ "oid": sha, "size": 15 }]
-            }));
-        then.status(200).json_body(json!({
-            "Data": {
-                "objects": [{
-                    "oid": sha,
-                    "actions": { "upload": { "href": upload_url } }
-                }]
-            }
-        }));
-    });
-    let upload = server.mock(|when, then| {
-        when.method(PUT)
-            .path("/blob/upload-url")
-            .header("authorization", "Bearer token")
-            .body("encrypted chunk");
-        then.status(200);
-    });
-    let commit = server.mock(|when, then| {
-        when.method(POST)
-            .path("/api/v1/repos/datasets/novix/cold/commit/master")
-            .json_body(json!({
-                "commit_message": "Upload objects/file-a/chunk-000000.lios",
-                "actions": [{
-                    "action": "create",
-                    "path": "objects/file-a/chunk-000000.lios",
-                    "type": "lfs",
-                    "size": 15,
-                    "sha256": sha,
-                    "content": "",
-                    "encoding": ""
-                }]
-            }));
-        then.status(200)
-            .json_body(json!({ "Data": { "commit": "abc" } }));
-    });
-
-    let adapter = ModelScopeAdapter::new(server.base_url(), "token");
-    adapter
-        .upload_object(
-            "novix",
-            "cold",
-            "objects/file-a/chunk-000000.lios",
-            &local_file,
-        )
-        .await
-        .unwrap();
-
-    validate.assert();
-    upload.assert();
-    commit.assert();
-}
-
-#[tokio::test]
 async fn validate_65_blobs_uses_64_plus_1_requests_and_returns_every_oid() {
     let server = MockServer::start();
     let specs = (0..65)
@@ -1031,7 +963,7 @@ async fn blob_upload_errors_do_not_expose_token_or_signed_url() {
 }
 
 #[tokio::test]
-async fn list_download_and_delete_prefix_use_dataset_tree_and_commit_delete() {
+async fn list_download_and_explicit_delete_commit_use_dataset_routes() {
     let server = MockServer::start();
     let tmp = tempdir().unwrap();
     let download_path = tmp.path().join("restore/chunk.lios");
@@ -1100,15 +1032,19 @@ async fn list_download_and_delete_prefix_use_dataset_tree_and_commit_delete() {
         )
         .await
         .unwrap();
+    let delete_actions = objects
+        .iter()
+        .map(|object| RemoteAction::delete(object.path.clone()))
+        .collect::<Vec<_>>();
     adapter
-        .delete_prefix("novix", "cold", "objects/file-a")
+        .commit_actions("novix", "cold", "Delete objects/file-a", &delete_actions)
         .await
         .unwrap();
 
     assert_eq!(objects.len(), 2);
     assert_eq!(objects[0].path, "objects/file-a/chunk-000000.lios");
     assert_eq!(fs::read(&download_path).unwrap(), b"encrypted chunk");
-    list.assert_hits(2);
+    list.assert_hits(1);
     download.assert();
     delete_commit.assert();
 }

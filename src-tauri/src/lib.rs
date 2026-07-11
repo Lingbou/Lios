@@ -24,6 +24,10 @@ use lios_core::catalog::{
     Catalog, CatalogRemoteFile, CatalogSelection, CatalogTreeNode, ConflictResolution, DriveItem,
     UploadConflict, CATALOG_FILE,
 };
+use lios_core::catalog_transaction::{
+    execute_catalog_transaction, CatalogTransactionOutcome, CatalogTransactionPhase,
+    CatalogTransactionProgress, CatalogTransactionSpec,
+};
 use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
 use lios_core::credentials::{protect_to_file, unprotect_from_file};
 use lios_core::crypto::KeyFile;
@@ -31,8 +35,7 @@ use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUse
 use lios_core::pack::PackOptions;
 use lios_core::restore::{RestoreConflictPolicy, RestoreOptions};
 use lios_core::storage::{
-    plan_catalog_sync_changes, validate_catalog_sync_upload, CatalogSyncFile, CatalogSyncUpload,
-    StorageAdapter, StorageObject,
+    plan_catalog_sync_changes, CatalogSyncFile, CatalogSyncUpload, StorageAdapter, StorageObject,
 };
 use lios_core::tasks::{TaskRecord, TaskState, TaskStore};
 use production_config::{
@@ -101,6 +104,7 @@ struct CatalogLoadResult {
     local_path: String,
     bytes: u64,
     tree: CatalogTreeNode,
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -109,10 +113,19 @@ struct DatasetRepoListResult {
     repositories: Vec<DatasetRepoSummary>,
 }
 
-#[derive(Serialize)]
 struct SyncWork {
     upload: Vec<CatalogSyncUpload>,
     delete: Vec<String>,
+    initial_remote_inventory: Vec<StorageObject>,
+    prepublish_safe_paths: HashSet<String>,
+    base_catalog_sha256: Option<String>,
+    probe_directory: PathBuf,
+}
+
+struct CatalogBaseline {
+    catalog_sha256: Option<String>,
+    referenced_paths: HashSet<String>,
+    remote_objects: Vec<StorageObject>,
 }
 
 fn to_err<E>(error: E) -> CommandError
@@ -147,9 +160,12 @@ fn emit_tasks(app: &tauri::AppHandle, paths: &LiosPaths) {
 }
 
 fn task_interrupt(paths: &LiosPaths, id: Uuid) -> CommandResult<Option<TaskState>> {
-    let state = task_store(paths)?
-        .list()
-        .map_err(to_err)?
+    task_interrupt_core(paths, id).map_err(to_err)
+}
+
+fn task_interrupt_core(paths: &LiosPaths, id: Uuid) -> lios_core::Result<Option<TaskState>> {
+    let state = TaskStore::open(&paths.database)?
+        .list()?
         .into_iter()
         .find(|task| task.id == id)
         .map(|task| task.state);
@@ -162,12 +178,6 @@ fn task_interrupt(paths: &LiosPaths, id: Uuid) -> CommandResult<Option<TaskState
 
 fn insert_task(paths: &LiosPaths, task: &TaskRecord) -> CommandResult<()> {
     task_store(paths)?.insert(task).map_err(to_err)
-}
-
-fn update_task_progress(paths: &LiosPaths, id: Uuid, done: u64, total: u64) -> CommandResult<()> {
-    task_store(paths)?
-        .update_progress(id, done, total)
-        .map_err(to_err)
 }
 
 fn update_task_transfer(
@@ -195,6 +205,47 @@ fn average_speed_bps(bytes_done: u64, start: Instant) -> u64 {
     } else {
         (bytes_done as f64 / elapsed) as u64
     }
+}
+
+fn transaction_phase_label(phase: CatalogTransactionPhase) -> &'static str {
+    match phase {
+        CatalogTransactionPhase::ValidateBlobs => "validating",
+        CatalogTransactionPhase::UploadBlobs => "uploading",
+        CatalogTransactionPhase::Prepublish
+        | CatalogTransactionPhase::ProbeCatalog
+        | CatalogTransactionPhase::Publish => "committing",
+        CatalogTransactionPhase::Cleanup => "cleaning",
+    }
+}
+
+fn persist_transaction_progress(
+    paths: &LiosPaths,
+    app: Option<&tauri::AppHandle>,
+    task: &mut TaskRecord,
+    started: Instant,
+    progress: CatalogTransactionProgress,
+) -> lios_core::Result<()> {
+    let phase = transaction_phase_label(progress.phase).to_string();
+    task.phase = Some(phase.clone());
+    task.progress_done = progress.completed_items;
+    task.progress_total = progress.total_items;
+    task.bytes_done = progress.bytes_done;
+    task.bytes_total = progress.bytes_total;
+    task.speed_bps = average_speed_bps(progress.bytes_done, started);
+    let store = TaskStore::open(&paths.database)?;
+    store.update_phase(task.id, Some(phase))?;
+    store.update_transfer(
+        task.id,
+        task.progress_done,
+        task.progress_total,
+        task.bytes_done,
+        task.bytes_total,
+        task.speed_bps,
+    )?;
+    if let Some(app) = app {
+        emit_tasks(app, paths);
+    }
+    Ok(())
 }
 
 fn update_task_state(
@@ -383,31 +434,73 @@ async fn finish_active_worker(
     intended_state: TaskState,
     error: Option<String>,
 ) -> CommandResult<TaskState> {
+    finish_worker(
+        paths,
+        gate,
+        catalog_mutation_gate,
+        task_id,
+        intended_state,
+        error,
+        true,
+    )
+    .await
+}
+
+async fn finish_worker(
+    paths: &LiosPaths,
+    gate: &Mutex<TaskLifecycleState>,
+    catalog_mutation_gate: &CatalogMutationGate,
+    task_id: Uuid,
+    intended_state: TaskState,
+    error: Option<String>,
+    preserve_control_state: bool,
+) -> CommandResult<TaskState> {
     let _shared_staging_guard = catalog_mutation_gate.lock_shared_staging().await;
     let mut lifecycle = gate.lock().await;
-    let current_state = task_store(paths)?
-        .list()
-        .map_err(to_err)?
-        .into_iter()
-        .find(|task| task.id == task_id)
-        .map(|task| task.state);
-    let final_state = match current_state {
-        Some(TaskState::Canceled) => TaskState::Canceled,
-        Some(TaskState::Paused) => TaskState::Paused,
-        _ => intended_state,
-    };
-    let final_error = if final_state == TaskState::Failed {
-        error
-    } else {
-        None
-    };
-    update_task_phase(paths, task_id, None)?;
-    update_task_state(paths, task_id, final_state.clone(), final_error)?;
+    let result = (|| {
+        let current_state = task_store(paths)?
+            .list()
+            .map_err(to_err)?
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .map(|task| task.state);
+        let final_state = match (preserve_control_state, current_state) {
+            (true, Some(TaskState::Canceled)) => TaskState::Canceled,
+            (true, Some(TaskState::Paused)) => TaskState::Paused,
+            _ => intended_state,
+        };
+        let final_error = if final_state == TaskState::Failed {
+            error
+        } else {
+            None
+        };
+        update_task_phase(paths, task_id, None)?;
+        update_task_state(paths, task_id, final_state.clone(), final_error)?;
+        Ok(final_state)
+    })();
     lifecycle.active_workers.remove(&task_id);
     if cleanup_is_safe(paths, &lifecycle).unwrap_or(false) {
         let _ = cleanup_current_staging_cache(paths, true, false);
     }
-    Ok(final_state)
+    result
+}
+
+async fn finish_committed_worker(
+    paths: &LiosPaths,
+    gate: &Mutex<TaskLifecycleState>,
+    catalog_mutation_gate: &CatalogMutationGate,
+    task_id: Uuid,
+) -> CommandResult<TaskState> {
+    finish_worker(
+        paths,
+        gate,
+        catalog_mutation_gate,
+        task_id,
+        TaskState::Completed,
+        None,
+        false,
+    )
+    .await
 }
 
 async fn clear_task_record(
@@ -473,56 +566,122 @@ fn desired_catalog_objects(
     Ok(desired)
 }
 
-async fn plan_catalog_sync(
+fn catalog_reference_paths(catalog: &Catalog, key: &KeyFile) -> CommandResult<HashSet<String>> {
+    let mut referenced = HashSet::from([CATALOG_FILE.to_string()]);
+    referenced.extend(
+        catalog
+            .remote_files_for_selection(&CatalogSelection::All, key)
+            .map_err(to_err)?
+            .into_iter()
+            .map(|file| file.path),
+    );
+    Ok(referenced)
+}
+
+fn catalog_baseline_from_downloaded_catalog(
     paths: &LiosPaths,
     catalog: &Catalog,
     key: &KeyFile,
+    remote_objects: Vec<StorageObject>,
+) -> CommandResult<CatalogBaseline> {
+    Ok(CatalogBaseline {
+        catalog_sha256: Some(sha256_hex_file(&paths.staging.join(CATALOG_FILE))?),
+        referenced_paths: catalog_reference_paths(catalog, key)?,
+        remote_objects,
+    })
+}
+
+async fn download_catalog_baseline(
+    paths: &LiosPaths,
+    key: &KeyFile,
     adapter: &ModelScopeAdapter,
     repo: &RepoConfig,
-) -> CommandResult<SyncWork> {
-    let desired = desired_catalog_objects(paths, catalog, key)?;
+) -> CommandResult<(Catalog, CatalogBaseline)> {
+    let catalog_path = paths.staging.join(CATALOG_FILE);
+    adapter
+        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
+        .await
+        .map_err(to_err)?;
+    let catalog = Catalog::from_staging(paths.staging.clone());
     let remote_objects = adapter
         .list_objects(&repo.namespace, &repo.dataset, "")
         .await
         .map_err(to_err)?;
-    plan_catalog_sync_with_remote_objects(desired, remote_objects)
+    let baseline = catalog_baseline_from_downloaded_catalog(paths, &catalog, key, remote_objects)?;
+    Ok((catalog, baseline))
 }
 
-fn plan_catalog_sync_with_remote_objects(
+fn plan_catalog_sync_with_baseline(
     desired: Vec<CatalogSyncFile>,
-    remote_objects: Vec<StorageObject>,
+    baseline: CatalogBaseline,
+    probe_directory: PathBuf,
 ) -> CommandResult<SyncWork> {
-    let plan = plan_catalog_sync_changes(desired, remote_objects).map_err(to_err)?;
+    let plan =
+        plan_catalog_sync_changes(desired, baseline.remote_objects.clone()).map_err(to_err)?;
+    let remote_paths = baseline
+        .remote_objects
+        .iter()
+        .map(|object| object.path.as_str())
+        .collect::<HashSet<_>>();
+    let prepublish_safe_paths = plan
+        .upload
+        .iter()
+        .filter(|upload| {
+            upload.path != CATALOG_FILE
+                && !baseline.referenced_paths.contains(&upload.path)
+                && !remote_paths.contains(upload.path.as_str())
+        })
+        .map(|upload| upload.path.clone())
+        .collect();
     Ok(SyncWork {
         upload: plan.upload,
         delete: plan.delete,
+        initial_remote_inventory: baseline.remote_objects,
+        prepublish_safe_paths,
+        base_catalog_sha256: baseline.catalog_sha256,
+        probe_directory,
     })
 }
 
-async fn execute_sync_work(
-    adapter: &ModelScopeAdapter,
+fn plan_catalog_sync(
+    paths: &LiosPaths,
+    catalog: &Catalog,
+    key: &KeyFile,
+    baseline: CatalogBaseline,
+) -> CommandResult<SyncWork> {
+    let desired = desired_catalog_objects(paths, catalog, key)?;
+    plan_catalog_sync_with_baseline(desired, baseline, paths.staging.clone())
+}
+
+async fn execute_sync_work<A, C, P>(
+    adapter: &A,
     repo: &RepoConfig,
-    work: &SyncWork,
-) -> CommandResult<()> {
-    for object in &work.upload {
-        validate_catalog_sync_upload(object).map_err(to_err)?;
-        adapter
-            .upload_object(
-                &repo.namespace,
-                &repo.dataset,
-                &object.path,
-                &object.local_path,
-            )
-            .await
-            .map_err(to_err)?;
-    }
-    if !work.delete.is_empty() {
-        adapter
-            .delete_objects(&repo.namespace, &repo.dataset, &work.delete)
-            .await
-            .map_err(to_err)?;
-    }
-    Ok(())
+    work: SyncWork,
+    should_cancel: C,
+    on_progress: P,
+) -> CommandResult<CatalogTransactionOutcome>
+where
+    A: StorageAdapter + ?Sized,
+    C: FnMut() -> lios_core::Result<bool>,
+    P: FnMut(CatalogTransactionProgress) -> lios_core::Result<()>,
+{
+    execute_catalog_transaction(
+        adapter,
+        &repo.namespace,
+        &repo.dataset,
+        CatalogTransactionSpec {
+            uploads: work.upload,
+            delete_paths: work.delete,
+            initial_remote_inventory: work.initial_remote_inventory,
+            prepublish_safe_paths: work.prepublish_safe_paths,
+            base_catalog_sha256: work.base_catalog_sha256,
+            probe_directory: work.probe_directory,
+        },
+        should_cancel,
+        on_progress,
+    )
+    .await
+    .map_err(to_err)
 }
 
 async fn sync_current_catalog(
@@ -531,9 +690,18 @@ async fn sync_current_catalog(
     key: &KeyFile,
     adapter: &ModelScopeAdapter,
     repo: &RepoConfig,
-) -> CommandResult<()> {
-    let work = plan_catalog_sync(paths, catalog, key, adapter, repo).await?;
-    execute_sync_work(adapter, repo, &work).await
+    baseline: CatalogBaseline,
+) -> CommandResult<Vec<String>> {
+    let work = plan_catalog_sync(paths, catalog, key, baseline)?;
+    match execute_sync_work(adapter, repo, work, || Ok(false), |_progress| Ok(())).await? {
+        CatalogTransactionOutcome::Completed { warnings } => Ok(warnings),
+        CatalogTransactionOutcome::Canceled => Err(CommandError::new(
+            CommandErrorCode::Internal,
+            "catalog transaction was unexpectedly canceled",
+            false,
+            None,
+        )),
+    }
 }
 
 #[tauri::command]
@@ -662,6 +830,14 @@ async fn initialize_space(
         &state.paths.staging,
     )
     .await?;
+    let baseline = CatalogBaseline {
+        catalog_sha256: None,
+        referenced_paths: HashSet::new(),
+        remote_objects: adapter
+            .list_objects(&repo.namespace, &repo.dataset, "")
+            .await
+            .map_err(to_err)?,
+    };
     let mut config = load_config(&state.paths)?;
     config.active_repo = Some(repo.clone());
     persist_config(&state.paths, &mut config)?;
@@ -669,7 +845,8 @@ async fn initialize_space(
     reset_staging(&state.paths)?;
     let catalog = Catalog::initialize_empty(&repo.dataset, &key, state.paths.staging.clone())
         .map_err(to_err)?;
-    sync_current_catalog(&state.paths, &catalog, &key, &adapter, &repo).await?;
+    let warnings =
+        sync_current_catalog(&state.paths, &catalog, &key, &adapter, &repo, baseline).await?;
     let bytes = fs::metadata(catalog.encrypted_catalog_path())
         .map_err(to_err)?
         .len();
@@ -678,6 +855,7 @@ async fn initialize_space(
         local_path: catalog.encrypted_catalog_path().display().to_string(),
         bytes,
         tree,
+        warnings,
     })
 }
 
@@ -716,6 +894,7 @@ async fn load_space_catalog(
         local_path: local_path.display().to_string(),
         bytes,
         tree,
+        warnings: Vec::new(),
     })
 }
 
@@ -752,21 +931,20 @@ async fn create_folder(
     let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
     let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
     let local_path = state.paths.staging.join(CATALOG_FILE);
-    adapter
-        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
-        .await
-        .map_err(to_err)?;
-    let catalog = Catalog::from_staging(state.paths.staging.clone());
+    let (catalog, baseline) =
+        download_catalog_baseline(&state.paths, &key, &adapter, &repo).await?;
     catalog
         .create_folder(&parent_node_id, &name, &key)
         .map_err(to_err)?;
-    sync_current_catalog(&state.paths, &catalog, &key, &adapter, &repo).await?;
+    let warnings =
+        sync_current_catalog(&state.paths, &catalog, &key, &adapter, &repo, baseline).await?;
     let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
     let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
     Ok(CatalogLoadResult {
         local_path: local_path.display().to_string(),
         bytes,
         tree,
+        warnings,
     })
 }
 
@@ -781,21 +959,20 @@ async fn rename_node(
     let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
     let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
     let local_path = state.paths.staging.join(CATALOG_FILE);
-    adapter
-        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
-        .await
-        .map_err(to_err)?;
-    let catalog = Catalog::from_staging(state.paths.staging.clone());
+    let (catalog, baseline) =
+        download_catalog_baseline(&state.paths, &key, &adapter, &repo).await?;
     catalog
         .rename_node(&node_id, &new_name, &key)
         .map_err(to_err)?;
-    sync_current_catalog(&state.paths, &catalog, &key, &adapter, &repo).await?;
+    let warnings =
+        sync_current_catalog(&state.paths, &catalog, &key, &adapter, &repo, baseline).await?;
     let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
     let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
     Ok(CatalogLoadResult {
         local_path: local_path.display().to_string(),
         bytes,
         tree,
+        warnings,
     })
 }
 
@@ -863,19 +1040,9 @@ async fn enqueue_upload_to_folder(
         let key = key_from_config(&config)?;
         let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
         let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
-        let catalog_path = state.paths.staging.join(CATALOG_FILE);
-        adapter
-            .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
-            .await
-            .map_err(to_err)?;
-        let catalog = Catalog::from_staging(state.paths.staging.clone());
+        let (catalog, baseline) =
+            download_catalog_baseline(&state.paths, &key, &adapter, &repo).await?;
         let upload_paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-        // The global mutation gate keeps this inventory snapshot valid against same-process
-        // writers. It does not protect against another device; remote revision checks come next.
-        let remote_objects = adapter
-            .list_objects(&repo.namespace, &repo.dataset, "")
-            .await
-            .map_err(to_err)?;
         update_task_phase(&state.paths, task.id, Some("preparing".to_string()))?;
         emit_tasks(&app, &state.paths);
         let preparing_started = Instant::now();
@@ -889,7 +1056,7 @@ async fn enqueue_upload_to_folder(
                     chunk_size: config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
                     staging_dir: state.paths.staging.clone(),
                 },
-                &remote_objects,
+                &baseline.remote_objects,
                 |progress| {
                     task.progress_done = progress.completed_chunks;
                     task.progress_total = progress.total_chunks;
@@ -908,97 +1075,59 @@ async fn enqueue_upload_to_folder(
             )
             .map_err(to_err)?;
         report.ensure_no_skipped_paths().map_err(to_err)?;
-        let desired = desired_catalog_objects(&state.paths, &catalog, &key)?;
-        let work = plan_catalog_sync_with_remote_objects(desired, remote_objects)?;
-        update_task_phase(&state.paths, task.id, Some("uploading".to_string()))?;
-        task.progress_done = 0;
-        task.bytes_done = 0;
-        task.progress_total = (work.upload.len() + work.delete.len()) as u64;
-        let upload_total_bytes = work
-            .upload
-            .iter()
-            .filter_map(|object| std::fs::metadata(&object.local_path).ok())
-            .map(|metadata| metadata.len())
-            .sum::<u64>();
-        let uploading_started = Instant::now();
-        update_task_transfer(
-            &state.paths,
-            task.id,
-            task.progress_done,
-            task.progress_total,
-            task.bytes_done,
-            upload_total_bytes,
-            0,
-        )?;
-        emit_tasks(&app, &state.paths);
-        for object in &work.upload {
-            if let Some(state) = task_interrupt(&state.paths, task.id)? {
-                return Ok::<Option<TaskState>, CommandError>(Some(state));
-            }
-            validate_catalog_sync_upload(object).map_err(to_err)?;
-            adapter
-                .upload_object(
-                    &repo.namespace,
-                    &repo.dataset,
-                    &object.path,
-                    &object.local_path,
+        let work = plan_catalog_sync(&state.paths, &catalog, &key, baseline)?;
+        let transaction_started = Instant::now();
+        let task_id = task.id;
+        let mut interrupted_state = None;
+        let outcome = execute_sync_work(
+            &adapter,
+            &repo,
+            work,
+            || {
+                interrupted_state = task_interrupt_core(&state.paths, task_id)?;
+                Ok(interrupted_state.is_some())
+            },
+            |progress| {
+                persist_transaction_progress(
+                    &state.paths,
+                    Some(&app),
+                    &mut task,
+                    transaction_started,
+                    progress,
                 )
-                .await
-                .map_err(to_err)?;
-            task.progress_done += 1;
-            task.bytes_done += std::fs::metadata(&object.local_path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            update_task_transfer(
-                &state.paths,
-                task.id,
-                task.progress_done,
-                task.progress_total,
-                task.bytes_done,
-                upload_total_bytes,
-                average_speed_bps(task.bytes_done, uploading_started),
-            )?;
-            emit_tasks(&app, &state.paths);
-        }
-        if !work.delete.is_empty() {
-            if let Some(state) = task_interrupt(&state.paths, task.id)? {
-                return Ok::<Option<TaskState>, CommandError>(Some(state));
+            },
+        )
+        .await?;
+        match outcome {
+            CatalogTransactionOutcome::Completed { warnings } => {
+                Ok::<(Option<TaskState>, Vec<String>), CommandError>((None, warnings))
             }
-            adapter
-                .delete_objects(&repo.namespace, &repo.dataset, &work.delete)
-                .await
-                .map_err(to_err)?;
-            task.progress_done += work.delete.len() as u64;
-            update_task_transfer(
-                &state.paths,
-                task.id,
-                task.progress_done,
-                task.progress_total,
-                task.bytes_done,
-                upload_total_bytes,
-                average_speed_bps(task.bytes_done, uploading_started),
-            )?;
-            emit_tasks(&app, &state.paths);
+            CatalogTransactionOutcome::Canceled => Ok((
+                Some(interrupted_state.unwrap_or(TaskState::Canceled)),
+                Vec::new(),
+            )),
         }
-        Ok::<Option<TaskState>, CommandError>(None)
     }
     .await;
     match result {
-        Ok(None) => {
-            task.state = finish_active_worker(
+        Ok((None, warnings)) => {
+            task.state = finish_committed_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
                 &state.catalog_mutation_gate,
                 task.id,
-                TaskState::Completed,
-                None,
             )
             .await?;
-            task.error = None;
+            task.error = (!warnings.is_empty()).then(|| warnings.join("; "));
+            if task.error.is_some() {
+                task_store(&state.paths)?
+                    .update_state(task.id, task.state.clone(), task.error.clone())
+                    .map_err(to_err)?;
+            }
             emit_tasks(&app, &state.paths);
             Ok(task)
         }
-        Ok(Some(interrupt_state)) => {
+        Ok((Some(interrupt_state), _warnings)) => {
             task.state = finish_active_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
@@ -1035,6 +1164,7 @@ async fn enqueue_upload_to_folder(
 
 #[tauri::command]
 async fn enqueue_delete_nodes(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     node_ids: Vec<String>,
 ) -> CommandResult<TaskRecord> {
@@ -1049,73 +1179,79 @@ async fn enqueue_delete_nodes(
         TaskRecord::queued("delete", 0),
     )
     .await?;
+    emit_tasks(&app, &state.paths);
     let result = async {
         let config = load_config(&state.paths)?;
         let key = key_from_config(&config)?;
         let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
         let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
-        let catalog_path = state.paths.staging.join(CATALOG_FILE);
-        adapter
-            .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
-            .await
-            .map_err(to_err)?;
-        let catalog = Catalog::from_staging(state.paths.staging.clone());
+        let (catalog, baseline) =
+            download_catalog_baseline(&state.paths, &key, &adapter, &repo).await?;
         catalog.delete_nodes(&node_ids, &key).map_err(to_err)?;
-        let work = plan_catalog_sync(&state.paths, &catalog, &key, &adapter, &repo).await?;
-        task.progress_total = (work.upload.len() + work.delete.len()) as u64;
-        update_task_progress(
-            &state.paths,
-            task.id,
-            task.progress_done,
-            task.progress_total,
-        )?;
-        for object in &work.upload {
-            validate_catalog_sync_upload(object).map_err(to_err)?;
-            adapter
-                .upload_object(
-                    &repo.namespace,
-                    &repo.dataset,
-                    &object.path,
-                    &object.local_path,
+        let work = plan_catalog_sync(&state.paths, &catalog, &key, baseline)?;
+        let transaction_started = Instant::now();
+        let task_id = task.id;
+        let mut interrupted_state = None;
+        let outcome = execute_sync_work(
+            &adapter,
+            &repo,
+            work,
+            || {
+                interrupted_state = task_interrupt_core(&state.paths, task_id)?;
+                Ok(interrupted_state.is_some())
+            },
+            |progress| {
+                persist_transaction_progress(
+                    &state.paths,
+                    Some(&app),
+                    &mut task,
+                    transaction_started,
+                    progress,
                 )
-                .await
-                .map_err(to_err)?;
-            task.progress_done += 1;
-            update_task_progress(
-                &state.paths,
-                task.id,
-                task.progress_done,
-                task.progress_total,
-            )?;
+            },
+        )
+        .await?;
+        match outcome {
+            CatalogTransactionOutcome::Completed { warnings } => {
+                Ok::<(Option<TaskState>, Vec<String>), CommandError>((None, warnings))
+            }
+            CatalogTransactionOutcome::Canceled => Ok((
+                Some(interrupted_state.unwrap_or(TaskState::Canceled)),
+                Vec::new(),
+            )),
         }
-        if !work.delete.is_empty() {
-            adapter
-                .delete_objects(&repo.namespace, &repo.dataset, &work.delete)
-                .await
-                .map_err(to_err)?;
-            task.progress_done += work.delete.len() as u64;
-            update_task_progress(
-                &state.paths,
-                task.id,
-                task.progress_done,
-                task.progress_total,
-            )?;
-        }
-        Ok::<(), CommandError>(())
     }
     .await;
     match result {
-        Ok(()) => {
+        Ok((None, warnings)) => {
+            task.state = finish_committed_worker(
+                &state.paths,
+                &state.task_lifecycle_gate,
+                &state.catalog_mutation_gate,
+                task.id,
+            )
+            .await?;
+            task.error = (!warnings.is_empty()).then(|| warnings.join("; "));
+            if task.error.is_some() {
+                task_store(&state.paths)?
+                    .update_state(task.id, task.state.clone(), task.error.clone())
+                    .map_err(to_err)?;
+            }
+            emit_tasks(&app, &state.paths);
+            Ok(task)
+        }
+        Ok((Some(interrupt_state), _warnings)) => {
             task.state = finish_active_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
                 &state.catalog_mutation_gate,
                 task.id,
-                TaskState::Completed,
+                interrupt_state,
                 None,
             )
             .await?;
             task.error = None;
+            emit_tasks(&app, &state.paths);
             Ok(task)
         }
         Err(error) => {
@@ -1133,6 +1269,7 @@ async fn enqueue_delete_nodes(
             } else {
                 None
             };
+            emit_tasks(&app, &state.paths);
             Err(error)
         }
     }
@@ -1440,6 +1577,114 @@ pub fn run() {
 }
 
 #[cfg(test)]
+mod catalog_transaction_integration_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn desired_file(path: &str, local_path: PathBuf) -> CatalogSyncFile {
+        CatalogSyncFile {
+            path: path.to_string(),
+            expected_sha256: Some(sha256_hex_file(&local_path).unwrap()),
+            expected_size: Some(fs::metadata(&local_path).unwrap().len()),
+            local_path: Some(local_path),
+        }
+    }
+
+    #[test]
+    fn baseline_keeps_the_exact_downloaded_catalog_hash_and_old_references() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let key = KeyFile::generate_to_path(temp.path().join("key.yaml")).unwrap();
+        let catalog = Catalog::initialize_empty("Space", &key, paths.staging.clone()).unwrap();
+        let expected_hash = sha256_hex_file(&paths.staging.join(CATALOG_FILE)).unwrap();
+
+        let baseline = catalog_baseline_from_downloaded_catalog(
+            &paths,
+            &catalog,
+            &key,
+            vec![StorageObject {
+                path: CATALOG_FILE.to_string(),
+                size: 1,
+                sha256: Some(expected_hash.clone()),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            baseline.catalog_sha256.as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert!(baseline.referenced_paths.contains(CATALOG_FILE));
+        assert!(baseline
+            .referenced_paths
+            .iter()
+            .any(|path| path.starts_with("recovery/nodes/")));
+    }
+
+    #[test]
+    fn only_paths_absent_from_the_old_catalog_are_prepublish_safe() {
+        let temp = tempdir().unwrap();
+        let catalog_path = temp.path().join("catalog.enc");
+        let existing_path = temp.path().join("existing.enc");
+        let orphan_path = temp.path().join("orphan.lios");
+        let new_path = temp.path().join("new.lios");
+        fs::write(&catalog_path, b"new catalog").unwrap();
+        fs::write(&existing_path, b"updated descriptor").unwrap();
+        fs::write(&orphan_path, b"changed orphan").unwrap();
+        fs::write(&new_path, b"new chunk").unwrap();
+        let existing_remote = "recovery/nodes/existing.enc";
+        let orphan_remote = "objects/files/orphan/chunks/chunk.lios";
+        let new_remote = "objects/files/new/chunks/chunk.lios";
+        let desired = vec![
+            desired_file(CATALOG_FILE, catalog_path),
+            desired_file(existing_remote, existing_path),
+            desired_file(orphan_remote, orphan_path),
+            desired_file(new_remote, new_path),
+        ];
+        let baseline = CatalogBaseline {
+            catalog_sha256: Some("a".repeat(64)),
+            referenced_paths: HashSet::from([
+                CATALOG_FILE.to_string(),
+                existing_remote.to_string(),
+            ]),
+            remote_objects: vec![
+                StorageObject {
+                    path: CATALOG_FILE.to_string(),
+                    size: 1,
+                    sha256: Some("b".repeat(64)),
+                },
+                StorageObject {
+                    path: existing_remote.to_string(),
+                    size: 1,
+                    sha256: Some("c".repeat(64)),
+                },
+                StorageObject {
+                    path: orphan_remote.to_string(),
+                    size: 1,
+                    sha256: Some("d".repeat(64)),
+                },
+            ],
+        };
+
+        let work =
+            plan_catalog_sync_with_baseline(desired, baseline, temp.path().to_path_buf()).unwrap();
+
+        assert_eq!(
+            work.base_catalog_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            work.prepublish_safe_paths,
+            HashSet::from([new_remote.to_string()])
+        );
+        assert!(!work.prepublish_safe_paths.contains(existing_remote));
+        assert!(!work.prepublish_safe_paths.contains(orphan_remote));
+        assert!(!work.prepublish_safe_paths.contains(CATALOG_FILE));
+    }
+}
+
+#[cfg(test)]
 mod task_cleanup_tests {
     use std::{fs, sync::Arc, time::Duration};
 
@@ -1450,8 +1695,8 @@ mod task_cleanup_tests {
 
     use super::{
         activate_existing_task, activate_new_task, cleanup_current_staging_cache, cleanup_if_idle,
-        clear_task_record, finish_active_worker, set_task_state, CatalogMutationGate,
-        CommandErrorCode, TaskLifecycleState,
+        clear_task_record, finish_active_worker, finish_committed_worker, set_task_state,
+        CatalogMutationGate, CommandErrorCode, TaskLifecycleState,
     };
 
     #[tokio::test]
@@ -1740,5 +1985,64 @@ mod task_cleanup_tests {
                 .iter()
                 .all(|record| record.id != task.id));
         }
+    }
+
+    #[tokio::test]
+    async fn committed_worker_ignores_a_late_cancel_state() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let lifecycle = Mutex::new(TaskLifecycleState::default());
+        let catalog_mutation_gate = CatalogMutationGate::default();
+        let task = activate_new_task(
+            &paths,
+            &lifecycle,
+            TaskRecord::queued("committed upload", 1),
+        )
+        .await
+        .unwrap();
+        set_task_state(&paths, &lifecycle, task.id, TaskState::Canceled, None)
+            .await
+            .unwrap();
+
+        let final_state =
+            finish_committed_worker(&paths, &lifecycle, &catalog_mutation_gate, task.id)
+                .await
+                .unwrap();
+
+        assert_eq!(final_state, TaskState::Completed);
+        assert_eq!(
+            TaskStore::open(&paths.database)
+                .unwrap()
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.id == task.id)
+                .unwrap()
+                .state,
+            TaskState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn finalization_failure_still_deregisters_the_active_worker() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let lifecycle = Mutex::new(TaskLifecycleState::default());
+        let catalog_mutation_gate = CatalogMutationGate::default();
+        let task = activate_new_task(
+            &paths,
+            &lifecycle,
+            TaskRecord::queued("committed upload", 1),
+        )
+        .await
+        .unwrap();
+        fs::remove_file(&paths.database).unwrap();
+        fs::create_dir(&paths.database).unwrap();
+
+        let result =
+            finish_committed_worker(&paths, &lifecycle, &catalog_mutation_gate, task.id).await;
+
+        assert!(result.is_err());
+        assert!(!lifecycle.lock().await.active_workers.contains(&task.id));
     }
 }

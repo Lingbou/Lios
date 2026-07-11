@@ -88,16 +88,6 @@ mod tests {
             unreachable!()
         }
 
-        async fn upload_object(
-            &self,
-            _namespace: &str,
-            _dataset: &str,
-            _remote_path: &str,
-            _local_path: &Path,
-        ) -> lios_core::Result<()> {
-            unreachable!()
-        }
-
         async fn download_object(
             &self,
             _namespace: &str,
@@ -109,24 +99,6 @@ mod tests {
                 .await
                 .unwrap();
             Err(RemoteError::new(RemoteErrorKind::Network, None).into())
-        }
-
-        async fn delete_objects(
-            &self,
-            _namespace: &str,
-            _dataset: &str,
-            _remote_paths: &[String],
-        ) -> lios_core::Result<()> {
-            unreachable!()
-        }
-
-        async fn delete_prefix(
-            &self,
-            _namespace: &str,
-            _dataset: &str,
-            _prefix: &str,
-        ) -> lios_core::Result<()> {
-            unreachable!()
         }
     }
 
