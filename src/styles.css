@@ -1023,7 +1023,8 @@ select:focus {
 }
 
 .conflictModal,
-.spaceModal {
+.spaceModal,
+.rebuildModal {
   width: min(720px, 100%);
   max-height: min(680px, calc(100vh - 40px));
   overflow: hidden;
@@ -1037,6 +1038,10 @@ select:focus {
 
 .spaceModal {
   width: min(460px, 100%);
+}
+
+.rebuildModal {
+  width: min(900px, 100%);
 }
 
 .modalHeader,
@@ -1071,6 +1076,206 @@ select:focus {
   width: 34px;
   min-height: 34px;
   padding: 0;
+}
+
+.rebuildModalBody {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  padding: 16px;
+}
+
+.rebuildLoading {
+  min-height: 240px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.rebuildLoading svg {
+  width: 34px;
+  height: 34px;
+  color: var(--pink);
+  animation: spin 1.2s linear infinite;
+}
+
+.rebuildLoading strong {
+  color: var(--ink);
+  font-size: 16px;
+}
+
+.rebuildLoading span {
+  font-size: 13px;
+}
+
+.rebuildError {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  border: 1px solid #efb9c0;
+  border-radius: 8px;
+  background: var(--danger-soft);
+  padding: 11px 12px;
+  color: var(--danger);
+}
+
+.rebuildError svg {
+  margin-top: 1px;
+}
+
+.rebuildError strong,
+.rebuildError small {
+  display: block;
+}
+
+.rebuildError small {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.rebuildIntro {
+  margin: 0;
+  color: #6f5265;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.rebuildReport {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  overflow: hidden;
+  border: 1px solid #f2d8e6;
+  border-radius: 8px;
+  background: #fff9fc;
+}
+
+.rebuildReport > div {
+  min-width: 0;
+  padding: 10px 12px;
+  border-right: 1px solid #f5e5ef;
+}
+
+.rebuildReport dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rebuildReport dd {
+  margin: 5px 0 0;
+  color: var(--ink);
+  font-size: 17px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.rebuildTreePanel,
+.rebuildWarnings {
+  display: grid;
+  gap: 8px;
+}
+
+.rebuildSectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.rebuildSectionHeader h3 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.rebuildSectionHeader span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rebuildTreeScroll {
+  max-height: 300px;
+  overflow: auto;
+  border: 1px solid #f2d8e6;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 8px;
+}
+
+.rebuildTree,
+.rebuildTree ul {
+  margin: 0;
+  list-style: none;
+}
+
+.rebuildTree {
+  padding: 0;
+}
+
+.rebuildTree ul {
+  padding-left: 22px;
+}
+
+.rebuildTreeRow {
+  min-height: 32px;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid #faedf4;
+  padding: 5px 7px;
+  color: #594554;
+  font-size: 13px;
+}
+
+.rebuildTreeRow svg {
+  width: 16px;
+  height: 16px;
+  color: var(--pink);
+}
+
+.rebuildTreeRow span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.rebuildTreeRow small {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.rebuildWarnings {
+  border-top: 1px solid #f5e5ef;
+  padding-top: 14px;
+}
+
+.rebuildWarnings ul,
+.rebuildWarnings p {
+  margin: 0;
+  color: #6f5265;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.rebuildWarnings ul {
+  padding-left: 20px;
+}
+
+.modalActionGroup {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.rebuildModal .loadingGlyph {
+  animation: spin 1.2s linear infinite;
 }
 
 .conflictList {
@@ -1193,6 +1398,31 @@ select:focus {
 }
 
 @media (max-width: 680px) {
+  .modalBackdrop {
+    padding: 10px;
+  }
+
+  .rebuildReport {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .rebuildTreeScroll {
+    max-height: 240px;
+  }
+
+  .rebuildModal .modalActions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .modalActionGroup {
+    flex-wrap: wrap;
+  }
+
+  .modalActionGroup > button {
+    flex: 1 1 auto;
+  }
+
   .driveWorkspace {
     padding: 12px 12px 126px;
   }

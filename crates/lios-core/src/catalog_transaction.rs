@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::storage::{
     validate_catalog_sync_upload, BlobCheckpoint, BlobSpec, BlobValidation, CatalogSyncUpload,
-    CommitPlan, RemoteAction, StorageAdapter, StorageObject,
+    CommitPlan, RemoteAction, RepoRevision, StorageAdapter, StorageObject,
 };
 use crate::{LiosError, RemoteError, RemoteErrorKind, Result};
 
@@ -16,6 +16,7 @@ pub struct CatalogTransactionSpec {
     pub initial_remote_inventory: Vec<StorageObject>,
     pub prepublish_safe_paths: HashSet<String>,
     pub base_catalog_sha256: Option<String>,
+    pub expected_revision: Option<RepoRevision>,
     pub probe_directory: PathBuf,
 }
 
@@ -112,6 +113,11 @@ where
         &spec.prepublish_safe_paths,
         spec.base_catalog_sha256.clone(),
     )?;
+    if spec.expected_revision.is_some() && !plan.prepublish.is_empty() {
+        return Err(LiosError::Unsupported(
+            "revision-guarded catalog publication cannot use prepublish commits".to_string(),
+        ));
+    }
 
     let mut progress = CatalogTransactionProgress {
         phase: CatalogTransactionPhase::ValidateBlobs,
@@ -246,6 +252,15 @@ where
     }
     if should_cancel()? {
         return Ok(CatalogTransactionOutcome::Canceled);
+    }
+    if let Some(expected_revision) = &spec.expected_revision {
+        let current_revision = adapter.head_revision(namespace, dataset).await?;
+        if &current_revision != expected_revision {
+            return Err(remote_conflict());
+        }
+        if should_cancel()? {
+            return Ok(CatalogTransactionOutcome::Canceled);
+        }
     }
 
     progress.phase = CatalogTransactionPhase::Publish;
@@ -437,6 +452,7 @@ mod tests {
     struct ScriptState {
         events: Vec<String>,
         probe: ProbeResult,
+        head_revision: RepoRevision,
         upload_required: bool,
         cleanup_failures_remaining: usize,
         publish_failures_remaining: usize,
@@ -453,6 +469,10 @@ mod tests {
                 state: Arc::new(Mutex::new(ScriptState {
                     events: Vec::new(),
                     probe,
+                    head_revision: RepoRevision {
+                        branch: "master".to_string(),
+                        commit_id: Some("head".to_string()),
+                    },
                     upload_required,
                     cleanup_failures_remaining: 0,
                     publish_failures_remaining: 0,
@@ -475,6 +495,13 @@ mod tests {
         fn fail_publish_times(&self, failures: usize) {
             self.state.lock().unwrap().publish_failures_remaining = failures;
         }
+
+        fn set_head_revision(&self, commit_id: &str) {
+            self.state.lock().unwrap().head_revision = RepoRevision {
+                branch: "master".to_string(),
+                commit_id: Some(commit_id.to_string()),
+            };
+        }
     }
 
     #[async_trait]
@@ -488,10 +515,8 @@ mod tests {
         }
 
         async fn head_revision(&self, _namespace: &str, _dataset: &str) -> Result<RepoRevision> {
-            Ok(RepoRevision {
-                branch: "master".to_string(),
-                commit_id: Some("head".to_string()),
-            })
+            self.record("revision");
+            Ok(self.state.lock().unwrap().head_revision.clone())
         }
 
         async fn list_objects(
@@ -665,6 +690,7 @@ mod tests {
             initial_remote_inventory: base.map(remote_catalog).into_iter().collect(),
             prepublish_safe_paths: safe,
             base_catalog_sha256: base.map(sha256),
+            expected_revision: None,
             probe_directory: root.to_path_buf(),
         }
     }
@@ -876,6 +902,53 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".lios-catalog-probe-")
         }));
+    }
+
+    #[tokio::test]
+    async fn changed_revision_after_blob_upload_conflicts_before_publish() {
+        let tmp = tempdir().unwrap();
+        let adapter = ScriptedAdapter::new(ProbeResult::NotFound, true);
+        adapter.set_head_revision("changed-after-preview");
+        let mut transaction = spec(tmp.path(), None, false, 0);
+        transaction.expected_revision = Some(RepoRevision {
+            branch: "master".to_string(),
+            commit_id: Some("preview-revision".to_string()),
+        });
+
+        let error = run(&adapter, transaction, || Ok(false)).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            LiosError::Remote(ref error) if error.kind == RemoteErrorKind::Conflict
+        ));
+        let events = adapter.events();
+        assert!(events.iter().any(|event| event.starts_with("upload:")));
+        assert!(events.iter().any(|event| event == "probe"));
+        assert!(events.iter().any(|event| event == "revision"));
+        assert!(!events.iter().any(|event| event == "publish"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_revision_guard_stops_before_publish() {
+        let tmp = tempdir().unwrap();
+        let adapter = ScriptedAdapter::new(ProbeResult::NotFound, false);
+        let mut transaction = spec(tmp.path(), None, false, 0);
+        transaction.expected_revision = Some(RepoRevision {
+            branch: "master".to_string(),
+            commit_id: Some("head".to_string()),
+        });
+        let observed = adapter.clone();
+
+        let outcome = run(&adapter, transaction, move || {
+            Ok(observed.events().iter().any(|event| event == "revision"))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, CatalogTransactionOutcome::Canceled);
+        let events = adapter.events();
+        assert!(events.iter().any(|event| event == "revision"));
+        assert!(!events.iter().any(|event| event == "publish"));
     }
 
     #[tokio::test]

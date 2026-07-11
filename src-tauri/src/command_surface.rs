@@ -14,6 +14,8 @@ macro_rules! with_registered_commands {
             enqueue_download,
             enqueue_delete_nodes,
             enqueue_verify_space,
+            preview_rebuild_catalog,
+            enqueue_rebuild_catalog,
             rename_node,
             create_folder,
             search_catalog,
@@ -77,6 +79,8 @@ mod tests {
             "enqueue_delete_nodes",
             "enqueue_download",
             "enqueue_verify_space",
+            "preview_rebuild_catalog",
+            "enqueue_rebuild_catalog",
             "retry_task",
         ] {
             assert!(REGISTERED_COMMANDS.contains(&command), "{command}");
