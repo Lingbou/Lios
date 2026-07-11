@@ -696,6 +696,71 @@ select:focus {
   flex-wrap: wrap;
 }
 
+.recoveryKeySummary {
+  min-width: 0;
+  border-top: 1px solid #f5e5ef;
+  padding-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.recoveryKeyLocation {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.recoveryKeyLocation > svg {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  color: var(--pink-strong);
+}
+
+.recoveryKeyLocation span,
+.recoveryKeyLocation small,
+.recoveryKeyLocation strong {
+  min-width: 0;
+  display: block;
+}
+
+.recoveryKeyLocation small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.recoveryKeyLocation strong {
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.backupStatus {
+  flex: 0 0 auto;
+  max-width: 220px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  background: #fffafd;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.backupStatus.ready {
+  border-color: #b9dfd4;
+  color: #367766;
+  background: #f2fbf8;
+}
+
 .cleanupResult {
   border: 1px solid #f4d5e6;
   border-radius: 8px;
@@ -1024,6 +1089,7 @@ select:focus {
 
 .conflictModal,
 .spaceModal,
+.recoveryKeyModal,
 .rebuildModal {
   width: min(720px, 100%);
   max-height: min(680px, calc(100vh - 40px));
@@ -1038,6 +1104,10 @@ select:focus {
 
 .spaceModal {
   width: min(460px, 100%);
+}
+
+.recoveryKeyModal {
+  width: min(540px, 100%);
 }
 
 .rebuildModal {
@@ -1085,6 +1155,60 @@ select:focus {
   align-content: start;
   gap: 16px;
   padding: 16px;
+}
+
+.recoveryKeyModalBody {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  padding: 16px;
+}
+
+.recoveryVerificationResult,
+.externalKeyNotice {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.recoveryVerificationResult {
+  border: 1px solid #b9dfd4;
+  background: #f2fbf8;
+  color: #285f52;
+}
+
+.externalKeyNotice {
+  border: 1px solid #f1cddd;
+  background: #fff7fb;
+  color: #6f5265;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.recoveryVerificationResult > svg,
+.externalKeyNotice > svg {
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  color: var(--pink-strong);
+}
+
+.recoveryVerificationResult strong,
+.recoveryVerificationResult small {
+  display: block;
+}
+
+.recoveryVerificationResult small {
+  margin-top: 5px;
+  color: #4f6f67;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .rebuildLoading {
@@ -1364,6 +1488,15 @@ select:focus {
     justify-content: flex-start;
   }
 
+  .recoveryKeySummary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .backupStatus {
+    max-width: 100%;
+  }
+
   .taskDrawer {
     left: 12px;
     right: 12px;
@@ -1410,7 +1543,8 @@ select:focus {
     max-height: 240px;
   }
 
-  .rebuildModal .modalActions {
+  .rebuildModal .modalActions,
+  .recoveryKeyModal .modalActions {
     align-items: stretch;
     flex-direction: column;
   }

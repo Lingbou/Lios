@@ -25,6 +25,7 @@ serde_json = "1"
 sha2 = "0.10"
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.4.1"
+tempfile = "3"
 tokio = { version = "1", features = ["fs", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["serde"] }
@@ -33,4 +34,3 @@ walkdir = "2"
 [dev-dependencies]
 async-trait = "0.1"
 httpmock = "0.7"
-tempfile = "3"

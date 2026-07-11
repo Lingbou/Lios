@@ -101,6 +101,10 @@ impl KeyFile {
         self.write_yaml(path.as_ref(), &yaml)
     }
 
+    pub fn same_material(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+
     fn write_yaml(&self, path: &Path, yaml: &impl Serialize) -> Result<()> {
         let serialized = serde_yaml::to_string(yaml)?;
         write_private_atomic_new(path, serialized.as_bytes())?;

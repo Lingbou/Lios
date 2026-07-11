@@ -1,10 +1,7 @@
-use std::path::PathBuf;
-
 use lios_core::config::{
     ensure_default_key_binding, validate_modelscope_production_endpoint, LiosConfig, LiosPaths,
     RepoConfig, MODELSCOPE_ENDPOINT,
 };
-use lios_core::crypto::KeyFile;
 use serde::Serialize;
 
 use crate::command_error::CommandError;
@@ -107,34 +104,6 @@ pub fn prepare_startup_config(
     Ok(warning)
 }
 
-pub fn prepare_config_for_write(
-    paths: &LiosPaths,
-    config: &mut LiosConfig,
-) -> Result<Option<SetupWarning>, CommandError> {
-    let (mut prepared, warning, changed) = migrate_legacy_config(config)?;
-    if changed {
-        persist_config(paths, &mut prepared)?;
-    }
-    *config = prepared;
-    Ok(warning)
-}
-
-pub fn generate_key_file_and_bind(
-    paths: &LiosPaths,
-    path: PathBuf,
-) -> Result<PathBuf, CommandError> {
-    paths.ensure_dirs()?;
-    let mut config = LiosConfig::load(&paths.config)?;
-    prepare_config_for_write(paths, &mut config)?;
-    KeyFile::generate_to_path(&path)?;
-    config.key_file_path = Some(path.clone());
-    if let Err(error) = persist_config(paths, &mut config) {
-        let _ = std::fs::remove_file(&path);
-        return Err(error);
-    }
-    Ok(path)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -143,8 +112,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        configured_endpoint, generate_key_file_and_bind, persist_config, prepare_startup_config,
-        validate_repo, SetupWarningCode,
+        configured_endpoint, persist_config, prepare_startup_config, validate_repo,
+        SetupWarningCode,
     };
     use crate::command_error::CommandErrorCode;
 
@@ -189,6 +158,7 @@ mod tests {
                 endpoint: "http://127.0.0.1:12345".to_string(),
             }),
             key_file_path: None,
+            backup_path: None,
             chunk_size: Some(1024),
         };
         config.save(&paths.config).unwrap();
@@ -213,6 +183,7 @@ mod tests {
                 endpoint: "http://127.0.0.1:12345".to_string(),
             }),
             key_file_path: None,
+            backup_path: None,
             chunk_size: None,
         };
         config.save(&paths.config).unwrap();
@@ -228,28 +199,5 @@ mod tests {
         assert!(saved.active_repo.is_none());
         assert_eq!(saved.key_file_path, config.key_file_path);
         assert!(paths.home.join("recovery.key").exists());
-    }
-
-    #[test]
-    fn invalid_config_is_rejected_before_explicit_key_file_creation() {
-        let temp = tempdir().unwrap();
-        let paths = LiosPaths::from_home(temp.path());
-        paths.ensure_dirs().unwrap();
-        let config = LiosConfig {
-            active_repo: Some(RepoConfig {
-                namespace: " ".to_string(),
-                dataset: "cold".to_string(),
-                endpoint: "https://modelscope.cn".to_string(),
-            }),
-            key_file_path: None,
-            chunk_size: None,
-        };
-        config.save(&paths.config).unwrap();
-        let target = paths.home.join("explicit.key");
-
-        let error = generate_key_file_and_bind(&paths, target.clone()).unwrap_err();
-
-        assert_eq!(error.code, CommandErrorCode::InvalidInput);
-        assert!(!target.exists());
     }
 }

@@ -2,8 +2,10 @@ pub mod catalog_mutation_gate;
 pub mod catalog_probe;
 pub mod command_error;
 pub mod command_surface;
+pub mod config_mutation_gate;
 pub mod download_service;
 pub mod production_config;
+pub mod recovery_key_service;
 pub mod task_manager;
 
 #[cfg(test)]
@@ -19,6 +21,7 @@ use catalog_mutation_gate::CatalogMutationGate;
 use catalog_probe::{ensure_space_can_initialize, map_catalog_load_error};
 use command_error::{CommandError, CommandErrorCode};
 use command_surface::with_registered_commands;
+use config_mutation_gate::ConfigMutationGate;
 use download_service::prepare_download_task;
 use lios_core::cache::{cleanup_temporary_staging, prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
@@ -47,8 +50,11 @@ use lios_core::tasks::{
     TaskSpec, TaskState, TaskStore,
 };
 use production_config::{
-    configured_endpoint, generate_key_file_and_bind, persist_config, prepare_config_for_write,
-    prepare_startup_config, validate_repo, SetupWarning,
+    configured_endpoint, persist_config, prepare_startup_config, validate_repo, SetupWarning,
+};
+use recovery_key_service::{
+    export_recovery_key_for_paths, import_recovery_key_for_paths, recovery_key_status,
+    verify_recovery_key_for_paths, RecoveryKeyStatus, RecoveryKeyVerification,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -67,6 +73,7 @@ type CommandResult<T> = std::result::Result<T, CommandError>;
 struct AppContext {
     paths: LiosPaths,
     catalog_mutation_gate: CatalogMutationGate,
+    config_mutation_gate: ConfigMutationGate,
     task_lifecycle_gate: Mutex<TaskLifecycleState>,
     task_manager: TaskManager,
 }
@@ -83,6 +90,7 @@ impl AppContext {
         Self {
             paths,
             catalog_mutation_gate: CatalogMutationGate::default(),
+            config_mutation_gate: ConfigMutationGate::default(),
             task_lifecycle_gate: Mutex::new(TaskLifecycleState::default()),
             task_manager: TaskManager::default(),
         }
@@ -102,6 +110,7 @@ struct PathsDto {
 struct SetupSnapshot {
     paths: PathsDto,
     config: LiosConfig,
+    recovery_key: RecoveryKeyStatus,
     has_token: bool,
     tasks: Vec<TaskRecord>,
     warning: Option<SetupWarning>,
@@ -3510,11 +3519,16 @@ async fn sync_current_catalog(
 #[tauri::command]
 fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnapshot> {
     state.paths.ensure_dirs().map_err(to_err)?;
-    let mut config = load_config(&state.paths)?;
-    let warning = prepare_startup_config(&state.paths, &mut config)?;
+    let (config, warning) = {
+        let _config_guard = state.config_mutation_gate.lock()?;
+        let mut config = load_config(&state.paths)?;
+        let warning = prepare_startup_config(&state.paths, &mut config)?;
+        (config, warning)
+    };
     let tasks = task_store(&state.paths)?.list().map_err(to_err)?;
     Ok(SetupSnapshot {
         paths: paths_dto(&state.paths),
+        recovery_key: recovery_key_status(&config),
         config,
         has_token: state.paths.credentials.exists(),
         tasks,
@@ -3547,6 +3561,7 @@ async fn create_dataset_repo(
         .create_repo(&repo.namespace, &repo.dataset)
         .await
         .map_err(to_err)?;
+    let _config_guard = state.config_mutation_gate.lock()?;
     let mut config = load_config(&state.paths)?;
     config.active_repo = Some(repo);
     persist_config(&state.paths, &mut config)
@@ -3576,6 +3591,7 @@ async fn connect_dataset_repo(
             "dataset repo was not found or is not visible",
         ));
     }
+    let _config_guard = state.config_mutation_gate.lock()?;
     let mut config = load_config(&state.paths)?;
     config.active_repo = Some(repo);
     persist_config(&state.paths, &mut config)
@@ -3602,6 +3618,7 @@ async fn list_dataset_repos(
 #[tauri::command]
 fn select_dataset_repo(state: tauri::State<'_, AppContext>, repo: RepoConfig) -> CommandResult<()> {
     let repo = validate_repo(repo)?;
+    let _config_guard = state.config_mutation_gate.lock()?;
     let mut config = load_config(&state.paths)?;
     config.active_repo = Some(repo);
     persist_config(&state.paths, &mut config)
@@ -3645,9 +3662,13 @@ async fn initialize_space(
             .await
             .map_err(to_err)?,
     };
-    let mut config = load_config(&state.paths)?;
-    config.active_repo = Some(repo.clone());
-    persist_config(&state.paths, &mut config)?;
+    let config = {
+        let _config_guard = state.config_mutation_gate.lock()?;
+        let mut config = load_config(&state.paths)?;
+        config.active_repo = Some(repo.clone());
+        persist_config(&state.paths, &mut config)?;
+        config
+    };
     let key = key_from_config(&config)?;
     reset_staging(&state.paths)?;
     let catalog = Catalog::initialize_empty(&repo.dataset, &key, state.paths.staging.clone())
@@ -3685,9 +3706,13 @@ async fn load_space_catalog(
         ));
     }
     let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
-    let mut config = load_config(&state.paths)?;
-    config.active_repo = Some(repo.clone());
-    persist_config(&state.paths, &mut config)?;
+    let config = {
+        let _config_guard = state.config_mutation_gate.lock()?;
+        let mut config = load_config(&state.paths)?;
+        config.active_repo = Some(repo.clone());
+        persist_config(&state.paths, &mut config)?;
+        config
+    };
     let key = key_from_config(&config)?;
     let local_path = state.paths.staging.join(CATALOG_FILE);
     adapter
@@ -3810,26 +3835,31 @@ async fn search_catalog(
 }
 
 #[tauri::command]
-fn generate_key_file(
+fn export_recovery_key(
     state: tauri::State<'_, AppContext>,
-    path: Option<String>,
-) -> CommandResult<String> {
-    state.paths.ensure_dirs().map_err(to_err)?;
-    let path = path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| state.paths.home.join("recovery.key"));
-    let path = generate_key_file_and_bind(&state.paths, path)?;
-    Ok(path.display().to_string())
+    destination: String,
+) -> CommandResult<RecoveryKeyStatus> {
+    export_recovery_key_for_paths(
+        &state.paths,
+        &state.config_mutation_gate,
+        Path::new(&destination),
+    )
 }
 
 #[tauri::command]
-fn import_key_file(state: tauri::State<'_, AppContext>, path: String) -> CommandResult<()> {
-    let path = PathBuf::from(path);
-    KeyFile::load_from_path(&path).map_err(to_err)?;
-    let mut config = load_config(&state.paths)?;
-    prepare_config_for_write(&state.paths, &mut config)?;
-    config.key_file_path = Some(path);
-    persist_config(&state.paths, &mut config)
+async fn verify_recovery_key(
+    state: tauri::State<'_, AppContext>,
+    path: String,
+) -> CommandResult<RecoveryKeyVerification> {
+    verify_recovery_key_for_paths(&state.paths, Path::new(&path)).await
+}
+
+#[tauri::command]
+async fn import_recovery_key(
+    state: tauri::State<'_, AppContext>,
+    path: String,
+) -> CommandResult<RecoveryKeyVerification> {
+    import_recovery_key_for_paths(&state.paths, &state.config_mutation_gate, Path::new(&path)).await
 }
 
 #[tauri::command]
@@ -5579,5 +5609,441 @@ mod catalog_rebuild_command_tests {
 
         assert!(!catalog_path.exists());
         assert_eq!(fs::read(descriptor_path).unwrap(), b"recovery metadata");
+    }
+}
+
+#[cfg(test)]
+mod recovery_key_service_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use lios_core::catalog::{Catalog, CATALOG_FILE};
+    use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
+    use lios_core::crypto::KeyFile;
+    use lios_core::storage::{StorageAdapter, StorageObject};
+    use lios_core::{LiosError, RemoteError, RemoteErrorKind};
+    use tempfile::tempdir;
+    use tokio::sync::oneshot;
+
+    use super::command_error::CommandErrorCode;
+    use super::config_mutation_gate::ConfigMutationGate;
+    use super::recovery_key_service::{
+        export_recovery_key_for_paths, import_candidate_with_adapter,
+        import_candidate_with_adapter_after_verification, recovery_key_status,
+        verify_candidate_with_adapter,
+    };
+
+    enum DownloadResult {
+        Catalog(PathBuf),
+        NotFound,
+    }
+
+    struct FakeCatalogAdapter {
+        result: DownloadResult,
+        calls: Arc<AtomicUsize>,
+        staging_dirs: Arc<Mutex<Vec<PathBuf>>>,
+        on_download: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl FakeCatalogAdapter {
+        fn catalog(path: PathBuf) -> Self {
+            Self {
+                result: DownloadResult::Catalog(path),
+                calls: Arc::new(AtomicUsize::new(0)),
+                staging_dirs: Arc::new(Mutex::new(Vec::new())),
+                on_download: Mutex::new(None),
+            }
+        }
+
+        fn catalog_with_action(path: PathBuf, action: impl FnOnce() + Send + 'static) -> Self {
+            Self {
+                result: DownloadResult::Catalog(path),
+                calls: Arc::new(AtomicUsize::new(0)),
+                staging_dirs: Arc::new(Mutex::new(Vec::new())),
+                on_download: Mutex::new(Some(Box::new(action))),
+            }
+        }
+
+        fn not_found() -> Self {
+            Self {
+                result: DownloadResult::NotFound,
+                calls: Arc::new(AtomicUsize::new(0)),
+                staging_dirs: Arc::new(Mutex::new(Vec::new())),
+                on_download: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageAdapter for FakeCatalogAdapter {
+        async fn create_repo(&self, _namespace: &str, _dataset: &str) -> lios_core::Result<()> {
+            Ok(())
+        }
+
+        async fn repo_exists(&self, _namespace: &str, _dataset: &str) -> lios_core::Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_objects(
+            &self,
+            _namespace: &str,
+            _dataset: &str,
+            _prefix: &str,
+        ) -> lios_core::Result<Vec<StorageObject>> {
+            Ok(Vec::new())
+        }
+
+        async fn download_object(
+            &self,
+            _namespace: &str,
+            _dataset: &str,
+            remote_path: &str,
+            local_path: &Path,
+        ) -> lios_core::Result<()> {
+            assert_eq!(remote_path, CATALOG_FILE);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.staging_dirs
+                .lock()
+                .unwrap()
+                .push(local_path.parent().unwrap().to_path_buf());
+            if let Some(action) = self.on_download.lock().unwrap().take() {
+                action();
+            }
+            match &self.result {
+                DownloadResult::Catalog(source) => {
+                    fs::copy(source, local_path)?;
+                    Ok(())
+                }
+                DownloadResult::NotFound => Err(LiosError::Remote(RemoteError::new(
+                    RemoteErrorKind::NotFound,
+                    Some(404),
+                ))),
+            }
+        }
+    }
+
+    fn repo() -> RepoConfig {
+        RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "archive".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        }
+    }
+
+    fn configured_paths() -> (tempfile::TempDir, LiosPaths, PathBuf) {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let active_key = paths.home.join("recovery.key");
+        KeyFile::generate_to_path(&active_key).unwrap();
+        LiosConfig {
+            key_file_path: Some(active_key.clone()),
+            ..LiosConfig::default()
+        }
+        .save(&paths.config)
+        .unwrap();
+        (temp, paths, active_key)
+    }
+
+    #[test]
+    fn export_refuses_clobber_and_status_rejects_stale_or_deleted_backup() {
+        let (_temp, paths, _active_key) = configured_paths();
+        let existing = paths.home.parent().unwrap().join("existing.key");
+        fs::write(&existing, b"leave me alone").unwrap();
+        let original_config = fs::read(&paths.config).unwrap();
+        let config_gate = ConfigMutationGate::default();
+
+        let error = export_recovery_key_for_paths(&paths, &config_gate, &existing).unwrap_err();
+
+        assert_eq!(error.code, CommandErrorCode::Storage);
+        assert_eq!(fs::read(&existing).unwrap(), b"leave me alone");
+        assert_eq!(fs::read(&paths.config).unwrap(), original_config);
+
+        let destination = paths.home.parent().unwrap().join("backup.key");
+        let status = export_recovery_key_for_paths(&paths, &config_gate, &destination).unwrap();
+        assert!(status.backed_up);
+        assert_eq!(status.backup_location.as_deref(), destination.to_str());
+        let saved = LiosConfig::load(&paths.config).unwrap();
+        assert_eq!(saved.backup_path.as_deref(), Some(destination.as_path()));
+
+        fs::remove_file(&destination).unwrap();
+        KeyFile::generate_to_path(&destination).unwrap();
+        assert!(!recovery_key_status(&saved).backed_up);
+        fs::remove_file(&destination).unwrap();
+        assert!(!recovery_key_status(&saved).backed_up);
+    }
+
+    #[tokio::test]
+    async fn matching_key_verifies_catalog_in_isolated_temporary_staging() {
+        let remote = tempdir().unwrap();
+        let candidate_path = remote.path().join("candidate.key");
+        let candidate = KeyFile::generate_to_path(&candidate_path).unwrap();
+        let remote_staging = remote.path().join("remote");
+        Catalog::initialize_empty("Archive", &candidate, &remote_staging).unwrap();
+        let adapter = FakeCatalogAdapter::catalog(remote_staging.join(CATALOG_FILE));
+        let target = repo();
+
+        let verification =
+            verify_candidate_with_adapter(&candidate_path, Some(&target), Some(&adapter))
+                .await
+                .unwrap();
+
+        assert!(verification.format_valid);
+        assert!(verification.catalog_checked);
+        assert_eq!(verification.checked_space, Some(target));
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        for staging in adapter.staging_dirs.lock().unwrap().iter() {
+            assert!(!staging.exists(), "temporary staging was not removed");
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_key_catalog_decryption_is_classified_as_wrong_key() {
+        let (_temp, paths, active_key_path) = configured_paths();
+        let active_key = KeyFile::load_from_path(&active_key_path).unwrap();
+        let remote = tempdir().unwrap();
+        let remote_staging = remote.path().join("remote");
+        Catalog::initialize_empty("Archive", &active_key, &remote_staging).unwrap();
+        let adapter = FakeCatalogAdapter::catalog(remote_staging.join(CATALOG_FILE));
+        let candidate_path = paths.home.parent().unwrap().join("external.key");
+        KeyFile::generate_to_path(&candidate_path).unwrap();
+        let target = repo();
+        let original_config = fs::read(&paths.config).unwrap();
+        let config_gate = ConfigMutationGate::default();
+
+        let error = import_candidate_with_adapter(
+            &paths,
+            &config_gate,
+            &candidate_path,
+            Some(&target),
+            Some(&adapter),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, CommandErrorCode::WrongKey);
+        assert_eq!(fs::read(&paths.config).unwrap(), original_config);
+        assert_eq!(
+            LiosConfig::load(&paths.config)
+                .unwrap()
+                .key_file_path
+                .as_deref(),
+            Some(active_key_path.as_path())
+        );
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        assert!(!paths.home.join("external.key").exists());
+    }
+
+    #[tokio::test]
+    async fn import_rejects_candidate_replaced_during_catalog_download() {
+        let (_temp, paths, active_key_path) = configured_paths();
+        let active_key = KeyFile::load_from_path(&active_key_path).unwrap();
+        let target = repo();
+        let mut config = LiosConfig::load(&paths.config).unwrap();
+        config.active_repo = Some(target.clone());
+        config.save(&paths.config).unwrap();
+        let original_config = fs::read(&paths.config).unwrap();
+        let remote = tempdir().unwrap();
+        let remote_staging = remote.path().join("remote");
+        Catalog::initialize_empty("Archive", &active_key, &remote_staging).unwrap();
+        let candidate_path = paths.home.parent().unwrap().join("external.key");
+        active_key.save_to_path(&candidate_path).unwrap();
+        let candidate_to_replace = candidate_path.clone();
+        let adapter =
+            FakeCatalogAdapter::catalog_with_action(remote_staging.join(CATALOG_FILE), move || {
+                fs::remove_file(&candidate_to_replace).unwrap();
+                KeyFile::generate_to_path(&candidate_to_replace).unwrap();
+            });
+        let config_gate = ConfigMutationGate::default();
+
+        let error = import_candidate_with_adapter(
+            &paths,
+            &config_gate,
+            &candidate_path,
+            Some(&target),
+            Some(&adapter),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, CommandErrorCode::WrongKey);
+        assert_eq!(fs::read(&paths.config).unwrap(), original_config);
+        assert_eq!(
+            LiosConfig::load(&paths.config)
+                .unwrap()
+                .key_file_path
+                .as_deref(),
+            Some(active_key_path.as_path())
+        );
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        assert!(!paths.home.join("external.key").exists());
+    }
+
+    #[tokio::test]
+    async fn import_rejects_repo_changed_during_download_without_clobbering_concurrent_config() {
+        let (_temp, paths, active_key_path) = configured_paths();
+        let active_key = KeyFile::load_from_path(&active_key_path).unwrap();
+        let target = repo();
+        let mut config = LiosConfig::load(&paths.config).unwrap();
+        config.active_repo = Some(target.clone());
+        config.save(&paths.config).unwrap();
+        let remote = tempdir().unwrap();
+        let remote_staging = remote.path().join("remote");
+        Catalog::initialize_empty("Archive", &active_key, &remote_staging).unwrap();
+        let candidate_path = paths.home.parent().unwrap().join("external.key");
+        active_key.save_to_path(&candidate_path).unwrap();
+        let concurrent_key_path = paths.home.parent().unwrap().join("concurrent.key");
+        KeyFile::generate_to_path(&concurrent_key_path).unwrap();
+        let concurrent_repo = RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "other-space".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        };
+        let config_path = paths.config.clone();
+        let concurrent_key_for_action = concurrent_key_path.clone();
+        let concurrent_repo_for_action = concurrent_repo.clone();
+        let concurrent_bytes = Arc::new(Mutex::new(None));
+        let concurrent_bytes_for_action = Arc::clone(&concurrent_bytes);
+        let adapter =
+            FakeCatalogAdapter::catalog_with_action(remote_staging.join(CATALOG_FILE), move || {
+                let mut config = LiosConfig::load(&config_path).unwrap();
+                config.active_repo = Some(concurrent_repo_for_action);
+                config.key_file_path = Some(concurrent_key_for_action);
+                config.save(&config_path).unwrap();
+                *concurrent_bytes_for_action.lock().unwrap() =
+                    Some(fs::read(&config_path).unwrap());
+            });
+        let config_gate = ConfigMutationGate::default();
+
+        let error = import_candidate_with_adapter(
+            &paths,
+            &config_gate,
+            &candidate_path,
+            Some(&target),
+            Some(&adapter),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, CommandErrorCode::RemoteConflict);
+        assert_eq!(
+            fs::read(&paths.config).unwrap(),
+            concurrent_bytes.lock().unwrap().clone().unwrap()
+        );
+        let saved = LiosConfig::load(&paths.config).unwrap();
+        assert_eq!(saved.active_repo, Some(concurrent_repo));
+        assert_eq!(
+            saved.key_file_path.as_deref(),
+            Some(concurrent_key_path.as_path())
+        );
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_config_gate_prevents_stale_import_write_after_remote_verification() {
+        let (_temp, paths, active_key_path) = configured_paths();
+        let active_key = KeyFile::load_from_path(&active_key_path).unwrap();
+        let target = repo();
+        let mut config = LiosConfig::load(&paths.config).unwrap();
+        config.active_repo = Some(target.clone());
+        config.save(&paths.config).unwrap();
+        let remote = tempdir().unwrap();
+        let remote_staging = remote.path().join("remote");
+        Catalog::initialize_empty("Archive", &active_key, &remote_staging).unwrap();
+        let candidate_path = paths.home.parent().unwrap().join("external.key");
+        active_key.save_to_path(&candidate_path).unwrap();
+        let adapter = Arc::new(FakeCatalogAdapter::catalog(
+            remote_staging.join(CATALOG_FILE),
+        ));
+        let gate = Arc::new(ConfigMutationGate::default());
+        let concurrent_key_path = paths.home.parent().unwrap().join("concurrent.key");
+        KeyFile::generate_to_path(&concurrent_key_path).unwrap();
+        let concurrent_repo = RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "gate-winner".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        };
+
+        let (gate_held_tx, gate_held_rx) = std::sync::mpsc::channel();
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let (written_tx, written_rx) = oneshot::channel();
+        let writer_gate = Arc::clone(&gate);
+        let writer_config_path = paths.config.clone();
+        let writer_key_path = concurrent_key_path.clone();
+        let writer_repo = concurrent_repo.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = writer_gate.lock().unwrap();
+            gate_held_tx.send(()).unwrap();
+            write_rx.recv().unwrap();
+            let mut config = LiosConfig::load(&writer_config_path).unwrap();
+            config.active_repo = Some(writer_repo);
+            config.key_file_path = Some(writer_key_path);
+            config.save(&writer_config_path).unwrap();
+            written_tx
+                .send(fs::read(&writer_config_path).unwrap())
+                .unwrap();
+        });
+        gate_held_rx.recv().unwrap();
+
+        let (verified_tx, verified_rx) = oneshot::channel();
+        let import_paths = paths.clone();
+        let import_candidate = candidate_path.clone();
+        let import_target = target.clone();
+        let import_adapter = Arc::clone(&adapter);
+        let import_gate = Arc::clone(&gate);
+        let import = tokio::spawn(async move {
+            import_candidate_with_adapter_after_verification(
+                &import_paths,
+                import_gate.as_ref(),
+                &import_candidate,
+                Some(&import_target),
+                Some(import_adapter.as_ref()),
+                move || verified_tx.send(()).unwrap(),
+            )
+            .await
+        });
+
+        verified_rx.await.unwrap();
+        write_tx.send(()).unwrap();
+        let concurrent_bytes = written_rx.await.unwrap();
+        let error = import.await.unwrap().unwrap_err();
+        writer.join().unwrap();
+
+        assert_eq!(error.code, CommandErrorCode::RemoteConflict);
+        assert_eq!(fs::read(&paths.config).unwrap(), concurrent_bytes);
+        let saved = LiosConfig::load(&paths.config).unwrap();
+        assert_eq!(saved.active_repo, Some(concurrent_repo));
+        assert_eq!(
+            saved.key_file_path.as_deref(),
+            Some(concurrent_key_path.as_path())
+        );
+    }
+
+    #[tokio::test]
+    async fn uninitialized_or_unconfigured_space_accepts_format_only_verification() {
+        let temp = tempdir().unwrap();
+        let candidate_path = temp.path().join("candidate.key");
+        KeyFile::generate_to_path(&candidate_path).unwrap();
+        let target = repo();
+        let adapter = FakeCatalogAdapter::not_found();
+
+        let uninitialized =
+            verify_candidate_with_adapter(&candidate_path, Some(&target), Some(&adapter))
+                .await
+                .unwrap();
+        assert!(uninitialized.format_valid);
+        assert!(!uninitialized.catalog_checked);
+        assert_eq!(uninitialized.checked_space, Some(target));
+
+        let format_only =
+            verify_candidate_with_adapter::<FakeCatalogAdapter>(&candidate_path, None, None)
+                .await
+                .unwrap();
+        assert!(format_only.format_valid);
+        assert!(!format_only.catalog_checked);
+        assert_eq!(format_only.checked_space, None);
     }
 }

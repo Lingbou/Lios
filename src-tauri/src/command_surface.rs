@@ -19,8 +19,9 @@ macro_rules! with_registered_commands {
             rename_node,
             create_folder,
             search_catalog,
-            generate_key_file,
-            import_key_file,
+            export_recovery_key,
+            verify_recovery_key,
+            import_recovery_key,
             list_tasks,
             cleanup_local_cache,
             pause_task,
@@ -84,6 +85,20 @@ mod tests {
             "retry_task",
         ] {
             assert!(REGISTERED_COMMANDS.contains(&command), "{command}");
+        }
+    }
+
+    #[test]
+    fn registers_recovery_key_workflow_and_removes_obsolete_key_commands() {
+        for command in [
+            "export_recovery_key",
+            "verify_recovery_key",
+            "import_recovery_key",
+        ] {
+            assert!(REGISTERED_COMMANDS.contains(&command), "{command}");
+        }
+        for obsolete in ["generate_key_file", "import_key_file"] {
+            assert!(!REGISTERED_COMMANDS.contains(&obsolete), "{obsolete}");
         }
     }
 }
