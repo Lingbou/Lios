@@ -4,6 +4,7 @@ pub mod command_error;
 pub mod command_surface;
 pub mod download_service;
 pub mod production_config;
+pub mod task_manager;
 
 #[cfg(test)]
 #[path = "../build_support.rs"]
