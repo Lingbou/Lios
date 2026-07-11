@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::atomic::{write_atomic, write_atomic_immutable, SiblingTempFile};
+use crate::atomic::{write_atomic, write_atomic_immutable, write_atomic_new, SiblingTempFile};
 use crate::crypto::KeyFile;
 use crate::format_v2::{
-    decrypt_compatible_v1_or_v2, encrypt_envelope_v2, envelope_encoded_len_v2, EnvelopeKindV2,
+    decrypt_compatible_v1_or_v2, decrypt_envelope_v2, encrypt_envelope_v2, envelope_encoded_len_v2,
+    EnvelopeKindV2,
 };
 use crate::framed_v2::{
     decode_chunk_stream_v2, encode_chunk_stream_v2, ChunkDecodeLimitsV2, ChunkIdV2,
@@ -101,6 +102,26 @@ pub struct CatalogRemoteIntegrityReport {
     pub metadata_limited_objects: u64,
     pub encoded_bytes_verified: u64,
     pub unreferenced_managed_objects: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CatalogRebuildReport {
+    pub nodes_rebuilt: u64,
+    pub directories_rebuilt: u64,
+    pub files_rebuilt: u64,
+    pub content_objects_rebuilt: u64,
+    pub chunks_referenced: u64,
+    pub original_bytes_referenced: u64,
+    pub unreferenced_managed_objects: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum CatalogRebuildOutcome {
+    Completed {
+        catalog: Catalog,
+        report: CatalogRebuildReport,
+    },
+    Canceled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -450,6 +471,246 @@ impl Catalog {
             encrypted_catalog_path: staging_dir.join(CATALOG_FILE),
             staging_dir,
         }
+    }
+
+    pub fn rebuild_from_recovery(
+        key: &KeyFile,
+        staging_dir: impl Into<PathBuf>,
+        remote_objects: &[StorageObject],
+    ) -> Result<(Self, CatalogRebuildReport)> {
+        match Self::rebuild_from_recovery_with_cancel(key, staging_dir, remote_objects, || false)? {
+            CatalogRebuildOutcome::Completed { catalog, report } => Ok((catalog, report)),
+            CatalogRebuildOutcome::Canceled => Err(LiosError::Unsupported(
+                "catalog rebuild was unexpectedly canceled".to_string(),
+            )),
+        }
+    }
+
+    pub fn rebuild_from_recovery_with_cancel(
+        key: &KeyFile,
+        staging_dir: impl Into<PathBuf>,
+        remote_objects: &[StorageObject],
+        mut should_cancel: impl FnMut() -> bool,
+    ) -> Result<CatalogRebuildOutcome> {
+        let staging_dir = staging_dir.into();
+        if should_cancel() {
+            return Ok(CatalogRebuildOutcome::Canceled);
+        }
+        let remote_by_path = index_remote_inventory(remote_objects)?;
+        if remote_objects
+            .iter()
+            .any(|object| windows_names_equal(&object.path, CATALOG_FILE))
+        {
+            return Err(LiosError::Unsupported(
+                "remote catalog still exists; recovery rebuild is not allowed".to_string(),
+            ));
+        }
+
+        let mut descriptor_objects = Vec::new();
+        for object in remote_objects {
+            if let Some(node_id) = recovery_node_id_from_path(&object.path)? {
+                descriptor_objects.push((node_id.to_string(), object));
+            }
+        }
+        if descriptor_objects.is_empty() {
+            return Err(LiosError::DataCorruption(
+                "recovery contains no node descriptors".to_string(),
+            ));
+        }
+
+        let mut nodes = BTreeMap::new();
+        let mut expected_remote_paths = HashSet::new();
+        for (path_node_id, remote) in descriptor_objects {
+            if should_cancel() {
+                return Ok(CatalogRebuildOutcome::Canceled);
+            }
+            let expected_sha256 = required_remote_sha256(remote, "node descriptor")?;
+            let encrypted = read_verified_encrypted_file(
+                &staging_dir,
+                &remote.path,
+                Some(expected_sha256),
+                Some(remote.size),
+            )?;
+            let plaintext = decrypt_envelope_v2(key, EnvelopeKindV2::NodeDescriptor, &encrypted)?;
+            let descriptor: NodeDescriptorV2 = serde_json::from_slice(&plaintext)?;
+            let expected_size = envelope_encoded_len_v2(serde_json::to_vec(&descriptor)?.len())?;
+            if remote.size != expected_size {
+                return Err(LiosError::DataCorruption(format!(
+                    "node descriptor size mismatch: {}",
+                    remote.path
+                )));
+            }
+            validate_recovered_descriptor(&descriptor, &path_node_id)?;
+            let descriptor_hash = sha256_hex(&encrypted);
+            if nodes
+                .insert(
+                    path_node_id.clone(),
+                    CatalogNodeV2 {
+                        descriptor,
+                        descriptor_encrypted_sha256: Some(descriptor_hash),
+                    },
+                )
+                .is_some()
+            {
+                return Err(LiosError::DataCorruption(format!(
+                    "duplicate recovery node descriptor: {path_node_id}"
+                )));
+            }
+            expected_remote_paths.insert(remote.path.clone());
+        }
+
+        let root_ids = nodes
+            .iter()
+            .filter(|(_, node)| node.descriptor.parent_id.is_none())
+            .map(|(node_id, _)| node_id.clone())
+            .collect::<Vec<_>>();
+        if root_ids.len() != 1 {
+            return Err(LiosError::DataCorruption(
+                "recovery must contain exactly one root node".to_string(),
+            ));
+        }
+        let root_id = root_ids[0].clone();
+        if !matches!(
+            nodes[&root_id].descriptor.kind,
+            NodeDescriptorKindV2::Directory
+        ) {
+            return Err(LiosError::DataCorruption(
+                "recovery root must be a directory".to_string(),
+            ));
+        }
+
+        let mut directories_rebuilt = 0u64;
+        let mut files_rebuilt = 0u64;
+        let mut referenced_objects = BTreeMap::<String, (String, u64)>::new();
+        for node in nodes.values() {
+            if should_cancel() {
+                return Ok(CatalogRebuildOutcome::Canceled);
+            }
+            match &node.descriptor.kind {
+                NodeDescriptorKindV2::Directory => {
+                    directories_rebuilt = directories_rebuilt.checked_add(1).ok_or_else(|| {
+                        LiosError::DataCorruption(
+                            "recovered directory count overflowed".to_string(),
+                        )
+                    })?;
+                }
+                NodeDescriptorKindV2::File {
+                    object_id,
+                    content_sha256,
+                    original_size,
+                } => {
+                    files_rebuilt = files_rebuilt.checked_add(1).ok_or_else(|| {
+                        LiosError::DataCorruption("recovered file count overflowed".to_string())
+                    })?;
+                    if let Some((existing_sha256, existing_size)) =
+                        referenced_objects.get(object_id)
+                    {
+                        if existing_sha256 != content_sha256 || existing_size != original_size {
+                            return Err(LiosError::DataCorruption(format!(
+                                "file nodes disagree about content object: {object_id}"
+                            )));
+                        }
+                    } else {
+                        referenced_objects
+                            .insert(object_id.clone(), (content_sha256.clone(), *original_size));
+                    }
+                }
+            }
+        }
+
+        let mut content_objects = BTreeMap::new();
+        let mut chunks_referenced = 0u64;
+        let mut original_bytes_referenced = 0u64;
+        for (object_id, (content_sha256, original_size)) in referenced_objects {
+            if should_cancel() {
+                return Ok(CatalogRebuildOutcome::Canceled);
+            }
+            let reference = RecoveredContentReference {
+                object_id: &object_id,
+                content_sha256: &content_sha256,
+                original_size,
+            };
+            let Some(object) = rebuild_content_object_from_manifest(
+                key,
+                &staging_dir,
+                &remote_by_path,
+                reference,
+                &mut expected_remote_paths,
+                &mut should_cancel,
+            )?
+            else {
+                return Ok(CatalogRebuildOutcome::Canceled);
+            };
+            let StorageRef::V2(storage) = &object.storage else {
+                unreachable!("recovery only rebuilds native v2 storage references");
+            };
+            let object_chunks = u64::try_from(storage.chunks.len()).map_err(|_| {
+                LiosError::DataCorruption("recovered chunk count overflowed".to_string())
+            })?;
+            chunks_referenced = chunks_referenced
+                .checked_add(object_chunks)
+                .ok_or_else(|| {
+                    LiosError::DataCorruption("recovered chunk count overflowed".to_string())
+                })?;
+            original_bytes_referenced = original_bytes_referenced
+                .checked_add(object.original_size)
+                .ok_or_else(|| {
+                    LiosError::DataCorruption(
+                        "recovered original byte count overflowed".to_string(),
+                    )
+                })?;
+            content_objects.insert(object_id, object);
+        }
+
+        let mut plain = CatalogV2 {
+            version: 2,
+            root_id,
+            nodes,
+            content_index: BTreeMap::new(),
+            content_objects,
+        };
+        rebuild_content_index(&mut plain);
+        validate_catalog_v2(&plain, true)?;
+        if should_cancel() {
+            return Ok(CatalogRebuildOutcome::Canceled);
+        }
+
+        let unreferenced_managed_objects = u64::try_from(
+            remote_objects
+                .iter()
+                .filter(|object| {
+                    is_managed_integrity_path(&object.path)
+                        && !expected_remote_paths.contains(&object.path)
+                })
+                .count(),
+        )
+        .map_err(|_| {
+            LiosError::DataCorruption("unreferenced remote object count overflowed".to_string())
+        })?;
+        let nodes_rebuilt = u64::try_from(plain.nodes.len()).map_err(|_| {
+            LiosError::DataCorruption("recovered node count overflowed".to_string())
+        })?;
+        let content_objects_rebuilt = u64::try_from(plain.content_objects.len()).map_err(|_| {
+            LiosError::DataCorruption("recovered content object count overflowed".to_string())
+        })?;
+
+        let catalog = Self::from_staging(staging_dir);
+        let serialized = serde_json::to_vec(&plain)?;
+        let encrypted = encrypt_envelope_v2(key, EnvelopeKindV2::Catalog, &serialized)?;
+        write_atomic_new(&catalog.encrypted_catalog_path, &encrypted)?;
+
+        Ok(CatalogRebuildOutcome::Completed {
+            catalog,
+            report: CatalogRebuildReport {
+                nodes_rebuilt,
+                directories_rebuilt,
+                files_rebuilt,
+                content_objects_rebuilt,
+                chunks_referenced,
+                original_bytes_referenced,
+                unreferenced_managed_objects,
+            },
+        })
     }
 
     pub fn pack(source: PackSource, key: &KeyFile, options: PackOptions) -> Result<Self> {
@@ -1345,6 +1606,211 @@ impl Catalog {
         write_atomic(&self.encrypted_catalog_path, &encrypted)?;
         Ok(())
     }
+}
+
+fn index_remote_inventory(
+    remote_objects: &[StorageObject],
+) -> Result<HashMap<&str, &StorageObject>> {
+    let mut remote_by_path = HashMap::with_capacity(remote_objects.len());
+    let mut remote_windows_paths = HashSet::with_capacity(remote_objects.len());
+    for object in remote_objects {
+        if !remote_windows_paths.insert(windows_name_key(&object.path))
+            || remote_by_path
+                .insert(object.path.as_str(), object)
+                .is_some()
+        {
+            return Err(LiosError::DataCorruption(format!(
+                "duplicate remote object path: {}",
+                object.path
+            )));
+        }
+    }
+    Ok(remote_by_path)
+}
+
+fn recovery_node_id_from_path(path: &str) -> Result<Option<&str>> {
+    let prefix = format!("{NODE_DESCRIPTORS_DIR}/");
+    let Some(file_name) = path.strip_prefix(&prefix) else {
+        return Ok(None);
+    };
+    validate_remote_object_path(path)?;
+    let Some(node_id) = file_name.strip_suffix(".enc") else {
+        return Err(LiosError::DataCorruption(format!(
+            "invalid recovery node descriptor path: {path}"
+        )));
+    };
+    if node_id.is_empty() || node_id.contains('/') || node_id.contains('\\') {
+        return Err(LiosError::DataCorruption(format!(
+            "invalid recovery node descriptor path: {path}"
+        )));
+    }
+    validate_opaque_id_v2(node_id, "node")?;
+    Ok(Some(node_id))
+}
+
+fn required_remote_sha256<'a>(object: &'a StorageObject, kind: &str) -> Result<&'a str> {
+    let sha256 = object.sha256.as_deref().ok_or_else(|| {
+        LiosError::DataCorruption(format!("remote {kind} has no LFS OID: {}", object.path))
+    })?;
+    validate_lower_hex_id(sha256, 64, "SHA-256")?;
+    Ok(sha256)
+}
+
+fn validate_recovered_descriptor(descriptor: &NodeDescriptorV2, path_node_id: &str) -> Result<()> {
+    if descriptor.version != 2 {
+        return Err(LiosError::Unsupported(format!(
+            "unknown node descriptor version: {}",
+            descriptor.version
+        )));
+    }
+    validate_opaque_id_v2(&descriptor.node_id, "node")?;
+    if descriptor.node_id != path_node_id {
+        return Err(LiosError::DataCorruption(format!(
+            "node descriptor path/id mismatch: {path_node_id}"
+        )));
+    }
+    if let Some(parent_id) = &descriptor.parent_id {
+        validate_opaque_id_v2(parent_id, "node")?;
+    }
+    if !is_portable_logical_name(&descriptor.name) {
+        return Err(LiosError::DataCorruption(format!(
+            "invalid native v2 item name: {}",
+            descriptor.name
+        )));
+    }
+    if let NodeDescriptorKindV2::File {
+        object_id,
+        content_sha256,
+        ..
+    } = &descriptor.kind
+    {
+        validate_opaque_id_v2(object_id, "object")?;
+        validate_lower_hex_id(content_sha256, 64, "content SHA-256")?;
+    }
+    Ok(())
+}
+
+struct RecoveredContentReference<'a> {
+    object_id: &'a str,
+    content_sha256: &'a str,
+    original_size: u64,
+}
+
+fn rebuild_content_object_from_manifest(
+    key: &KeyFile,
+    staging_dir: &Path,
+    remote_by_path: &HashMap<&str, &StorageObject>,
+    reference: RecoveredContentReference<'_>,
+    expected_remote_paths: &mut HashSet<String>,
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<Option<ContentObject>> {
+    let RecoveredContentReference {
+        object_id,
+        content_sha256,
+        original_size,
+    } = reference;
+    if should_cancel() {
+        return Ok(None);
+    }
+    validate_opaque_id_v2(object_id, "object")?;
+    validate_lower_hex_id(content_sha256, 64, "content SHA-256")?;
+    let manifest_path = format!("{FILES_DIR}/{object_id}/{FILE_MANIFEST}");
+    let remote_manifest = remote_by_path
+        .get(manifest_path.as_str())
+        .copied()
+        .ok_or_else(|| {
+            LiosError::DataCorruption(format!(
+                "referenced remote object is missing: {manifest_path}"
+            ))
+        })?;
+    let remote_manifest_sha256 = required_remote_sha256(remote_manifest, "manifest")?;
+    let encrypted_manifest = read_verified_encrypted_file(
+        staging_dir,
+        &manifest_path,
+        Some(remote_manifest_sha256),
+        Some(remote_manifest.size),
+    )?;
+    let manifest_plaintext =
+        decrypt_envelope_v2(key, EnvelopeKindV2::Manifest, &encrypted_manifest)?;
+    let manifest: ObjectManifestV2 = serde_json::from_slice(&manifest_plaintext)?;
+    let manifest_sha256 = sha256_hex(&encrypted_manifest);
+    let storage = V2StorageRef {
+        manifest_path: manifest_path.clone(),
+        manifest_encrypted_sha256: manifest_sha256,
+        chunks: manifest.chunks.clone(),
+    };
+    let object = ContentObject {
+        object_id: object_id.to_string(),
+        content_sha256: content_sha256.to_string(),
+        original_size,
+        storage: StorageRef::V2(storage.clone()),
+    };
+    let expected_manifest = expected_v2_manifest(&object, &storage);
+    let expected_manifest_size =
+        envelope_encoded_len_v2(serde_json::to_vec(&expected_manifest)?.len())?;
+    if remote_manifest.size != expected_manifest_size {
+        return Err(LiosError::DataCorruption(format!(
+            "content manifest size mismatch: {object_id}"
+        )));
+    }
+    validate_v2_manifest_bytes(
+        &object,
+        &storage,
+        key,
+        &encrypted_manifest,
+        &expected_manifest,
+    )?;
+    validate_storage_ref(&object, &mut HashSet::new())?;
+
+    if storage.chunks.is_empty() {
+        return Err(LiosError::DataCorruption(format!(
+            "content manifest has no chunks: {object_id}"
+        )));
+    }
+    let mut chunk_original_bytes = 0u64;
+    for chunk in &storage.chunks {
+        if should_cancel() {
+            return Ok(None);
+        }
+        validate_lower_hex_id(&chunk.original_sha256, 64, "chunk original SHA-256")?;
+        validate_lower_hex_id(&chunk.encoded_sha256, 64, "chunk encoded SHA-256")?;
+        chunk_original_bytes = chunk_original_bytes
+            .checked_add(chunk.original_size)
+            .ok_or_else(|| {
+                LiosError::DataCorruption(format!(
+                    "chunk original byte count overflowed: {object_id}"
+                ))
+            })?;
+        let remote_chunk = remote_by_path
+            .get(chunk.path.as_str())
+            .copied()
+            .ok_or_else(|| {
+                LiosError::DataCorruption(format!(
+                    "referenced remote object is missing: {}",
+                    chunk.path
+                ))
+            })?;
+        if remote_chunk.size != chunk.encoded_size {
+            return Err(LiosError::DataCorruption(format!(
+                "remote object size mismatch: {}",
+                chunk.path
+            )));
+        }
+        if required_remote_sha256(remote_chunk, "chunk")? != chunk.encoded_sha256 {
+            return Err(LiosError::DataCorruption(format!(
+                "remote object LFS OID mismatch: {}",
+                chunk.path
+            )));
+        }
+        expected_remote_paths.insert(chunk.path.clone());
+    }
+    if chunk_original_bytes != original_size {
+        return Err(LiosError::DataCorruption(format!(
+            "content manifest original size mismatch: {object_id}"
+        )));
+    }
+    expected_remote_paths.insert(manifest_path);
+    Ok(Some(object))
 }
 
 fn normalize_v1_catalog(catalog: CatalogV1) -> Result<CatalogV2> {

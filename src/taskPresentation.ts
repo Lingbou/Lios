@@ -32,6 +32,29 @@ export type TaskItemPresentationRecord = {
   error?: string | null;
 };
 
+export function taskLabelText(label: string) {
+  if (label === "upload") return "上传";
+  if (label === "download") return "下载";
+  if (label === "delete" || label.startsWith("delete ")) return "删除";
+  if (label === "restore") return "恢复";
+  if (label === "verify_quick") return "快速检查";
+  if (label === "verify_full") return "完整检查";
+  if (label === "rebuild") return "目录恢复";
+  return label;
+}
+
+export function taskCompletionReloadsCatalog(
+  previousState: TaskPresentationState | undefined,
+  task: Pick<TaskPresentationRecord, "state" | "label">
+) {
+  return (
+    previousState !== undefined &&
+    previousState !== "Completed" &&
+    task.state === "Completed" &&
+    (task.label === "upload" || task.label === "delete" || task.label === "rebuild")
+  );
+}
+
 function finiteNonNegative(value: number | null | undefined) {
   return Number.isFinite(value) && (value ?? 0) > 0 ? (value ?? 0) : 0;
 }
@@ -115,6 +138,7 @@ export function taskStatusText(task: TaskPresentationRecord) {
   if (task.state === "Preparing" && task.label.startsWith("verify_")) {
     return "正在准备空间检查";
   }
+  if (task.state === "Preparing" && task.label === "rebuild") return "正在准备目录重建";
   if (task.state === "Preparing" || task.phase === "preparing") return "正在切片加密";
   if (task.state === "Running" && task.phase === "uploading") return "正在同步到远端";
   if (task.state === "Running" && task.phase === "downloading") return "正在下载";
@@ -124,6 +148,12 @@ export function taskStatusText(task: TaskPresentationRecord) {
   }
   if (task.state === "Running" && task.phase === "verifying_content") return "正在验证加密内容";
   if (task.state === "Running" && task.phase === "checking_complete") return "检查完成";
+  if (task.state === "Running" && task.phase === "downloading_recovery_metadata") {
+    return "正在下载恢复元数据";
+  }
+  if (task.state === "Running" && task.phase === "rebuilding_catalog") {
+    return "正在重建目录索引";
+  }
   if (task.state === "Running" && task.phase === "restoring") return "正在恢复到本地";
   if (task.state === "Running") return task.progress_total > 0 ? "正在处理" : "正在准备";
   if (task.state === "Retrying") {

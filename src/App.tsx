@@ -32,8 +32,10 @@ import { initializeWithExistingCatalog, loadCatalogState } from "./catalogState.
 import { errorText } from "./commandError.ts";
 import { setupWarningMessage, type SetupWarning } from "./setupWarning.ts";
 import {
+  taskCompletionReloadsCatalog,
   taskItemProgressPercent,
   taskItemStatusText,
+  taskLabelText,
   taskProgressPercent,
   taskProgressText,
   taskStatusText
@@ -162,6 +164,30 @@ type CatalogLoadResult = {
   warnings: string[];
 };
 
+type CatalogRebuildReport = {
+  nodes_rebuilt: number;
+  directories_rebuilt: number;
+  files_rebuilt: number;
+  content_objects_rebuilt: number;
+  chunks_referenced: number;
+  original_bytes_referenced: number;
+  unreferenced_managed_objects: number;
+};
+
+type CatalogRebuildPreview = {
+  revision: string;
+  tree: CatalogTreeNode;
+  report: CatalogRebuildReport;
+  warnings: string[];
+};
+
+type CatalogRebuildDialog = {
+  space: RepoConfig;
+  status: "loading" | "ready" | "submitting" | "error";
+  preview: CatalogRebuildPreview | null;
+  error: string;
+};
+
 type Snapshot = {
   paths: PathsDto;
   config: LiosConfig;
@@ -264,16 +290,6 @@ function taskIcon(state: TaskState) {
   return <RefreshCw aria-hidden />;
 }
 
-function taskLabel(label: string) {
-  if (label === "upload") return "上传";
-  if (label === "download") return "下载";
-  if (label === "delete" || label.startsWith("delete ")) return "删除";
-  if (label === "restore") return "恢复";
-  if (label === "verify_quick") return "快速检查";
-  if (label === "verify_full") return "完整检查";
-  return label;
-}
-
 function nodeKind(node: CatalogTreeNode): "Directory" | "File" {
   return node.kind.type === "Directory" ? "Directory" : "File";
 }
@@ -331,6 +347,26 @@ function treeToDriveItem(node: CatalogTreeNode): DriveItem {
   };
 }
 
+function CatalogRecoveryTree({ node }: { node: CatalogTreeNode }) {
+  const kind = node.kind;
+  return (
+    <li>
+      <div className="rebuildTreeRow">
+        {kind.type === "Directory" ? <Folder aria-hidden /> : <File aria-hidden />}
+        <span>{node.name || "根目录"}</span>
+        {kind.type === "File" && <small>{formatBytes(kind.original_size)}</small>}
+      </div>
+      {kind.type === "Directory" && kind.children.length > 0 && (
+        <ul>
+          {kind.children.map((child) => (
+            <CatalogRecoveryTree node={child} key={child.id} />
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
 function sameSpace(left: RepoConfig | null | undefined, right: RepoConfig | null | undefined) {
   return Boolean(
     left &&
@@ -365,7 +401,9 @@ function App() {
   const [conflicts, setConflicts] = useState<UploadConflict[]>([]);
   const [conflictActions, setConflictActions] = useState<Record<string, ConflictAction>>({});
   const [cacheCleanup, setCacheCleanup] = useState<CacheCleanupReport | null>(null);
+  const [rebuildDialog, setRebuildDialog] = useState<CatalogRebuildDialog | null>(null);
   const previousTaskStates = useRef<Map<string, TaskState>>(new Map());
+  const rebuildPreviewRequest = useRef(0);
 
   const tasks = snapshot?.tasks ?? [];
   const configured = Boolean(snapshot?.has_token && snapshot.config.key_file_path);
@@ -381,6 +419,11 @@ function App() {
   const activeTasks = tasks.filter((task) =>
     ["Queued", "Preparing", "Running", "Paused", "Retrying", "Committing"].includes(task.state)
   ).length;
+  const rebuildTaskActive = tasks.some(
+    (task) =>
+      task.label === "rebuild" &&
+      ["Queued", "Preparing", "Running", "Paused", "Retrying", "Committing"].includes(task.state)
+  );
   const failedTasks = tasks.filter((task) => task.state === "Failed").length;
   const totalTasks = tasks.length;
   const hasToken = Boolean(snapshot?.has_token);
@@ -509,12 +552,7 @@ function App() {
     const nextStates = new Map<string, TaskState>();
     for (const task of tasks) {
       const previous = previousTaskStates.current.get(task.id);
-      if (
-        previous !== undefined &&
-        previous !== "Completed" &&
-        task.state === "Completed" &&
-        (task.label === "upload" || task.label === "delete")
-      ) {
+      if (taskCompletionReloadsCatalog(previous, task)) {
         completedMutation = true;
       }
       nextStates.set(task.id, task.state);
@@ -802,6 +840,101 @@ function App() {
     });
   }
 
+  async function loadCatalogRebuildPreview(space: RepoConfig) {
+    const requestId = rebuildPreviewRequest.current + 1;
+    rebuildPreviewRequest.current = requestId;
+    setMessage("");
+    setRebuildDialog({ space, status: "loading", preview: null, error: "" });
+    try {
+      const preview = await appInvoke<CatalogRebuildPreview>("preview_rebuild_catalog", { space });
+      if (rebuildPreviewRequest.current !== requestId) return;
+      setRebuildDialog({ space, status: "ready", preview, error: "" });
+    } catch (error) {
+      if (rebuildPreviewRequest.current !== requestId) return;
+      setRebuildDialog({
+        space,
+        status: "error",
+        preview: null,
+        error: errorText(error)
+      });
+    }
+  }
+
+  async function openCatalogRebuildDialog() {
+    if (!selectedSpace) {
+      setMessage("先从账号中选择一个空间。");
+      return;
+    }
+    if (rebuildTaskActive) {
+      setMessage("当前已有目录恢复任务，请等待它完成后再试。");
+      return;
+    }
+    if (busy !== null || rebuildDialog) return;
+    const space: RepoConfig = {
+      namespace: selectedSpace.namespace,
+      dataset: selectedSpace.dataset,
+      endpoint: selectedSpace.endpoint
+    };
+    await loadCatalogRebuildPreview(space);
+  }
+
+  function closeCatalogRebuildDialog() {
+    if (rebuildDialog?.status === "submitting") return;
+    rebuildPreviewRequest.current += 1;
+    setRebuildDialog(null);
+  }
+
+  async function confirmCatalogRebuild() {
+    const dialog = rebuildDialog;
+    if (!dialog?.preview || dialog.status === "loading" || dialog.status === "submitting") return;
+    if (rebuildTaskActive) {
+      setRebuildDialog({
+        ...dialog,
+        status: "error",
+        error: "当前已有目录恢复任务，请等待它完成后重新预览。"
+      });
+      return;
+    }
+
+    const preview = dialog.preview;
+    setRebuildDialog({ ...dialog, status: "submitting", error: "" });
+    let task: TaskRecord;
+    try {
+      task = await appInvoke<TaskRecord>("enqueue_rebuild_catalog", {
+        space: dialog.space,
+        expectedRevision: preview.revision
+      });
+    } catch (error) {
+      setRebuildDialog((current) =>
+        current
+          ? {
+              ...current,
+              status: "error",
+              preview,
+              error: errorText(error)
+            }
+          : current
+      );
+      await refreshTasks().catch(() => undefined);
+      return;
+    }
+
+    previousTaskStates.current.set(task.id, task.state);
+    setSnapshot((current) =>
+      current
+        ? {
+            ...current,
+            tasks: [task, ...current.tasks.filter((currentTask) => currentTask.id !== task.id)]
+          }
+        : current
+    );
+    setRebuildDialog(null);
+    await refreshTasks().catch(() => undefined);
+    if (task.state === "Completed" && activeSpace) {
+      await reloadCatalog().catch((error) => setMessage(errorText(error)));
+    }
+  }
+
   async function selectAccount() {
     setView("spaces");
     setMessage("");
@@ -1028,6 +1161,13 @@ function App() {
                   <button onClick={() => verifySpace(true)} disabled={!selectedSpace || busy !== null}>
                     <HardDrive aria-hidden />
                     完整检查
+                  </button>
+                  <button
+                    onClick={openCatalogRebuildDialog}
+                    disabled={!selectedSpace || busy !== null || rebuildDialog !== null || rebuildTaskActive}
+                  >
+                    <RefreshCw aria-hidden />
+                    重建 Catalog
                   </button>
                 </div>
               </div>
@@ -1303,7 +1443,7 @@ function App() {
                       <div className="taskIcon">{taskIcon(task.state)}</div>
                       <div className="taskInfo">
                         <strong>
-                          {taskLabel(task.label)}
+                          {taskLabelText(task.label)}
                           {task.items.length > 0 && <small>{task.items.length} 个文件</small>}
                         </strong>
                         <span>{taskStatusText(task)}</span>
@@ -1357,7 +1497,7 @@ function App() {
                       </div>
                     </div>
                     {task.items.length > 0 && (
-                      <div className="taskFileList" aria-label={`${taskLabel(task.label)}文件明细`}>
+                      <div className="taskFileList" aria-label={`${taskLabelText(task.label)}文件明细`}>
                         {task.items.map((item) => {
                           const itemProgress = taskItemProgressPercent(item);
                           const itemTotal = item.bytes_total || item.size;
@@ -1390,6 +1530,146 @@ function App() {
           </div>
         </section>
       </section>
+
+      {rebuildDialog && (
+        <div className="modalBackdrop">
+          <section
+            className="rebuildModal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="rebuild-catalog-title"
+          >
+            <div className="modalHeader">
+              <div>
+                <h2 id="rebuild-catalog-title">恢复目录结构</h2>
+                <p>{`${rebuildDialog.space.namespace}/${rebuildDialog.space.dataset}`}</p>
+              </div>
+              <button
+                onClick={closeCatalogRebuildDialog}
+                disabled={rebuildDialog.status === "submitting"}
+                title="关闭"
+                aria-label="关闭"
+              >
+                <X aria-hidden />
+              </button>
+            </div>
+
+            <div className="rebuildModalBody">
+              {rebuildDialog.status === "loading" && (
+                <div className="rebuildLoading" role="status">
+                  <RefreshCw aria-hidden />
+                  <strong>正在准备恢复预览</strong>
+                  <span>正在读取可恢复的目录信息，请稍候。</span>
+                </div>
+              )}
+
+              {rebuildDialog.error && (
+                <div className="rebuildError" role="alert">
+                  <AlertTriangle aria-hidden />
+                  <span>
+                    <strong>{rebuildDialog.preview ? "恢复任务未能开始" : "无法生成恢复预览"}</strong>
+                    <small>{rebuildDialog.error}</small>
+                  </span>
+                </div>
+              )}
+
+              {rebuildDialog.preview && (
+                <>
+                  <p className="rebuildIntro">
+                    Lios 将根据已恢复的信息重新生成目录索引。请确认下方目录和统计无误；如果远端内容在预览后发生变化，任务会停止并要求重新预览。
+                  </p>
+
+                  <dl className="rebuildReport">
+                    <div>
+                      <dt>可恢复节点</dt>
+                      <dd>{rebuildDialog.preview.report.nodes_rebuilt}</dd>
+                    </div>
+                    <div>
+                      <dt>文件夹</dt>
+                      <dd>{rebuildDialog.preview.report.directories_rebuilt}</dd>
+                    </div>
+                    <div>
+                      <dt>文件</dt>
+                      <dd>{rebuildDialog.preview.report.files_rebuilt}</dd>
+                    </div>
+                    <div>
+                      <dt>文件内容</dt>
+                      <dd>{rebuildDialog.preview.report.content_objects_rebuilt}</dd>
+                    </div>
+                    <div>
+                      <dt>数据分片</dt>
+                      <dd>{rebuildDialog.preview.report.chunks_referenced}</dd>
+                    </div>
+                    <div>
+                      <dt>原始数据</dt>
+                      <dd>{formatBytes(rebuildDialog.preview.report.original_bytes_referenced)}</dd>
+                    </div>
+                    <div>
+                      <dt>未引用对象</dt>
+                      <dd>{rebuildDialog.preview.report.unreferenced_managed_objects}</dd>
+                    </div>
+                  </dl>
+
+                  <section className="rebuildTreePanel" aria-labelledby="rebuild-tree-title">
+                    <div className="rebuildSectionHeader">
+                      <h3 id="rebuild-tree-title">可恢复的目录</h3>
+                      <span>完整预览</span>
+                    </div>
+                    <div className="rebuildTreeScroll">
+                      <ul className="rebuildTree">
+                        <CatalogRecoveryTree node={rebuildDialog.preview.tree} />
+                      </ul>
+                    </div>
+                  </section>
+
+                  <section className="rebuildWarnings" aria-labelledby="rebuild-warnings-title">
+                    <div className="rebuildSectionHeader">
+                      <h3 id="rebuild-warnings-title">恢复提示</h3>
+                      <span>{rebuildDialog.preview.warnings.length} 项</span>
+                    </div>
+                    {rebuildDialog.preview.warnings.length > 0 ? (
+                      <ul>
+                        {rebuildDialog.preview.warnings.map((warning, index) => (
+                          <li key={`${index}-${warning}`}>{warning}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p>未发现需要额外处理的提示。</p>
+                    )}
+                  </section>
+                </>
+              )}
+            </div>
+
+            <div className="modalActions">
+              <button onClick={closeCatalogRebuildDialog} disabled={rebuildDialog.status === "submitting"}>
+                取消
+              </button>
+              <div className="modalActionGroup">
+                {rebuildDialog.status === "error" && (
+                  <button onClick={() => loadCatalogRebuildPreview(rebuildDialog.space)}>重新预览</button>
+                )}
+                <button
+                  className="primary"
+                  onClick={confirmCatalogRebuild}
+                  disabled={
+                    !rebuildDialog.preview ||
+                    rebuildDialog.status === "loading" ||
+                    rebuildDialog.status === "submitting" ||
+                    rebuildTaskActive
+                  }
+                >
+                  <RefreshCw
+                    className={rebuildDialog.status === "submitting" ? "loadingGlyph" : undefined}
+                    aria-hidden
+                  />
+                  {rebuildDialog.status === "submitting" ? "正在加入任务" : "确认恢复"}
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
 
       {conflicts.length > 0 && (
         <div className="modalBackdrop">
