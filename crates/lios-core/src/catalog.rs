@@ -78,6 +78,15 @@ pub struct CatalogRemoteFile {
     pub sha256: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CatalogIntegrityReport {
+    pub nodes_verified: u64,
+    pub objects_verified: u64,
+    pub chunks_verified: u64,
+    pub encoded_bytes_verified: u64,
+    pub original_bytes_verified: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LegacyContentOptimizationSummary {
     pub object_id: String,
@@ -362,6 +371,14 @@ pub struct ObjectManifestV2 {
     pub content_sha256: String,
     pub original_size: u64,
     pub chunks: Vec<V2ChunkRef>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ObjectManifestV1 {
+    version: u8,
+    object_id: String,
+    chunks: Vec<LegacyChunkRef>,
 }
 
 struct LoadedCatalogV2 {
@@ -1000,6 +1017,55 @@ impl Catalog {
         Ok(files)
     }
 
+    pub fn verify_staged_integrity(&self, key: &KeyFile) -> Result<CatalogIntegrityReport> {
+        let loaded = self.load_catalog_v2(key)?;
+        let mut report = CatalogIntegrityReport::default();
+        for (node_id, node) in &loaded.catalog.nodes {
+            let expected_sha256 = match &node.descriptor_encrypted_sha256 {
+                Some(expected_sha256) => expected_sha256,
+                None if loaded.migrated_from_v1 => continue,
+                None => {
+                    return Err(LiosError::DataCorruption(format!(
+                        "native v2 node descriptor hash is missing: {node_id}"
+                    )))
+                }
+            };
+            let relative_path = format!("{NODE_DESCRIPTORS_DIR}/{node_id}.enc");
+            let encrypted = read_verified_encrypted_file(
+                &self.staging_dir,
+                &relative_path,
+                Some(expected_sha256),
+                None,
+            )?;
+            let plaintext =
+                decrypt_compatible_v1_or_v2(key, EnvelopeKindV2::NodeDescriptor, &encrypted)?;
+            let descriptor: NodeDescriptorV2 = serde_json::from_slice(&plaintext)?;
+            if descriptor != node.descriptor {
+                return Err(LiosError::DataCorruption(format!(
+                    "node descriptor mismatch: {node_id}"
+                )));
+            }
+            report.nodes_verified = report.nodes_verified.checked_add(1).ok_or_else(|| {
+                LiosError::DataCorruption("verified node count overflowed".to_string())
+            })?;
+            add_verified_encoded_bytes(&mut report, encrypted.len())?;
+        }
+
+        for object in loaded.catalog.content_objects.values() {
+            verify_content_object_integrity(object, key, &self.staging_dir, &mut report)?;
+            report.objects_verified = report.objects_verified.checked_add(1).ok_or_else(|| {
+                LiosError::DataCorruption("verified object count overflowed".to_string())
+            })?;
+            report.original_bytes_verified = report
+                .original_bytes_verified
+                .checked_add(object.original_size)
+                .ok_or_else(|| {
+                    LiosError::DataCorruption("verified original byte count overflowed".to_string())
+                })?;
+        }
+        Ok(report)
+    }
+
     pub fn legacy_content_objects_needing_optimization(
         &self,
         key: &KeyFile,
@@ -1064,7 +1130,7 @@ impl Catalog {
     }
 
     fn load_catalog_v2(&self, key: &KeyFile) -> Result<LoadedCatalogV2> {
-        let encrypted = fs::read(&self.encrypted_catalog_path)?;
+        let encrypted = read_verified_encrypted_file(&self.staging_dir, CATALOG_FILE, None, None)?;
         let decrypted = decrypt_compatible_v1_or_v2(key, EnvelopeKindV2::Catalog, &encrypted)?;
         let value: serde_json::Value = serde_json::from_slice(&decrypted)?;
         let version = value
@@ -1328,13 +1394,14 @@ fn validate_catalog_v2(catalog: &CatalogV2, require_canonical_node_ids: bool) ->
             "catalog contains a cycle or disconnected node".to_string(),
         ));
     }
+    let mut remote_paths = HashSet::new();
     for (object_id, object) in &catalog.content_objects {
         if object.object_id != *object_id {
             return Err(LiosError::DataCorruption(format!(
                 "content object id mismatch: {object_id}"
             )));
         }
-        validate_storage_ref(object)?;
+        validate_storage_ref(object, &mut remote_paths)?;
     }
     for (sha256, object_id) in &catalog.content_index {
         let object = catalog.content_objects.get(object_id).ok_or_else(|| {
@@ -1363,12 +1430,24 @@ fn catalog_depth_error() -> LiosError {
     ))
 }
 
-fn validate_storage_ref(object: &ContentObject) -> Result<()> {
+fn validate_storage_ref(object: &ContentObject, remote_paths: &mut HashSet<String>) -> Result<()> {
     match &object.storage {
         StorageRef::Legacy(storage) => {
             validate_legacy_object_path(&storage.manifest_path)?;
+            if !remote_paths.insert(windows_name_key(&storage.manifest_path)) {
+                return Err(LiosError::DataCorruption(format!(
+                    "duplicate legacy object path: {}",
+                    storage.manifest_path
+                )));
+            }
             for chunk in &storage.chunks {
                 validate_legacy_object_path(&chunk.path)?;
+                if !remote_paths.insert(windows_name_key(&chunk.path)) {
+                    return Err(LiosError::DataCorruption(format!(
+                        "duplicate legacy object path: {}",
+                        chunk.path
+                    )));
+                }
             }
         }
         StorageRef::V2(storage) => {
@@ -1381,8 +1460,20 @@ fn validate_storage_ref(object: &ContentObject) -> Result<()> {
                 )));
             }
             validate_remote_object_path(&storage.manifest_path)?;
+            if !remote_paths.insert(windows_name_key(&storage.manifest_path)) {
+                return Err(LiosError::DataCorruption(format!(
+                    "duplicate v2 object path: {}",
+                    storage.manifest_path
+                )));
+            }
             for (index, chunk) in storage.chunks.iter().enumerate() {
                 validate_remote_object_path(&chunk.path)?;
+                if !remote_paths.insert(windows_name_key(&chunk.path)) {
+                    return Err(LiosError::DataCorruption(format!(
+                        "duplicate v2 object path: {}",
+                        chunk.path
+                    )));
+                }
                 if chunk.index != index || chunk.format_version != 2 {
                     return Err(LiosError::DataCorruption(format!(
                         "invalid v2 chunk reference: {}",
@@ -2381,17 +2472,353 @@ fn restore_legacy_chunk(
     Ok(())
 }
 
+fn read_verified_encrypted_file(
+    staging_dir: &Path,
+    relative_path: &str,
+    expected_sha256: Option<&str>,
+    expected_size: Option<u64>,
+) -> Result<Vec<u8>> {
+    let (mut file, opened_size) =
+        open_verified_staging_file(staging_dir, relative_path, expected_size)?;
+    let mut encrypted = Vec::new();
+    file.read_to_end(&mut encrypted)?;
+    if u64::try_from(encrypted.len()).ok() != Some(opened_size) {
+        return Err(LiosError::Crypto);
+    }
+    if expected_sha256.is_some_and(|expected| sha256_hex(&encrypted) != expected) {
+        return Err(LiosError::Crypto);
+    }
+    Ok(encrypted)
+}
+
+fn open_verified_staging_file(
+    staging_dir: &Path,
+    relative_path: &str,
+    expected_size: Option<u64>,
+) -> Result<(fs::File, u64)> {
+    validate_remote_object_path(relative_path)?;
+    let path = staging_dir.join(relative_path);
+    #[cfg(windows)]
+    let opened_staging_path = opened_windows_staging_path(staging_dir)?;
+    ensure_staging_descendants_safe(staging_dir, &path)?;
+    let file = open_staging_file(&path)?;
+    let metadata = file.metadata()?;
+    if opened_file_is_link_or_junction(&metadata) || !metadata.is_file() {
+        return Err(LiosError::DataCorruption(format!(
+            "encrypted object is not a regular file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(windows)]
+    ensure_windows_opened_path_matches(&file, &opened_staging_path, relative_path)?;
+    if expected_size.is_some_and(|size| metadata.len() != size) {
+        return Err(LiosError::Crypto);
+    }
+    Ok((file, metadata.len()))
+}
+
+#[cfg(windows)]
+fn open_staging_file(path: &Path) -> Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    Ok(fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)?)
+}
+
+#[cfg(not(windows))]
+fn open_staging_file(path: &Path) -> Result<fs::File> {
+    Ok(fs::File::open(path)?)
+}
+
+#[cfg(windows)]
+fn opened_file_is_link_or_junction(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn opened_file_is_link_or_junction(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn opened_windows_staging_path(staging_dir: &Path) -> Result<String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(staging_dir)?;
+    let metadata = directory.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir() {
+        return Err(LiosError::DataCorruption(format!(
+            "staging root is not a regular directory: {}",
+            staging_dir.display()
+        )));
+    }
+    windows_final_path_key(&directory)
+}
+
+#[cfg(windows)]
+fn ensure_windows_opened_path_matches(
+    file: &fs::File,
+    opened_staging_path: &str,
+    relative_path: &str,
+) -> Result<()> {
+    let opened_file_path = windows_final_path_key(file)?;
+    let expected = format!(
+        "{}\\{}",
+        opened_staging_path.trim_end_matches('\\'),
+        relative_path.replace('/', "\\")
+    )
+    .to_lowercase();
+    if opened_file_path != expected {
+        return Err(LiosError::DataCorruption(format!(
+            "staging path resolved through a symlink or junction: {relative_path}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_final_path_key(file: &fs::File) -> Result<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED};
+
+    let handle = HANDLE(file.as_raw_handle());
+    let mut buffer = vec![0u16; 512];
+    loop {
+        let length =
+            unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, FILE_NAME_NORMALIZED) };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let length = usize::try_from(length)
+            .map_err(|_| LiosError::DataCorruption("opened path length overflowed".to_string()))?;
+        if length < buffer.len() {
+            return Ok(OsString::from_wide(&buffer[..length])
+                .to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_lowercase());
+        }
+        buffer.resize(length.saturating_add(1), 0);
+    }
+}
+
+fn ensure_staging_descendants_safe(staging_dir: &Path, path: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(staging_dir)
+        .map_err(|_| LiosError::InvalidRelativePath(path.to_path_buf()))?;
+    let root_metadata = fs::symlink_metadata(staging_dir)?;
+    if is_link_or_junction(staging_dir, &root_metadata)? || !root_metadata.is_dir() {
+        return Err(LiosError::DataCorruption(format!(
+            "staging root is not a regular directory: {}",
+            staging_dir.display()
+        )));
+    }
+    let mut current = staging_dir.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(LiosError::InvalidRelativePath(path.to_path_buf()));
+        };
+        current.push(part);
+        let metadata = fs::symlink_metadata(&current)?;
+        if is_link_or_junction(&current, &metadata)? {
+            return Err(LiosError::DataCorruption(format!(
+                "staging path contains symlink or junction: {}",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn add_verified_encoded_bytes(
+    report: &mut CatalogIntegrityReport,
+    encoded_len: usize,
+) -> Result<()> {
+    let encoded_len = u64::try_from(encoded_len)
+        .map_err(|_| LiosError::DataCorruption("encoded object is too large".to_string()))?;
+    report.encoded_bytes_verified = report
+        .encoded_bytes_verified
+        .checked_add(encoded_len)
+        .ok_or_else(|| {
+            LiosError::DataCorruption("verified encoded byte count overflowed".to_string())
+        })?;
+    Ok(())
+}
+
+fn verify_content_object_integrity(
+    object: &ContentObject,
+    key: &KeyFile,
+    staging_dir: &Path,
+    report: &mut CatalogIntegrityReport,
+) -> Result<()> {
+    let mut file_hasher = Sha256::new();
+    let mut restored_size = 0u64;
+    match &object.storage {
+        StorageRef::Legacy(storage) => {
+            let encrypted_manifest = read_verified_encrypted_file(
+                staging_dir,
+                &storage.manifest_path,
+                storage.manifest_encrypted_sha256.as_deref(),
+                None,
+            )?;
+            let manifest_plaintext =
+                decrypt_compatible_v1_or_v2(key, EnvelopeKindV2::Manifest, &encrypted_manifest)?;
+            let manifest: ObjectManifestV1 = serde_json::from_slice(&manifest_plaintext)?;
+            let expected_manifest = ObjectManifestV1 {
+                version: 1,
+                object_id: object.object_id.clone(),
+                chunks: storage.chunks.clone(),
+            };
+            if manifest != expected_manifest {
+                return Err(LiosError::DataCorruption(format!(
+                    "legacy content manifest mismatch: {}",
+                    object.object_id
+                )));
+            }
+            add_verified_encoded_bytes(report, encrypted_manifest.len())?;
+            let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
+            chunks.sort_by_key(|chunk| chunk.index);
+            for chunk in chunks {
+                let encrypted = read_verified_encrypted_file(
+                    staging_dir,
+                    &chunk.path,
+                    Some(&chunk.encrypted_sha256),
+                    None,
+                )?;
+                let compressed = key.decrypt(&encrypted)?;
+                let mut sink = std::io::sink();
+                restore_legacy_chunk(
+                    compressed.as_slice(),
+                    chunk,
+                    &mut sink,
+                    &mut file_hasher,
+                    &mut restored_size,
+                    object.original_size,
+                )?;
+                report.chunks_verified =
+                    report.chunks_verified.checked_add(1).ok_or_else(|| {
+                        LiosError::DataCorruption("verified chunk count overflowed".to_string())
+                    })?;
+                add_verified_encoded_bytes(report, encrypted.len())?;
+            }
+        }
+        StorageRef::V2(storage) => {
+            let expected_manifest = expected_v2_manifest(object, storage);
+            let expected_manifest_size =
+                envelope_encoded_len_v2(serde_json::to_vec(&expected_manifest)?.len())?;
+            let encrypted_manifest = read_verified_encrypted_file(
+                staging_dir,
+                &storage.manifest_path,
+                Some(&storage.manifest_encrypted_sha256),
+                Some(expected_manifest_size),
+            )?;
+            validate_v2_manifest_bytes(
+                object,
+                storage,
+                key,
+                &encrypted_manifest,
+                &expected_manifest,
+            )?;
+            add_verified_encoded_bytes(report, encrypted_manifest.len())?;
+            let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
+            chunks.sort_by_key(|chunk| chunk.index);
+            for chunk in chunks {
+                if chunk.format_version != 2 {
+                    return Err(LiosError::Unsupported(format!(
+                        "unknown chunk format version: {}",
+                        chunk.format_version
+                    )));
+                }
+                let (input, _) =
+                    open_verified_staging_file(staging_dir, &chunk.path, Some(chunk.encoded_size))?;
+                let chunk_id = parse_chunk_id_v2(&chunk.chunk_id)?;
+                let writer = WholeFileHashingWriter::new(std::io::sink(), &mut file_hasher);
+                let stats = decode_chunk_stream_v2(
+                    key,
+                    chunk_id,
+                    input,
+                    writer,
+                    &ChunkDecodeLimitsV2::for_chunk(chunk.original_size),
+                )?;
+                if stats.original_bytes != chunk.original_size
+                    || hex::encode(stats.original_sha256) != chunk.original_sha256
+                    || stats.encoded_bytes != chunk.encoded_size
+                    || hex::encode(stats.encoded_sha256) != chunk.encoded_sha256
+                {
+                    return Err(LiosError::Crypto);
+                }
+                restored_size = restored_size
+                    .checked_add(stats.original_bytes)
+                    .filter(|size| *size <= object.original_size)
+                    .ok_or_else(|| {
+                        LiosError::DataCorruption("verified file exceeds declared size".to_string())
+                    })?;
+                report.chunks_verified =
+                    report.chunks_verified.checked_add(1).ok_or_else(|| {
+                        LiosError::DataCorruption("verified chunk count overflowed".to_string())
+                    })?;
+                report.encoded_bytes_verified = report
+                    .encoded_bytes_verified
+                    .checked_add(stats.encoded_bytes)
+                    .ok_or_else(|| {
+                        LiosError::DataCorruption(
+                            "verified encoded byte count overflowed".to_string(),
+                        )
+                    })?;
+            }
+        }
+    }
+    if restored_size != object.original_size
+        || hex::encode(file_hasher.finalize()) != object.content_sha256
+    {
+        return Err(LiosError::Crypto);
+    }
+    Ok(())
+}
+
 fn validate_v2_manifest(
     object: &ContentObject,
     storage: &V2StorageRef,
     key: &KeyFile,
     staging_dir: &Path,
 ) -> Result<()> {
-    let encrypted = fs::read(staging_dir.join(&storage.manifest_path))?;
-    if sha256_hex(&encrypted) != storage.manifest_encrypted_sha256 {
-        return Err(LiosError::Crypto);
-    }
-    let plaintext = decrypt_compatible_v1_or_v2(key, EnvelopeKindV2::Manifest, &encrypted)?;
+    let expected = expected_v2_manifest(object, storage);
+    let encrypted = read_verified_encrypted_file(
+        staging_dir,
+        &storage.manifest_path,
+        Some(&storage.manifest_encrypted_sha256),
+        None,
+    )?;
+    validate_v2_manifest_bytes(object, storage, key, &encrypted, &expected)
+}
+
+fn validate_v2_manifest_bytes(
+    object: &ContentObject,
+    storage: &V2StorageRef,
+    key: &KeyFile,
+    encrypted: &[u8],
+    expected: &ObjectManifestV2,
+) -> Result<()> {
+    let plaintext = decrypt_compatible_v1_or_v2(key, EnvelopeKindV2::Manifest, encrypted)?;
     let manifest: ObjectManifestV2 = serde_json::from_slice(&plaintext)?;
     if manifest.version != 2 {
         return Err(LiosError::Unsupported(format!(
@@ -2405,21 +2832,27 @@ fn validate_v2_manifest(
             manifest.format_version
         )));
     }
-    let expected = ObjectManifestV2 {
+    if manifest != *expected {
+        return Err(LiosError::DataCorruption(format!(
+            "content manifest mismatch: {}",
+            object.object_id
+        )));
+    }
+    if storage.manifest_encrypted_sha256 != sha256_hex(encrypted) {
+        return Err(LiosError::Crypto);
+    }
+    Ok(())
+}
+
+fn expected_v2_manifest(object: &ContentObject, storage: &V2StorageRef) -> ObjectManifestV2 {
+    ObjectManifestV2 {
         version: 2,
         format_version: 2,
         object_id: object.object_id.clone(),
         content_sha256: object.content_sha256.clone(),
         original_size: object.original_size,
         chunks: storage.chunks.clone(),
-    };
-    if manifest != expected {
-        return Err(LiosError::DataCorruption(format!(
-            "content manifest mismatch: {}",
-            object.object_id
-        )));
     }
-    Ok(())
 }
 
 fn parse_chunk_id_v2(value: &str) -> Result<ChunkIdV2> {

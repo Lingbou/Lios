@@ -34,6 +34,13 @@ fn write_file(path: &Path, contents: &[u8]) {
     fs::write(path, contents).unwrap();
 }
 
+fn tamper_file(path: &Path) {
+    let mut encoded = fs::read(path).unwrap();
+    let midpoint = encoded.len() / 2;
+    encoded[midpoint] ^= 0x40;
+    fs::write(path, encoded).unwrap();
+}
+
 fn read_all_files(root: &Path) -> Vec<(String, Vec<u8>)> {
     let mut entries = Vec::new();
     for entry in walkdir::WalkDir::new(root) {
@@ -192,6 +199,377 @@ fn packed_file_restores_to_identical_bytes() {
         .unwrap();
 
     assert_eq!(fs::read(restore.join("source.bin")).unwrap(), data);
+}
+
+#[test]
+fn full_integrity_check_authenticates_descriptors_manifests_chunks_and_whole_files() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    let data = (0..4096).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    write_file(&source, &data);
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 257,
+            staging_dir: staging.clone(),
+        },
+    )
+    .unwrap();
+
+    let report = catalog.verify_staged_integrity(&key).unwrap();
+    let expected_encoded_bytes = catalog
+        .remote_files_for_selection(&CatalogSelection::All, &key)
+        .unwrap()
+        .into_iter()
+        .map(|file| fs::metadata(staging.join(file.path)).unwrap().len())
+        .sum::<u64>();
+
+    assert_eq!(report.nodes_verified, 1);
+    assert_eq!(report.objects_verified, 1);
+    assert_eq!(report.chunks_verified, 16);
+    assert_eq!(report.original_bytes_verified, data.len() as u64);
+    assert_eq!(report.encoded_bytes_verified, expected_encoded_bytes);
+}
+
+#[test]
+fn full_integrity_check_rejects_authenticated_object_corruption() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    write_file(&source, b"integrity payload");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 4,
+            staging_dir: staging.clone(),
+        },
+    )
+    .unwrap();
+    let value = read_catalog_v2(&catalog, &key);
+    let chunk_path = value
+        .content_objects
+        .values()
+        .find_map(|object| match &object.storage {
+            StorageRef::V2(storage) => storage.chunks.first().map(|chunk| chunk.path.clone()),
+            StorageRef::Legacy(_) => None,
+        })
+        .unwrap();
+    tamper_file(&staging.join(chunk_path));
+
+    assert!(catalog.verify_staged_integrity(&key).is_err());
+}
+
+#[test]
+fn full_integrity_check_rejects_authenticated_manifest_corruption() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    write_file(&source, b"integrity payload");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 4,
+            staging_dir: staging.clone(),
+        },
+    )
+    .unwrap();
+    let value = read_catalog_v2(&catalog, &key);
+    let manifest_path = value
+        .content_objects
+        .values()
+        .find_map(|object| match &object.storage {
+            StorageRef::V2(storage) => Some(storage.manifest_path.clone()),
+            StorageRef::Legacy(_) => None,
+        })
+        .unwrap();
+    tamper_file(&staging.join(manifest_path));
+
+    assert!(catalog.verify_staged_integrity(&key).is_err());
+}
+
+#[test]
+fn full_integrity_check_rejects_authenticated_descriptor_corruption() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    write_file(&source, b"integrity payload");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 4,
+            staging_dir: staging.clone(),
+        },
+    )
+    .unwrap();
+    let value = read_catalog_v2(&catalog, &key);
+    let descriptor_path = staging
+        .join("recovery/nodes")
+        .join(format!("{}.enc", value.root_id));
+    tamper_file(&descriptor_path);
+
+    assert!(catalog.verify_staged_integrity(&key).is_err());
+}
+
+#[test]
+fn full_integrity_check_rejects_missing_native_v2_descriptor_hash() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    write_file(&source, b"integrity payload");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 4,
+            staging_dir: staging,
+        },
+    )
+    .unwrap();
+    let mut value = read_catalog_v2(&catalog, &key);
+    value
+        .nodes
+        .get_mut(&value.root_id.clone())
+        .unwrap()
+        .descriptor_encrypted_sha256 = None;
+    write_catalog_v2(&catalog, &key, &value);
+
+    assert!(catalog.verify_staged_integrity(&key).is_err());
+}
+
+#[test]
+fn full_integrity_check_authenticates_migrated_legacy_manifest() {
+    let tmp = tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto_v1");
+    let staging = tmp.path().join("staging");
+    let chunk_path = staging.join("objects/files/legacy-object/chunks/golden.lios");
+    let manifest_path = staging.join("objects/files/legacy-object/manifest.enc");
+    write_file(
+        &staging.join("catalog.enc"),
+        &fs::read(fixtures.join("legacy_catalog_v1.enc")).unwrap(),
+    );
+    write_file(
+        &chunk_path,
+        &fs::read(fixtures.join("legacy_chunk_v1.enc")).unwrap(),
+    );
+    let key = KeyFile::load_from_path(fixtures.join("legacy_v1.key")).unwrap();
+    let manifest = serde_json::json!({
+        "version": 1,
+        "object_id": "legacy-object",
+        "chunks": [{
+            "index": 0,
+            "path": "objects/files/legacy-object/chunks/golden.lios",
+            "original_size": 78,
+            "original_sha256": "c79c31459aceec53b672359d1fbb98381afee6e0d72c9c142e807bad6d07b0cb",
+            "encrypted_sha256": "41e43900b34eba5f8a06c54c8e3eed0a1b231bbfe600f0b3810b3045ea01ac4c"
+        }]
+    });
+    let encrypted_manifest = encrypt_envelope_v2(
+        &key,
+        EnvelopeKindV2::Manifest,
+        &serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    write_file(&manifest_path, &encrypted_manifest);
+    let catalog = Catalog::from_staging(staging);
+
+    let report = catalog.verify_staged_integrity(&key).unwrap();
+
+    assert_eq!(report.nodes_verified, 0);
+    assert_eq!(report.objects_verified, 1);
+    assert_eq!(report.chunks_verified, 1);
+    assert_eq!(
+        report.encoded_bytes_verified,
+        encrypted_manifest.len() as u64 + fs::metadata(chunk_path).unwrap().len()
+    );
+}
+
+#[test]
+fn full_integrity_check_rejects_migrated_legacy_manifest_mismatch() {
+    let tmp = tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto_v1");
+    let staging = tmp.path().join("staging");
+    write_file(
+        &staging.join("catalog.enc"),
+        &fs::read(fixtures.join("legacy_catalog_v1.enc")).unwrap(),
+    );
+    write_file(
+        &staging.join("objects/files/legacy-object/chunks/golden.lios"),
+        &fs::read(fixtures.join("legacy_chunk_v1.enc")).unwrap(),
+    );
+    let key = KeyFile::load_from_path(fixtures.join("legacy_v1.key")).unwrap();
+    let manifest = serde_json::json!({
+        "version": 1,
+        "object_id": "wrong-object",
+        "chunks": []
+    });
+    let encrypted_manifest = encrypt_envelope_v2(
+        &key,
+        EnvelopeKindV2::Manifest,
+        &serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    write_file(
+        &staging.join("objects/files/legacy-object/manifest.enc"),
+        &encrypted_manifest,
+    );
+    let catalog = Catalog::from_staging(staging);
+
+    assert!(catalog.verify_staged_integrity(&key).is_err());
+}
+
+#[test]
+fn full_integrity_check_rejects_linked_staging_ancestor() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    let staging = tmp.path().join("staging");
+    write_file(&source, b"integrity payload");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let catalog = Catalog::pack(
+        PackSource::Path(source),
+        &key,
+        PackOptions {
+            chunk_size: 4,
+            staging_dir: staging.clone(),
+        },
+    )
+    .unwrap();
+    let linked_target = tmp.path().join("linked-recovery");
+    fs::rename(staging.join("recovery"), &linked_target).unwrap();
+    create_directory_link(&linked_target, &staging.join("recovery"));
+
+    assert!(catalog.verify_staged_integrity(&key).is_err());
+}
+
+#[test]
+fn catalog_rejects_legacy_manifest_chunk_path_alias() {
+    let tmp = tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto_v1");
+    let staging = tmp.path().join("staging");
+    write_file(
+        &staging.join("catalog.enc"),
+        &fs::read(fixtures.join("legacy_catalog_v1.enc")).unwrap(),
+    );
+    let key = KeyFile::load_from_path(fixtures.join("legacy_v1.key")).unwrap();
+    let catalog = Catalog::from_staging(staging);
+    catalog
+        .create_folder("legacy-root", "migration-marker", &key)
+        .unwrap();
+    let mut value = read_catalog_v2(&catalog, &key);
+    let object = value.content_objects.get_mut("legacy-object").unwrap();
+    let StorageRef::Legacy(storage) = &mut object.storage else {
+        panic!("expected legacy storage");
+    };
+    storage.chunks[0].path = storage.manifest_path.clone();
+    write_catalog_v2(&catalog, &key, &value);
+
+    assert!(catalog.decrypt_tree(&key).is_err());
+}
+
+#[test]
+fn full_integrity_check_rejects_catalog_read_through_linked_staging_root() {
+    let tmp = tempdir().unwrap();
+    let real_staging = tmp.path().join("real-staging");
+    let linked_staging = tmp.path().join("linked-staging");
+    fs::create_dir_all(&real_staging).unwrap();
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let legacy_empty = serde_json::json!({
+        "version": 1,
+        "root": {
+            "id": "legacy-root",
+            "name": "legacy-root",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "kind": { "type": "Directory", "children": [] }
+        }
+    });
+    let encrypted_catalog = encrypt_envelope_v2(
+        &key,
+        EnvelopeKindV2::Catalog,
+        &serde_json::to_vec(&legacy_empty).unwrap(),
+    )
+    .unwrap();
+    write_file(&real_staging.join("catalog.enc"), &encrypted_catalog);
+    create_directory_link(&real_staging, &linked_staging);
+    let catalog = Catalog::from_staging(linked_staging);
+
+    assert!(catalog.verify_staged_integrity(&key).is_err());
+}
+
+#[test]
+fn catalog_rejects_windows_equivalent_paths_shared_by_distinct_legacy_objects() {
+    let tmp = tempdir().unwrap();
+    let staging = tmp.path().join("staging");
+    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
+    let shared_chunk = serde_json::json!({
+        "index": 0,
+        "path": "objects/files/shared/chunks/chunk.lios",
+        "original_size": 1,
+        "original_sha256": "source-sha",
+        "encrypted_sha256": "encoded-sha"
+    });
+    let shared_chunk_case_variant = serde_json::json!({
+        "index": 0,
+        "path": "objects/files/shared/chunks/CHUNK.lios",
+        "original_size": 1,
+        "original_sha256": "source-sha",
+        "encrypted_sha256": "encoded-sha"
+    });
+    let legacy_catalog = serde_json::json!({
+        "version": 1,
+        "root": {
+            "id": "legacy-root",
+            "name": "legacy-root",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "kind": {
+                "type": "Directory",
+                "children": [
+                    {
+                        "id": "file-a",
+                        "name": "a.bin",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "kind": {
+                            "type": "File",
+                            "original_size": 1,
+                            "sha256": "file-a-sha",
+                            "object_id": "object-a",
+                            "chunks": [shared_chunk.clone()]
+                        }
+                    },
+                    {
+                        "id": "file-b",
+                        "name": "b.bin",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "kind": {
+                            "type": "File",
+                            "original_size": 1,
+                            "sha256": "file-b-sha",
+                            "object_id": "object-b",
+                            "chunks": [shared_chunk_case_variant]
+                        }
+                    }
+                ]
+            }
+        }
+    });
+    let encrypted_catalog = encrypt_envelope_v2(
+        &key,
+        EnvelopeKindV2::Catalog,
+        &serde_json::to_vec(&legacy_catalog).unwrap(),
+    )
+    .unwrap();
+    write_file(&staging.join("catalog.enc"), &encrypted_catalog);
+    let catalog = Catalog::from_staging(staging);
+
+    assert!(catalog.decrypt_tree(&key).is_err());
 }
 
 #[test]
