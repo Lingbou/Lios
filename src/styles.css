@@ -829,7 +829,10 @@ select:focus {
   color: var(--pink-strong);
 }
 
-.taskRow.running .taskIcon svg {
+.taskRow.preparing .taskIcon svg,
+.taskRow.running .taskIcon svg,
+.taskRow.retrying .taskIcon svg,
+.taskRow.committing .taskIcon svg {
   animation: spin 1.2s linear infinite;
 }
 
