@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::atomic::write_atomic;
 use crate::crypto::KeyFile;
@@ -82,6 +83,26 @@ impl LiosPaths {
         fs::create_dir_all(&self.staging)?;
         Ok(())
     }
+
+    pub fn for_task(&self, account_id: &str, space_id: &str, task_id: Uuid) -> Result<Self> {
+        if !is_internal_scope_id(account_id) || !is_internal_scope_id(space_id) {
+            return Err(LiosError::InvalidTaskScopeId);
+        }
+        let mut paths = self.clone();
+        paths.staging = self
+            .staging
+            .join(account_id)
+            .join(space_id)
+            .join(task_id.to_string());
+        Ok(paths)
+    }
+}
+
+fn is_internal_scope_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 impl LiosConfig {

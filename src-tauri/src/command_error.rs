@@ -122,6 +122,9 @@ impl From<LiosError> for CommandError {
             LiosError::MissingFileName(path) | LiosError::InvalidRelativePath(path) => {
                 Self::invalid_input(path.display().to_string())
             }
+            LiosError::InvalidTaskScopeId => {
+                Self::invalid_input("invalid internal task scope identifier")
+            }
             LiosError::Unsupported(message) => Self::invalid_input(message),
             LiosError::Storage(message) => {
                 Self::new(CommandErrorCode::Storage, message, false, None)

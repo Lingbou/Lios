@@ -87,6 +87,8 @@ pub enum LiosError {
     MissingFileName(PathBuf),
     #[error("path is outside of expected root: {0}")]
     InvalidRelativePath(PathBuf),
+    #[error("invalid internal task scope identifier")]
+    InvalidTaskScopeId,
     #[error("storage error: {0}")]
     Storage(String),
     #[error("storage transaction error: {0}")]

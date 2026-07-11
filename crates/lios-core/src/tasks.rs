@@ -13,6 +13,7 @@ use crate::{LiosError, Result};
 
 const TASK_SCHEMA_VERSION: i64 = 1;
 const INVALID_TASK_SPEC_MESSAGE: &str = "persisted task specification is invalid";
+const DEFAULT_TASK_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskState {
@@ -69,6 +70,8 @@ pub enum TaskSpec {
         repo: RepoConfig,
         parent_node_id: String,
         source_paths: Vec<PathBuf>,
+        #[serde(default = "default_task_chunk_size")]
+        chunk_size: usize,
         conflict_resolutions: Vec<ConflictResolution>,
     },
     Delete {
@@ -475,6 +478,78 @@ impl TaskStore {
         spec.flatten()
             .map(|json| serde_json::from_str(&json).map_err(LiosError::from))
             .transpose()
+    }
+
+    pub fn list_queued_with_specs(&self) -> Result<Vec<(TaskRecord, TaskSpec)>> {
+        let mut queued = Vec::new();
+        for task in self
+            .list()?
+            .into_iter()
+            .filter(|task| task.state == TaskState::Queued)
+        {
+            if let Some(spec) = self.load_spec(task.id)? {
+                queued.push((task, spec));
+            }
+        }
+        Ok(queued)
+    }
+
+    pub fn claim_queued(&mut self, id: Uuid) -> Result<Option<TaskSpec>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row = transaction
+            .query_row(
+                "SELECT account_id, space_id, state, spec_json FROM tasks WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((account_id, space_id, state, spec_json)) = row else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if TaskState::from_str(&state)? != TaskState::Queued {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let Some(spec_json) = spec_json else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let spec: TaskSpec = serde_json::from_str(&spec_json)?;
+        if spec.account_id() != account_id || spec.space_id() != space_id {
+            return Err(LiosError::DataCorruption(
+                "persisted task ownership does not match its specification".to_string(),
+            ));
+        }
+        let changed = transaction.execute(
+            r#"
+            UPDATE tasks
+            SET state = ?2, phase = 'preparing', error = NULL, updated_at = ?3
+            WHERE id = ?1 AND state = ?4 AND spec_json IS NOT NULL
+            "#,
+            rusqlite::params![
+                id.to_string(),
+                TaskState::Preparing.as_str(),
+                now_timestamp(),
+                TaskState::Queued.as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(LiosError::DataCorruption(
+                "queued task could not be claimed atomically".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(Some(spec))
     }
 
     pub fn upsert_item(&self, item: &TaskItem) -> Result<()> {
@@ -909,6 +984,10 @@ impl TaskStore {
         }
         Ok(tasks)
     }
+
+    pub fn get(&self, id: Uuid) -> Result<Option<TaskRecord>> {
+        Ok(self.list()?.into_iter().find(|task| task.id == id))
+    }
 }
 
 fn migrate_task_store(connection: &mut rusqlite::Connection) -> Result<()> {
@@ -1086,4 +1165,8 @@ fn persisted_u64(value: i64, field: &str) -> Result<u64> {
 
 fn now_timestamp() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn default_task_chunk_size() -> usize {
+    DEFAULT_TASK_CHUNK_SIZE
 }

@@ -34,6 +34,32 @@ fn local_paths_follow_lios_layout() {
 }
 
 #[test]
+fn task_scoped_paths_are_nested_under_staging_and_reject_unsafe_ids() {
+    let tmp = tempdir().unwrap();
+    let paths = LiosPaths::from_home(tmp.path());
+    let task_id = Uuid::new_v4();
+    let account_id = "a".repeat(64);
+    let space_id = "b".repeat(64);
+
+    let scoped = paths.for_task(&account_id, &space_id, task_id).unwrap();
+    assert_eq!(
+        scoped.staging,
+        paths
+            .staging
+            .join(&account_id)
+            .join(&space_id)
+            .join(task_id.to_string())
+    );
+    assert_eq!(scoped.database, paths.database);
+    assert_eq!(scoped.config, paths.config);
+    assert!(paths.for_task("../account", &space_id, task_id).is_err());
+    assert!(paths
+        .for_task(&account_id.to_uppercase(), &space_id, task_id)
+        .is_err());
+    assert!(paths.for_task(&account_id, "short", task_id).is_err());
+}
+
+#[test]
 fn config_roundtrips_as_yaml_without_token_material() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("config.yaml");
@@ -383,6 +409,7 @@ fn task_store_persists_specs_items_checkpoints_and_content_index() {
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("album.bin")],
+        chunk_size: 128 * 1024 * 1024,
         conflict_resolutions: vec![ConflictResolution {
             source_path: tmp.path().join("album.bin").to_string_lossy().into_owned(),
             action: ConflictAction::KeepBoth,
@@ -436,6 +463,7 @@ fn task_store_persists_specs_items_checkpoints_and_content_index() {
             repo,
             parent_node_id,
             source_paths,
+            chunk_size,
             conflict_resolutions,
         } => {
             assert_eq!(account_id, "account-a");
@@ -445,6 +473,7 @@ fn task_store_persists_specs_items_checkpoints_and_content_index() {
             assert_eq!(repo.endpoint, "https://modelscope.cn");
             assert_eq!(parent_node_id, "root");
             assert_eq!(source_paths, vec![tmp.path().join("album.bin")]);
+            assert_eq!(chunk_size, 128 * 1024 * 1024);
             assert_eq!(conflict_resolutions.len(), 1);
             assert_eq!(conflict_resolutions[0].action, ConflictAction::KeepBoth);
         }
@@ -641,6 +670,7 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("source.bin")],
+        chunk_size: 128 * 1024 * 1024,
         conflict_resolutions: Vec::new(),
     };
     let replayable_states = [
@@ -882,4 +912,85 @@ fn task_store_rejects_out_of_range_writes_and_negative_persisted_numbers() {
         reopened.list_items(task.id).unwrap_err(),
         LiosError::DataCorruption(_)
     ));
+}
+
+#[test]
+fn task_store_lists_valid_queued_specs_and_claims_each_task_once() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let mut store = TaskStore::open(&db_path).unwrap();
+    let spec = TaskSpec::Delete {
+        account_id: "account-a".to_string(),
+        space_id: "novix/cold".to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let queued = TaskRecord::queued_for_spec(&spec);
+    store.insert_with_spec(&queued, &spec).unwrap();
+    let completed = TaskRecord::queued_for_spec(&spec);
+    store.insert_with_spec(&completed, &spec).unwrap();
+    store
+        .update_state(completed.id, TaskState::Completed, None)
+        .unwrap();
+    let legacy = TaskRecord::queued("legacy", 0);
+    store.insert(&legacy).unwrap();
+    let runnable = store.list_queued_with_specs().unwrap();
+    assert_eq!(runnable.len(), 1);
+    assert_eq!(runnable[0].0.id, queued.id);
+    assert_eq!(runnable[0].1.space_id(), "novix/cold");
+
+    let malformed = TaskRecord::queued_for_spec(&spec);
+    store.insert_with_spec(&malformed, &spec).unwrap();
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET spec_json = '{broken' WHERE id = ?1",
+            rusqlite::params![malformed.id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let claimed_spec = store.claim_queued(queued.id).unwrap().unwrap();
+    assert_eq!(claimed_spec.space_id(), "novix/cold");
+    let mut second_connection = TaskStore::open(&db_path).unwrap();
+    assert!(second_connection.claim_queued(queued.id).unwrap().is_none());
+    assert!(second_connection.claim_queued(legacy.id).unwrap().is_none());
+    assert!(matches!(
+        second_connection.claim_queued(malformed.id).unwrap_err(),
+        LiosError::Json(_)
+    ));
+    assert_eq!(
+        second_connection.get(malformed.id).unwrap().unwrap().state,
+        TaskState::Queued
+    );
+    let claimed = second_connection.get(queued.id).unwrap().unwrap();
+    assert_eq!(claimed.state, TaskState::Preparing);
+    assert_eq!(claimed.phase.as_deref(), Some("preparing"));
+}
+
+#[test]
+fn legacy_upload_task_spec_defaults_to_128mb_chunks() {
+    let spec: TaskSpec = serde_json::from_value(serde_json::json!({
+        "kind": "upload",
+        "account_id": "account-a",
+        "space_id": "novix/cold",
+        "repo": {
+            "namespace": "novix",
+            "dataset": "cold",
+            "endpoint": "https://modelscope.cn"
+        },
+        "parent_node_id": "root",
+        "source_paths": ["C:\\source.bin"],
+        "conflict_resolutions": []
+    }))
+    .unwrap();
+
+    let TaskSpec::Upload { chunk_size, .. } = spec else {
+        panic!("expected upload task spec");
+    };
+    assert_eq!(chunk_size, 128 * 1024 * 1024);
 }
