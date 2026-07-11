@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  taskCompletionReloadsCatalog,
   taskItemProgressPercent,
   taskItemStatusText,
+  taskLabelText,
   taskProgressPercent,
   taskProgressText,
   taskStatusText
@@ -118,5 +120,41 @@ test("verification preparing status is not described as file packing", () => {
       progress_done: 0
     }),
     "正在准备空间检查"
+  );
+});
+
+test("catalog rebuild statuses describe recovery work", () => {
+  const task = {
+    state: "Preparing",
+    label: "rebuild",
+    phase: null,
+    progress_total: 0,
+    progress_done: 0
+  } as const;
+
+  assert.equal(taskStatusText(task), "正在准备目录重建");
+  assert.equal(
+    taskStatusText({ ...task, state: "Running", phase: "downloading_recovery_metadata" }),
+    "正在下载恢复元数据"
+  );
+  assert.equal(
+    taskStatusText({ ...task, state: "Running", phase: "rebuilding_catalog" }),
+    "正在重建目录索引"
+  );
+});
+
+test("catalog rebuild uses a recovery label and reloads only on its completion transition", () => {
+  assert.equal(taskLabelText("rebuild"), "目录恢复");
+  assert.equal(
+    taskCompletionReloadsCatalog("Running", { state: "Completed", label: "rebuild" }),
+    true
+  );
+  assert.equal(
+    taskCompletionReloadsCatalog("Completed", { state: "Completed", label: "rebuild" }),
+    false
+  );
+  assert.equal(
+    taskCompletionReloadsCatalog(undefined, { state: "Completed", label: "rebuild" }),
+    false
   );
 });

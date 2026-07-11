@@ -22,9 +22,10 @@ use command_surface::with_registered_commands;
 use download_service::prepare_download_task;
 use lios_core::cache::{cleanup_temporary_staging, prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
-    Catalog, CatalogIntegrityOutcome, CatalogRemoteFile, CatalogRemoteIntegrityReport,
-    CatalogSelection, CatalogTreeNode, ConflictAction, ConflictResolution, DriveItem,
-    SourceFileSnapshot, SourceSnapshotReport, UploadConflict, CATALOG_FILE,
+    Catalog, CatalogIntegrityOutcome, CatalogRebuildOutcome, CatalogRebuildReport,
+    CatalogRemoteFile, CatalogRemoteIntegrityReport, CatalogSelection, CatalogTreeNode,
+    ConflictAction, ConflictResolution, DriveItem, SourceFileSnapshot, SourceSnapshotReport,
+    UploadConflict, CATALOG_FILE,
 };
 use lios_core::catalog_transaction::{
     execute_catalog_transaction, probe_catalog_sha256, CatalogBlobCheckpointState,
@@ -120,6 +121,14 @@ struct CatalogLoadResult {
 }
 
 #[derive(Serialize)]
+struct CatalogRebuildPreviewResult {
+    revision: String,
+    tree: CatalogTreeNode,
+    report: CatalogRebuildReport,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct DatasetRepoListResult {
     user: ModelScopeUserSummary,
     repositories: Vec<DatasetRepoSummary>,
@@ -131,6 +140,7 @@ struct SyncWork {
     initial_remote_inventory: Vec<StorageObject>,
     prepublish_safe_paths: HashSet<String>,
     base_catalog_sha256: Option<String>,
+    expected_revision: Option<RepoRevision>,
     probe_directory: PathBuf,
 }
 
@@ -736,15 +746,15 @@ async fn clear_task_record(
         return Err(CommandError::invalid_input("active task cannot be cleared"));
     }
     if let Some(spec) = store.load_spec(task_id).map_err(to_err)? {
-        if matches!(spec, TaskSpec::VerifySpace { .. }) {
+        if let Some(cleanup_label) = terminal_staging_cleanup_label(&spec) {
             let task_paths = paths
                 .for_task(spec.account_id(), spec.space_id(), task_id)
                 .map_err(to_err)?;
-            if let Err(error) = cleanup_terminal_verification_staging(&task_paths, &spec, task_id) {
+            if let Err(error) = cleanup_terminal_task_staging(&task_paths, &spec, task_id) {
                 append_task_warning(
                     &task_paths,
                     task_id,
-                    &format!("verification staging cleanup failed: {}", error.message),
+                    &format!("{cleanup_label} staging cleanup failed: {}", error.message),
                 )?;
                 return Err(error);
             }
@@ -779,12 +789,20 @@ fn task_state_is_active(state: &TaskState) -> bool {
     }
 }
 
-fn cleanup_terminal_verification_staging(
+fn terminal_staging_cleanup_label(spec: &TaskSpec) -> Option<&'static str> {
+    match spec {
+        TaskSpec::VerifySpace { .. } => Some("verification"),
+        TaskSpec::RebuildCatalog { .. } => Some("catalog rebuild"),
+        TaskSpec::Upload { .. } | TaskSpec::Delete { .. } | TaskSpec::Download { .. } => None,
+    }
+}
+
+fn cleanup_terminal_task_staging(
     paths: &LiosPaths,
     spec: &TaskSpec,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    if !matches!(spec, TaskSpec::VerifySpace { .. }) {
+    if terminal_staging_cleanup_label(spec).is_none() {
         return Ok(());
     }
     let Some(task) = task_store(paths)?.get(task_id).map_err(to_err)? else {
@@ -793,20 +811,32 @@ fn cleanup_terminal_verification_staging(
     if task_state_is_active(&task.state) || !paths.staging.exists() {
         return Ok(());
     }
+    remove_scoped_staging_directory(paths, spec.account_id(), spec.space_id(), task_id)
+}
+
+fn remove_scoped_staging_directory(
+    paths: &LiosPaths,
+    account_id: &str,
+    space_id: &str,
+    scope_id: Uuid,
+) -> CommandResult<()> {
+    if !paths.staging.exists() {
+        return Ok(());
+    }
     let expected_staging = paths
         .home
         .join("staging")
-        .join(spec.account_id())
-        .join(spec.space_id())
-        .join(task_id.to_string());
+        .join(account_id)
+        .join(space_id)
+        .join(scope_id.to_string());
     if paths.staging != expected_staging {
         return Err(CommandError::invalid_input(
-            "refusing to clear an unexpected verification staging path",
+            "refusing to clear an unexpected task staging path",
         ));
     }
     let staging_root = paths.home.join("staging");
-    let account_dir = staging_root.join(spec.account_id());
-    let space_dir = account_dir.join(spec.space_id());
+    let account_dir = staging_root.join(account_id);
+    let space_dir = account_dir.join(space_id);
     for directory in [
         paths.home.as_path(),
         staging_root.as_path(),
@@ -821,7 +851,7 @@ fn cleanup_terminal_verification_staging(
         };
         if !metadata.is_dir() || metadata_is_link_or_junction(&metadata) {
             return Err(CommandError::invalid_input(
-                "refusing to clear verification staging through a link or junction",
+                "refusing to clear task staging through a link or junction",
             ));
         }
     }
@@ -847,22 +877,25 @@ fn append_task_warning(paths: &LiosPaths, task_id: Uuid, warning: &str) -> Comma
         .map_err(to_err)
 }
 
-fn cleanup_terminal_verification_staging_and_record(
+fn cleanup_terminal_task_staging_and_record(
     paths: &LiosPaths,
     spec: &TaskSpec,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    if let Err(error) = cleanup_terminal_verification_staging(paths, spec, task_id) {
+    let Some(cleanup_label) = terminal_staging_cleanup_label(spec) else {
+        return Ok(());
+    };
+    if let Err(error) = cleanup_terminal_task_staging(paths, spec, task_id) {
         append_task_warning(
             paths,
             task_id,
-            &format!("verification staging cleanup failed: {}", error.message),
+            &format!("{cleanup_label} staging cleanup failed: {}", error.message),
         )?;
     }
     Ok(())
 }
 
-fn cleanup_terminal_verification_staging_after_restart(paths: &LiosPaths) -> lios_core::Result<()> {
+fn cleanup_terminal_task_staging_after_restart(paths: &LiosPaths) -> lios_core::Result<()> {
     let store = TaskStore::open(&paths.database)?;
     for task in store.list()? {
         if task_state_is_active(&task.state) {
@@ -871,33 +904,33 @@ fn cleanup_terminal_verification_staging_after_restart(paths: &LiosPaths) -> lio
         let Some(spec) = store.load_spec(task.id)? else {
             continue;
         };
-        if !matches!(spec, TaskSpec::VerifySpace { .. }) {
+        if terminal_staging_cleanup_label(&spec).is_none() {
             continue;
         }
         let task_paths = paths.for_task(spec.account_id(), spec.space_id(), task.id)?;
-        cleanup_terminal_verification_staging_and_record(&task_paths, &spec, task.id)
+        cleanup_terminal_task_staging_and_record(&task_paths, &spec, task.id)
             .map_err(|error| lios_core::LiosError::Storage(error.message))?;
     }
     Ok(())
 }
 
-async fn cleanup_terminal_verification_staging_after_restart_async(
+async fn cleanup_terminal_task_staging_after_restart_async(
     paths: LiosPaths,
 ) -> lios_core::Result<()> {
-    tokio::task::spawn_blocking(move || cleanup_terminal_verification_staging_after_restart(&paths))
+    tokio::task::spawn_blocking(move || cleanup_terminal_task_staging_after_restart(&paths))
         .await
         .map_err(|error| {
             lios_core::LiosError::Storage(format!(
-                "verification staging cleanup worker failed: {error}"
+                "terminal task staging cleanup worker failed: {error}"
             ))
         })?
 }
 
-fn start_terminal_verification_staging_cleanup(app: &tauri::AppHandle, paths: &LiosPaths) {
+fn start_terminal_task_staging_cleanup(app: &tauri::AppHandle, paths: &LiosPaths) {
     let app = app.clone();
     let paths = paths.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = cleanup_terminal_verification_staging_after_restart_async(paths.clone()).await;
+        let _ = cleanup_terminal_task_staging_after_restart_async(paths.clone()).await;
         emit_tasks(&app, &paths);
     });
 }
@@ -1732,8 +1765,7 @@ async fn run_persisted_task_locked(
     }
     .await;
     manager.remove(&control).await;
-    let staging_cleanup =
-        cleanup_terminal_verification_staging_and_record(&task_paths, &spec, task_id);
+    let staging_cleanup = cleanup_terminal_task_staging_and_record(&task_paths, &spec, task_id);
     emit_tasks(&app, &paths);
     match finalization {
         Ok(()) => staging_cleanup,
@@ -1890,12 +1922,14 @@ async fn execute_task_spec(
         TaskSpec::VerifySpace { repo, full, .. } => {
             run_verify_space_worker(app, paths, task, repo, full, cancellation).await
         }
-        TaskSpec::RebuildCatalog { .. } => Err(CommandError::new(
-            CommandErrorCode::InvalidInput,
-            "task type is not implemented yet",
-            false,
-            None,
-        )),
+        TaskSpec::RebuildCatalog {
+            repo,
+            expected_revision,
+            ..
+        } => {
+            run_rebuild_catalog_worker(app, paths, task, repo, expected_revision, cancellation)
+                .await
+        }
     }
 }
 
@@ -2326,6 +2360,257 @@ fn remote_integrity_warnings(
         ));
     }
     warnings
+}
+
+fn recovery_metadata_objects(
+    remote_objects: &[StorageObject],
+) -> CommandResult<Vec<StorageObject>> {
+    let mut selected = remote_objects
+        .iter()
+        .filter(|object| {
+            object.path.starts_with("recovery/nodes/")
+                || (object.path.starts_with("objects/files/")
+                    && object.path.ends_with("/manifest.enc"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(selected)
+}
+
+fn validate_rebuild_revision(
+    expected_revision: Option<&str>,
+    current: &RepoRevision,
+) -> CommandResult<String> {
+    let expected = expected_revision
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty())
+        .ok_or_else(|| {
+            CommandError::invalid_input("catalog rebuild requires a confirmed preview")
+        })?;
+    let current_commit = verification_commit_id(current)?;
+    if expected != current_commit {
+        return Err(CommandError::new(
+            CommandErrorCode::RemoteConflict,
+            "remote space changed after the rebuild preview",
+            false,
+            Some(serde_json::json!({
+                "preview_revision": expected,
+                "current_revision": current_commit,
+            })),
+        ));
+    }
+    Ok(expected.to_string())
+}
+
+fn plan_catalog_rebuild_sync(
+    paths: &LiosPaths,
+    catalog: &Catalog,
+    key: &KeyFile,
+    remote_objects: Vec<StorageObject>,
+    expected_revision: RepoRevision,
+) -> CommandResult<SyncWork> {
+    let mut work = plan_catalog_sync(
+        paths,
+        catalog,
+        key,
+        CatalogBaseline {
+            catalog_sha256: None,
+            referenced_paths: HashSet::new(),
+            remote_objects,
+        },
+    )?;
+    work.delete.clear();
+    work.expected_revision = Some(expected_revision);
+    Ok(work)
+}
+
+fn catalog_rebuild_warnings(report: &CatalogRebuildReport) -> Vec<String> {
+    if report.unreferenced_managed_objects == 0 {
+        Vec::new()
+    } else {
+        vec![format!(
+            "发现 {} 个未被重建 catalog 引用的远端对象，未执行删除",
+            report.unreferenced_managed_objects
+        )]
+    }
+}
+
+fn discard_staged_catalog_for_rebuild(paths: &LiosPaths) -> CommandResult<()> {
+    let catalog_path = paths.staging.join(CATALOG_FILE);
+    let metadata = match fs::symlink_metadata(&catalog_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(to_err(error)),
+    };
+    if !metadata.is_file() || metadata_is_link_or_junction(&metadata) {
+        return Err(CommandError::new(
+            CommandErrorCode::CorruptedData,
+            "staged catalog rebuild output is not a regular file",
+            false,
+            Some(serde_json::json!({ "path": CATALOG_FILE })),
+        ));
+    }
+    fs::remove_file(catalog_path).map_err(to_err)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_recovery_metadata(
+    adapter: &ModelScopeAdapter,
+    repo: &RepoConfig,
+    remote_objects: &[StorageObject],
+    staging_dir: &Path,
+    cancellation: &CancellationToken,
+    mut on_progress: impl FnMut(u64, u64, u64, u64) -> CommandResult<()>,
+) -> CommandResult<bool> {
+    let metadata_objects = recovery_metadata_objects(remote_objects)?;
+    let total_objects = u64::try_from(metadata_objects.len()).map_err(|_| {
+        CommandError::new(
+            CommandErrorCode::CorruptedData,
+            "recovery metadata object count overflowed",
+            false,
+            None,
+        )
+    })?;
+    let total_bytes = metadata_objects.iter().try_fold(0u64, |total, object| {
+        total.checked_add(object.size).ok_or_else(|| {
+            CommandError::new(
+                CommandErrorCode::CorruptedData,
+                "recovery metadata byte count overflowed",
+                false,
+                None,
+            )
+        })
+    })?;
+    let mut completed_objects = 0u64;
+    let mut completed_bytes = 0u64;
+    on_progress(0, total_objects, 0, total_bytes)?;
+    for object in metadata_objects {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let local_path = remote_to_staging_path(staging_dir, &object.path)?;
+        let expected = CatalogRemoteFile {
+            path: object.path.clone(),
+            expected_size: Some(object.size),
+            sha256: object.sha256.clone(),
+        };
+        let completed_before_object = completed_bytes;
+        let mut progress_error = None;
+        let download = adapter.download_object_with_progress(
+            &repo.namespace,
+            &repo.dataset,
+            &object.path,
+            &local_path,
+            |object_bytes| {
+                if progress_error.is_none() {
+                    let bytes_done = completed_before_object.saturating_add(object_bytes);
+                    if let Err(error) =
+                        on_progress(completed_objects, total_objects, bytes_done, total_bytes)
+                    {
+                        progress_error = Some(error);
+                    }
+                }
+            },
+        );
+        tokio::select! {
+            result = download => result.map_err(to_err)?,
+            _ = cancellation.cancelled() => return Ok(false),
+        }
+        if let Some(error) = progress_error {
+            return Err(error);
+        }
+        match validate_local_remote_file(&local_path, &expected, cancellation).await? {
+            LocalRemoteFileValidation::Valid => {}
+            LocalRemoteFileValidation::Invalid => {
+                return Err(CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    format!("downloaded recovery metadata is invalid: {}", object.path),
+                    false,
+                    Some(serde_json::json!({ "path": object.path })),
+                ))
+            }
+            LocalRemoteFileValidation::Canceled => return Ok(false),
+        }
+        completed_objects = completed_objects.checked_add(1).ok_or_else(|| {
+            CommandError::new(
+                CommandErrorCode::CorruptedData,
+                "recovery metadata progress overflowed",
+                false,
+                None,
+            )
+        })?;
+        completed_bytes = completed_bytes.checked_add(object.size).ok_or_else(|| {
+            CommandError::new(
+                CommandErrorCode::CorruptedData,
+                "recovery metadata byte progress overflowed",
+                false,
+                None,
+            )
+        })?;
+        on_progress(
+            completed_objects,
+            total_objects,
+            completed_bytes,
+            total_bytes,
+        )?;
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_catalog_rebuild_snapshot(
+    adapter: &ModelScopeAdapter,
+    repo: &RepoConfig,
+    key: &KeyFile,
+    paths: &LiosPaths,
+    remote_objects: Vec<StorageObject>,
+    cancellation: &CancellationToken,
+    on_progress: impl FnMut(u64, u64, u64, u64) -> CommandResult<()>,
+) -> CommandResult<Option<(Catalog, CatalogRebuildReport)>> {
+    if !download_recovery_metadata(
+        adapter,
+        repo,
+        &remote_objects,
+        &paths.staging,
+        cancellation,
+        on_progress,
+    )
+    .await?
+    {
+        return Ok(None);
+    }
+    rebuild_staged_catalog(key, paths, remote_objects, cancellation).await
+}
+
+async fn rebuild_staged_catalog(
+    key: &KeyFile,
+    paths: &LiosPaths,
+    remote_objects: Vec<StorageObject>,
+    cancellation: &CancellationToken,
+) -> CommandResult<Option<(Catalog, CatalogRebuildReport)>> {
+    let staging_dir = paths.staging.clone();
+    let key = key.clone();
+    let cancellation = cancellation.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        Catalog::rebuild_from_recovery_with_cancel(&key, staging_dir, &remote_objects, || {
+            cancellation.is_cancelled()
+        })
+    })
+    .await
+    .map_err(|error| {
+        CommandError::new(
+            CommandErrorCode::Internal,
+            format!("catalog rebuild worker failed: {error}"),
+            false,
+            None,
+        )
+    })?
+    .map_err(to_err)?;
+    match outcome {
+        CatalogRebuildOutcome::Completed { catalog, report } => Ok(Some((catalog, report))),
+        CatalogRebuildOutcome::Canceled => Ok(None),
+    }
 }
 
 fn map_remote_integrity_error(error: lios_core::LiosError) -> CommandError {
@@ -2804,6 +3089,191 @@ async fn run_verify_space_worker(
     })
 }
 
+async fn run_rebuild_catalog_worker(
+    app: &tauri::AppHandle,
+    paths: &LiosPaths,
+    mut task: TaskRecord,
+    repo: RepoConfig,
+    expected_revision: Option<String>,
+    cancellation: &CancellationToken,
+) -> CommandResult<TaskWorkerOutcome> {
+    let config = load_config(paths)?;
+    let key = key_from_config(&config)?;
+    let repo = validate_repo(repo)?;
+    let branch_adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(paths)?);
+    let Some(started_revision) =
+        head_revision_with_cancellation(&branch_adapter, &repo, cancellation).await?
+    else {
+        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+            .map_err(to_err)?
+            .unwrap_or(TaskState::Canceled);
+        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+    };
+    let pinned_revision =
+        validate_rebuild_revision(expected_revision.as_deref(), &started_revision)?;
+    let adapter = branch_adapter.clone().with_revision(pinned_revision);
+    let remote_objects = tokio::select! {
+        result = adapter.list_objects(&repo.namespace, &repo.dataset, "") => {
+            result.map_err(to_err)?
+        }
+        _ = cancellation.cancelled() => {
+            let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+                .map_err(to_err)?
+                .unwrap_or(TaskState::Canceled);
+            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+        }
+    };
+    if remote_objects
+        .iter()
+        .any(|object| object.path == CATALOG_FILE)
+    {
+        return Err(CommandError::already_initialized(
+            "remote catalog already exists; rebuild was not published",
+        ));
+    }
+    discard_staged_catalog_for_rebuild(paths)?;
+
+    update_task_state(paths, task.id, TaskState::Running, None)?;
+    update_task_phase(
+        paths,
+        task.id,
+        Some("downloading_recovery_metadata".to_string()),
+    )?;
+    task.state = TaskState::Running;
+    task.phase = Some("downloading_recovery_metadata".to_string());
+    let mut download_metrics = TransferMetrics::new();
+    let downloaded = download_recovery_metadata(
+        &adapter,
+        &repo,
+        &remote_objects,
+        &paths.staging,
+        cancellation,
+        |done, total, bytes_done, bytes_total| {
+            let total_steps = total.checked_add(2).ok_or_else(|| {
+                CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    "catalog rebuild progress overflowed",
+                    false,
+                    None,
+                )
+            })?;
+            let observation = download_metrics.observe(bytes_done, bytes_total, done == total);
+            if observation.should_publish || done == total {
+                update_task_transfer(
+                    paths,
+                    task.id,
+                    TaskTransferUpdate {
+                        done,
+                        total: total_steps,
+                        bytes_done,
+                        bytes_total,
+                        speed_bps: observation.speed_bps,
+                        eta_seconds: observation.eta_seconds,
+                    },
+                )?;
+                emit_tasks(app, paths);
+            }
+            task.progress_done = done;
+            task.progress_total = total_steps;
+            task.bytes_done = bytes_done;
+            task.bytes_total = bytes_total;
+            Ok(())
+        },
+    )
+    .await?;
+    if !downloaded {
+        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+            .map_err(to_err)?
+            .unwrap_or(TaskState::Canceled);
+        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+    }
+
+    update_task_phase(paths, task.id, Some("rebuilding_catalog".to_string()))?;
+    task.phase = Some("rebuilding_catalog".to_string());
+    update_task_transfer(
+        paths,
+        task.id,
+        TaskTransferUpdate {
+            done: task.progress_total.saturating_sub(2),
+            total: task.progress_total,
+            bytes_done: task.bytes_total,
+            bytes_total: task.bytes_total,
+            speed_bps: 0,
+            eta_seconds: None,
+        },
+    )?;
+    emit_tasks(app, paths);
+    let Some((catalog, report)) =
+        rebuild_staged_catalog(&key, paths, remote_objects.clone(), cancellation).await?
+    else {
+        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+            .map_err(to_err)?
+            .unwrap_or(TaskState::Canceled);
+        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+    };
+    task.progress_done = task.progress_total.saturating_sub(1);
+    update_task_transfer(
+        paths,
+        task.id,
+        TaskTransferUpdate {
+            done: task.progress_done,
+            total: task.progress_total,
+            bytes_done: task.bytes_total,
+            bytes_total: task.bytes_total,
+            speed_bps: 0,
+            eta_seconds: None,
+        },
+    )?;
+    emit_tasks(app, paths);
+    if !ensure_verification_snapshot_is_current(
+        &branch_adapter,
+        &repo,
+        &started_revision,
+        cancellation,
+    )
+    .await?
+    {
+        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
+            .map_err(to_err)?
+            .unwrap_or(TaskState::Canceled);
+        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
+    }
+
+    let work = plan_catalog_rebuild_sync(paths, &catalog, &key, remote_objects, started_revision)?;
+    persist_sync_checkpoints(paths, task.id, &work)?;
+    let mut transaction_metrics = TransferMetrics::new();
+    let task_id = task.id;
+    let mut interrupted_state = None;
+    let outcome = execute_sync_work(
+        &branch_adapter,
+        &repo,
+        work,
+        || {
+            interrupted_state = observed_task_interrupt(paths, task_id, cancellation)?;
+            Ok(interrupted_state.is_some())
+        },
+        |progress| {
+            persist_transaction_progress(
+                paths,
+                Some(app),
+                &mut task,
+                &mut transaction_metrics,
+                progress,
+            )
+        },
+    )
+    .await?;
+    match outcome {
+        CatalogTransactionOutcome::Completed { mut warnings } => {
+            warnings.extend(catalog_rebuild_warnings(&report));
+            Ok(TaskWorkerOutcome::Committed { warnings })
+        }
+        CatalogTransactionOutcome::Canceled => Ok(TaskWorkerOutcome::Interrupted(
+            interrupted_state.unwrap_or(TaskState::Canceled),
+        )),
+    }
+}
+
 fn desired_catalog_objects(
     paths: &LiosPaths,
     catalog: &Catalog,
@@ -2911,6 +3381,7 @@ fn plan_catalog_sync_with_baseline(
         initial_remote_inventory: baseline.remote_objects,
         prepublish_safe_paths,
         base_catalog_sha256: baseline.catalog_sha256,
+        expected_revision: None,
         probe_directory,
     })
 }
@@ -3006,6 +3477,7 @@ where
             initial_remote_inventory: work.initial_remote_inventory,
             prepublish_safe_paths: work.prepublish_safe_paths,
             base_catalog_sha256: work.base_catalog_sha256,
+            expected_revision: work.expected_revision,
             probe_directory: work.probe_directory,
         },
         should_cancel,
@@ -3483,6 +3955,122 @@ async fn enqueue_verify_space(
 }
 
 #[tauri::command]
+async fn preview_rebuild_catalog(
+    state: tauri::State<'_, AppContext>,
+    space: RepoConfig,
+) -> CommandResult<CatalogRebuildPreviewResult> {
+    let config = load_config(&state.paths)?;
+    let key = key_from_config(&config)?;
+    let repo = validate_repo(space)?;
+    let scope = TaskScope::from_repo(&repo);
+    let _space_permit = state
+        .task_manager
+        .acquire_space(scope.space_id.clone())
+        .await;
+    let branch_adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(&state.paths)?);
+    let cancellation = CancellationToken::new();
+    let started_revision = head_revision_with_cancellation(&branch_adapter, &repo, &cancellation)
+        .await?
+        .ok_or_else(|| CommandError::invalid_input("catalog rebuild preview was canceled"))?;
+    let revision = verification_commit_id(&started_revision)?.to_string();
+    let adapter = branch_adapter.clone().with_revision(revision.clone());
+    let remote_objects = adapter
+        .list_objects(&repo.namespace, &repo.dataset, "")
+        .await
+        .map_err(to_err)?;
+    if remote_objects
+        .iter()
+        .any(|object| object.path == CATALOG_FILE)
+    {
+        return Err(CommandError::already_initialized(
+            "remote catalog still exists; rebuild preview is only available for a missing catalog",
+        ));
+    }
+
+    let preview_id = Uuid::new_v4();
+    let preview_paths = state
+        .paths
+        .for_task(&scope.account_id, &scope.space_id, preview_id)
+        .map_err(to_err)?;
+    preview_paths.ensure_dirs().map_err(to_err)?;
+    let operation = async {
+        let rebuilt = build_catalog_rebuild_snapshot(
+            &adapter,
+            &repo,
+            &key,
+            &preview_paths,
+            remote_objects,
+            &cancellation,
+            |_done, _total, _bytes_done, _bytes_total| Ok(()),
+        )
+        .await?
+        .ok_or_else(|| CommandError::invalid_input("catalog rebuild preview was canceled"))?;
+        ensure_verification_snapshot_is_current(
+            &branch_adapter,
+            &repo,
+            &started_revision,
+            &cancellation,
+        )
+        .await?
+        .then_some(())
+        .ok_or_else(|| CommandError::invalid_input("catalog rebuild preview was canceled"))?;
+        let (catalog, report) = rebuilt;
+        let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
+        let warnings = catalog_rebuild_warnings(&report);
+        Ok(CatalogRebuildPreviewResult {
+            revision,
+            tree,
+            report,
+            warnings,
+        })
+    }
+    .await;
+    let cleanup = remove_scoped_staging_directory(
+        &preview_paths,
+        &scope.account_id,
+        &scope.space_id,
+        preview_id,
+    );
+    match operation {
+        Ok(preview) => {
+            cleanup?;
+            Ok(preview)
+        }
+        Err(error) => {
+            let _ = cleanup;
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+async fn enqueue_rebuild_catalog(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppContext>,
+    space: RepoConfig,
+    expected_revision: String,
+) -> CommandResult<TaskRecord> {
+    let config = load_config(&state.paths)?;
+    key_from_config(&config)?;
+    read_token(&state.paths)?;
+    let repo = validate_repo(space)?;
+    let expected_revision = expected_revision.trim();
+    if expected_revision.is_empty() {
+        return Err(CommandError::invalid_input(
+            "catalog rebuild requires a confirmed preview revision",
+        ));
+    }
+    let scope = TaskScope::from_repo(&repo);
+    let spec = TaskSpec::RebuildCatalog {
+        account_id: scope.account_id,
+        space_id: scope.space_id,
+        repo,
+        expected_revision: Some(expected_revision.to_string()),
+    };
+    submit_and_spawn(&app, state.inner(), spec, &[])
+}
+
+#[tauri::command]
 fn list_tasks(state: tauri::State<'_, AppContext>) -> CommandResult<Vec<TaskRecord>> {
     task_store(&state.paths)?.list().map_err(to_err)
 }
@@ -3628,7 +4216,7 @@ pub fn run() {
             let handle = app.handle().clone();
             let paths = app.state::<AppContext>().paths.clone();
             let recovery = recover_startup_tasks(&paths)?;
-            start_terminal_verification_staging_cleanup(&handle, &paths);
+            start_terminal_task_staging_cleanup(&handle, &paths);
             emit_tasks(&handle, &paths);
             start_startup_tasks(&handle, &paths, recovery)?;
             Ok(())
@@ -3798,6 +4386,7 @@ mod task_checkpoint_tests {
             initial_remote_inventory: Vec::new(),
             prepublish_safe_paths: HashSet::new(),
             base_catalog_sha256: Some("a".repeat(64)),
+            expected_revision: None,
             probe_directory: paths.staging.clone(),
         };
 
@@ -4493,9 +5082,9 @@ mod remote_verification_tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        append_task_warning, cleanup_terminal_verification_staging,
-        cleanup_terminal_verification_staging_after_restart_async,
-        cleanup_terminal_verification_staging_and_record, clear_task_record,
+        append_task_warning, cleanup_terminal_task_staging,
+        cleanup_terminal_task_staging_after_restart_async,
+        cleanup_terminal_task_staging_and_record, clear_task_record,
         ensure_verification_revision_unchanged, head_revision_with_cancellation,
         map_remote_integrity_error, validate_local_remote_file, verification_commit_id,
         CommandErrorCode, LocalRemoteFileValidation, TaskLifecycleState,
@@ -4511,6 +5100,19 @@ mod remote_verification_tests {
                 endpoint: "https://modelscope.cn".to_string(),
             },
             full: true,
+        }
+    }
+
+    fn rebuild_spec() -> TaskSpec {
+        TaskSpec::RebuildCatalog {
+            account_id: "a".repeat(64),
+            space_id: "b".repeat(64),
+            repo: RepoConfig {
+                namespace: "novix".to_string(),
+                dataset: "cold".to_string(),
+                endpoint: "https://modelscope.cn".to_string(),
+            },
+            expected_revision: Some("preview-revision".to_string()),
         }
     }
 
@@ -4583,7 +5185,35 @@ mod remote_verification_tests {
             task_paths.ensure_dirs().unwrap();
             fs::write(task_paths.staging.join("cached.lios"), b"cached").unwrap();
 
-            cleanup_terminal_verification_staging(&task_paths, &spec, task.id).unwrap();
+            cleanup_terminal_task_staging(&task_paths, &spec, task.id).unwrap();
+
+            assert_eq!(task_paths.staging.exists(), should_exist);
+        }
+    }
+
+    #[test]
+    fn terminal_rebuild_discards_staging_but_paused_rebuild_keeps_it() {
+        for (state, should_exist) in [
+            (TaskState::Completed, false),
+            (TaskState::Failed, false),
+            (TaskState::Canceled, false),
+            (TaskState::Paused, true),
+            (TaskState::Retrying, true),
+        ] {
+            let temp = tempdir().unwrap();
+            let paths = LiosPaths::from_home(temp.path());
+            let spec = rebuild_spec();
+            let task = TaskRecord::queued_for_spec(&spec);
+            let store = TaskStore::open(&paths.database).unwrap();
+            store.insert_with_spec(&task, &spec).unwrap();
+            store.update_state(task.id, state, None).unwrap();
+            let task_paths = paths
+                .for_task(spec.account_id(), spec.space_id(), task.id)
+                .unwrap();
+            task_paths.ensure_dirs().unwrap();
+            fs::write(task_paths.staging.join("catalog.enc"), b"rebuilt").unwrap();
+
+            cleanup_terminal_task_staging(&task_paths, &spec, task.id).unwrap();
 
             assert_eq!(task_paths.staging.exists(), should_exist);
         }
@@ -4622,9 +5252,9 @@ mod remote_verification_tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        assert!(cleanup_terminal_verification_staging(&task_paths, &spec, task.id).is_err());
+        assert!(cleanup_terminal_task_staging(&task_paths, &spec, task.id).is_err());
         assert!(sentinel.exists());
-        cleanup_terminal_verification_staging_and_record(&task_paths, &spec, task.id).unwrap();
+        cleanup_terminal_task_staging_and_record(&task_paths, &spec, task.id).unwrap();
         let stored = TaskStore::open(&paths.database)
             .unwrap()
             .get(task.id)
@@ -4653,7 +5283,31 @@ mod remote_verification_tests {
         task_paths.ensure_dirs().unwrap();
         fs::write(task_paths.staging.join("cached.lios"), b"cached").unwrap();
 
-        cleanup_terminal_verification_staging_after_restart_async(paths.clone())
+        cleanup_terminal_task_staging_after_restart_async(paths.clone())
+            .await
+            .unwrap();
+
+        assert!(!task_paths.staging.exists());
+    }
+
+    #[tokio::test]
+    async fn deferred_startup_sweep_removes_terminal_rebuild_staging() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let spec = rebuild_spec();
+        let task = TaskRecord::queued_for_spec(&spec);
+        let store = TaskStore::open(&paths.database).unwrap();
+        store.insert_with_spec(&task, &spec).unwrap();
+        store
+            .update_state(task.id, TaskState::Completed, None)
+            .unwrap();
+        let task_paths = paths
+            .for_task(spec.account_id(), spec.space_id(), task.id)
+            .unwrap();
+        task_paths.ensure_dirs().unwrap();
+        fs::write(task_paths.staging.join("catalog.enc"), b"rebuilt").unwrap();
+
+        cleanup_terminal_task_staging_after_restart_async(paths.clone())
             .await
             .unwrap();
 
@@ -4735,6 +5389,35 @@ mod remote_verification_tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn clearing_terminal_rebuild_removes_staging_before_the_record() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let spec = rebuild_spec();
+        let task = TaskRecord::queued_for_spec(&spec);
+        let store = TaskStore::open(&paths.database).unwrap();
+        store.insert_with_spec(&task, &spec).unwrap();
+        store
+            .update_state(task.id, TaskState::Completed, None)
+            .unwrap();
+        let task_paths = paths
+            .for_task(spec.account_id(), spec.space_id(), task.id)
+            .unwrap();
+        task_paths.ensure_dirs().unwrap();
+        fs::write(task_paths.staging.join("catalog.enc"), b"rebuilt").unwrap();
+
+        clear_task_record(&paths, &Mutex::new(TaskLifecycleState::default()), task.id)
+            .await
+            .unwrap();
+
+        assert!(!task_paths.staging.exists());
+        assert!(TaskStore::open(&paths.database)
+            .unwrap()
+            .get(task.id)
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn remote_integrity_error_preserves_the_affected_object() {
         let reason = "remote object LFS OID mismatch: objects/files/a/chunks/b.lios".to_string();
@@ -4750,5 +5433,151 @@ mod remote_verification_tests {
                 .and_then(|details| details["reason"].as_str()),
             Some(reason.as_str())
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_rebuild_command_tests {
+    use std::fs;
+
+    use lios_core::catalog::{Catalog, CatalogSelection, CATALOG_FILE};
+    use lios_core::config::LiosPaths;
+    use lios_core::crypto::KeyFile;
+    use lios_core::storage::{RepoRevision, StorageObject};
+    use sha2::{Digest, Sha256};
+    use tempfile::tempdir;
+
+    use super::{
+        discard_staged_catalog_for_rebuild, plan_catalog_rebuild_sync, recovery_metadata_objects,
+        validate_rebuild_revision, CommandErrorCode,
+    };
+
+    fn staged_object(paths: &LiosPaths, remote_path: String) -> StorageObject {
+        let bytes = fs::read(paths.staging.join(&remote_path)).unwrap();
+        StorageObject {
+            path: remote_path,
+            size: bytes.len() as u64,
+            sha256: Some(hex::encode(Sha256::digest(bytes))),
+        }
+    }
+
+    #[test]
+    fn rebuild_downloads_only_descriptors_and_manifests() {
+        let objects = vec![
+            StorageObject {
+                path: "recovery/nodes/a.enc".to_string(),
+                size: 1,
+                sha256: Some("a".repeat(64)),
+            },
+            StorageObject {
+                path: "objects/files/b/manifest.enc".to_string(),
+                size: 2,
+                sha256: Some("b".repeat(64)),
+            },
+            StorageObject {
+                path: "objects/files/b/chunks/c.lios".to_string(),
+                size: 3,
+                sha256: Some("c".repeat(64)),
+            },
+            StorageObject {
+                path: "notes.txt".to_string(),
+                size: 4,
+                sha256: None,
+            },
+        ];
+
+        let selected = recovery_metadata_objects(&objects).unwrap();
+
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|object| object.path)
+                .collect::<Vec<_>>(),
+            vec![
+                "objects/files/b/manifest.enc".to_string(),
+                "recovery/nodes/a.enc".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rebuild_confirmation_requires_the_preview_revision() {
+        let current = RepoRevision {
+            branch: "master".to_string(),
+            commit_id: Some("commit-123".to_string()),
+        };
+        assert_eq!(
+            validate_rebuild_revision(Some("commit-123"), &current).unwrap(),
+            "commit-123"
+        );
+        assert_eq!(
+            validate_rebuild_revision(None, &current).unwrap_err().code,
+            CommandErrorCode::InvalidInput
+        );
+        assert_eq!(
+            validate_rebuild_revision(Some("commit-old"), &current)
+                .unwrap_err()
+                .code,
+            CommandErrorCode::RemoteConflict
+        );
+    }
+
+    #[test]
+    fn rebuild_publish_plan_never_deletes_unreferenced_remote_objects() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let key = KeyFile::generate_to_path(temp.path().join("key.yaml")).unwrap();
+        let catalog = Catalog::initialize_empty("Recovered", &key, paths.staging.clone()).unwrap();
+        let mut remote = catalog
+            .remote_files_for_selection(&CatalogSelection::All, &key)
+            .unwrap()
+            .into_iter()
+            .map(|file| staged_object(&paths, file.path))
+            .collect::<Vec<_>>();
+        remote.push(StorageObject {
+            path: format!(
+                "objects/files/{}/chunks/{}.lios",
+                "a".repeat(32),
+                "b".repeat(64)
+            ),
+            size: 5,
+            sha256: Some("c".repeat(64)),
+        });
+
+        let expected_revision = RepoRevision {
+            branch: "master".to_string(),
+            commit_id: Some("preview-revision".to_string()),
+        };
+        let work =
+            plan_catalog_rebuild_sync(&paths, &catalog, &key, remote, expected_revision.clone())
+                .unwrap();
+
+        assert!(work.delete.is_empty());
+        assert_eq!(work.expected_revision, Some(expected_revision));
+        assert_eq!(
+            work.upload
+                .iter()
+                .map(|upload| upload.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![CATALOG_FILE]
+        );
+    }
+
+    #[test]
+    fn rebuild_retry_discards_only_the_prior_generated_catalog() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let catalog_path = paths.staging.join(CATALOG_FILE);
+        let descriptor_path = paths.staging.join("recovery/nodes/a.enc");
+        fs::create_dir_all(descriptor_path.parent().unwrap()).unwrap();
+        fs::write(&catalog_path, b"previous rebuild output").unwrap();
+        fs::write(&descriptor_path, b"recovery metadata").unwrap();
+
+        discard_staged_catalog_for_rebuild(&paths).unwrap();
+
+        assert!(!catalog_path.exists());
+        assert_eq!(fs::read(descriptor_path).unwrap(), b"recovery metadata");
     }
 }

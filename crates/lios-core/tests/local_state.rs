@@ -1620,6 +1620,54 @@ fn verify_task_labels_distinguish_quick_and_full_checks() {
 }
 
 #[test]
+fn rebuild_task_spec_roundtrips_the_confirmed_revision() {
+    let spec = TaskSpec::RebuildCatalog {
+        account_id: "account".to_string(),
+        space_id: "space".to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "archive".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        expected_revision: Some("commit-123".to_string()),
+    };
+
+    let encoded = serde_json::to_string(&spec).unwrap();
+    let decoded: TaskSpec = serde_json::from_str(&encoded).unwrap();
+    let TaskSpec::RebuildCatalog {
+        expected_revision, ..
+    } = decoded
+    else {
+        panic!("expected rebuild catalog task");
+    };
+
+    assert_eq!(expected_revision.as_deref(), Some("commit-123"));
+}
+
+#[test]
+fn legacy_rebuild_task_spec_without_revision_loads_as_unconfirmed() {
+    let decoded: TaskSpec = serde_json::from_value(serde_json::json!({
+        "kind": "rebuild_catalog",
+        "account_id": "account",
+        "space_id": "space",
+        "repo": {
+            "namespace": "novix",
+            "dataset": "archive",
+            "endpoint": "https://modelscope.cn"
+        }
+    }))
+    .unwrap();
+    let TaskSpec::RebuildCatalog {
+        expected_revision, ..
+    } = decoded
+    else {
+        panic!("expected rebuild catalog task");
+    };
+
+    assert_eq!(expected_revision, None);
+}
+
+#[test]
 fn upload_task_spec_roundtrips_the_persisted_source_snapshot() {
     let snapshot = SourceSnapshotReport::default();
     let spec = TaskSpec::Upload {
