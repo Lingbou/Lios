@@ -5,7 +5,8 @@ import {
   taskItemProgressPercent,
   taskItemStatusText,
   taskProgressPercent,
-  taskProgressText
+  taskProgressText,
+  taskStatusText
 } from "../src/taskPresentation.ts";
 
 test("task progress prefers byte progress and includes speed plus ETA", () => {
@@ -60,5 +61,62 @@ test("terminal task progress does not show stale speed or ETA", () => {
       eta_seconds: 10
     }),
     "1.00 KB / 1.00 KB · 100%"
+  );
+});
+
+test("completed task status preserves integrity warnings", () => {
+  assert.equal(
+    taskStatusText({
+      state: "Completed",
+      label: "verify_quick",
+      phase: null,
+      progress_total: 3,
+      progress_done: 3,
+      error: "1 个旧版分片缺少长度元数据",
+      attempt: 0
+    }),
+    "已完成：1 个旧版分片缺少长度元数据"
+  );
+});
+
+test("content verification does not report 100 percent before the final step", () => {
+  assert.equal(
+    taskProgressPercent({
+      state: "Running",
+      label: "verify_full",
+      phase: "verifying_content",
+      progress_total: 4,
+      progress_done: 3,
+      bytes_total: 1024,
+      bytes_done: 1024
+    }),
+    75
+  );
+});
+
+test("canceled task status preserves cleanup warnings", () => {
+  assert.equal(
+    taskStatusText({
+      state: "Canceled",
+      label: "verify_full",
+      phase: null,
+      progress_total: 4,
+      progress_done: 2,
+      error: "verification staging cleanup failed: access denied"
+    }),
+    "已取消：verification staging cleanup failed: access denied"
+  );
+});
+
+test("verification preparing status is not described as file packing", () => {
+  assert.equal(
+    taskStatusText({
+      state: "Preparing",
+      label: "verify_full",
+      phase: null,
+      progress_total: 0,
+      progress_done: 0
+    }),
+    "正在准备空间检查"
   );
 });

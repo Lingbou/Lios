@@ -19,6 +19,8 @@ export type TaskPresentationRecord = {
   bytes_done?: number;
   speed_bps?: number;
   eta_seconds?: number | null;
+  attempt?: number;
+  error?: string | null;
 };
 
 export type TaskItemPresentationRecord = {
@@ -58,6 +60,12 @@ function formatEta(seconds: number) {
 }
 
 export function taskProgressPercent(task: TaskPresentationRecord) {
+  if (task.phase === "verifying_content" && task.progress_total > 0) {
+    return Math.min(
+      100,
+      Math.max(0, Math.round((task.progress_done / task.progress_total) * 100))
+    );
+  }
   const bytesTotal = finiteNonNegative(task.bytes_total);
   const bytesDone = Math.max(0, task.bytes_done ?? 0);
   if (bytesTotal > 0) {
@@ -96,6 +104,34 @@ export function taskProgressText(task: TaskPresentationRecord) {
     if (eta > 0) parts.push(`剩余 ${formatEta(eta)}`);
   }
   return parts.join(" · ");
+}
+
+export function taskStatusText(task: TaskPresentationRecord) {
+  if (task.state === "Queued") return "等待中";
+  if (task.state === "Paused") return "已暂停：等待继续或取消";
+  if (task.state === "Completed") return task.error ? `已完成：${task.error}` : "已完成";
+  if (task.state === "Canceled") return task.error ? `已取消：${task.error}` : "已取消";
+  if (task.state === "Failed") return task.error ? `失败：${task.error}` : "失败";
+  if (task.state === "Preparing" && task.label.startsWith("verify_")) {
+    return "正在准备空间检查";
+  }
+  if (task.state === "Preparing" || task.phase === "preparing") return "正在切片加密";
+  if (task.state === "Running" && task.phase === "uploading") return "正在同步到远端";
+  if (task.state === "Running" && task.phase === "downloading") return "正在下载";
+  if (task.state === "Running" && task.phase === "checking_remote") return "正在核对远端清单";
+  if (task.state === "Running" && task.phase === "downloading_verification_data") {
+    return "正在下载校验数据";
+  }
+  if (task.state === "Running" && task.phase === "verifying_content") return "正在验证加密内容";
+  if (task.state === "Running" && task.phase === "checking_complete") return "检查完成";
+  if (task.state === "Running" && task.phase === "restoring") return "正在恢复到本地";
+  if (task.state === "Running") return task.progress_total > 0 ? "正在处理" : "正在准备";
+  if (task.state === "Retrying") {
+    return `正在重试${(task.attempt ?? 0) > 0 ? `（第 ${task.attempt} 次）` : ""}`;
+  }
+  if (task.state === "Committing" && task.phase === "reconciling") return "正在核对远端提交结果";
+  if (task.state === "Committing") return "正在提交远端变更";
+  return "处理中";
 }
 
 export function taskItemProgressPercent(item: TaskItemPresentationRecord) {
