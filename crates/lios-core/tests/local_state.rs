@@ -9,21 +9,11 @@ use serde::Deserialize;
 use tempfile::tempdir;
 
 #[derive(Deserialize)]
-struct FrozenV1KeyFile {
+struct EmittedV2KeyFile {
     version: u8,
     algorithm: String,
-    key: String,
-}
-
-fn parse_with_frozen_v1_reader(path: &std::path::Path) -> [u8; 32] {
-    let parsed: FrozenV1KeyFile =
-        serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(parsed.version, 1);
-    assert_eq!(parsed.algorithm, "XChaCha20Poly1305-compatible-32-byte-key");
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, parsed.key)
-        .unwrap()
-        .try_into()
-        .unwrap()
+    kdf: String,
+    master_key: String,
 }
 
 #[test]
@@ -173,7 +163,7 @@ fn current_v1_key_yaml_remains_loadable() {
 }
 
 #[test]
-fn generated_and_exported_keys_remain_readable_by_frozen_v1_parser() {
+fn generated_and_exported_keys_switch_to_v2_with_full_v2_production_writes() {
     let tmp = tempdir().unwrap();
     let generated_path = tmp.path().join("generated.key");
     let v2_source_path = tmp.path().join("v2-source.key");
@@ -190,8 +180,22 @@ fn generated_and_exported_keys_remain_readable_by_frozen_v1_parser() {
         .save_to_path(&exported_path)
         .unwrap();
 
-    assert_eq!(parse_with_frozen_v1_reader(&generated_path).len(), 32);
-    assert_eq!(parse_with_frozen_v1_reader(&exported_path), [0; 32]);
+    for path in [&generated_path, &exported_path] {
+        let parsed: EmittedV2KeyFile =
+            serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.kdf, "HKDF-SHA256");
+        assert_eq!(parsed.algorithm, "XChaCha20-Poly1305");
+        assert_eq!(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                parsed.master_key
+            )
+            .unwrap()
+            .len(),
+            32
+        );
+    }
 }
 
 #[test]

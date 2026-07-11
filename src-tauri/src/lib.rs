@@ -1,8 +1,8 @@
+pub mod catalog_mutation_gate;
 pub mod catalog_probe;
 pub mod command_error;
 pub mod command_surface;
 pub mod download_service;
-pub mod initialization_gate;
 pub mod production_config;
 
 #[cfg(test)]
@@ -14,11 +14,11 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
+use catalog_mutation_gate::CatalogMutationGate;
 use catalog_probe::{ensure_space_can_initialize, map_catalog_load_error};
 use command_error::{CommandError, CommandErrorCode};
 use command_surface::with_registered_commands;
 use download_service::prepare_download_task;
-use initialization_gate::InitializationGate;
 use lios_core::cache::{cleanup_temporary_staging, prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
     Catalog, CatalogRemoteFile, CatalogSelection, CatalogTreeNode, ConflictResolution, DriveItem,
@@ -30,7 +30,10 @@ use lios_core::crypto::KeyFile;
 use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUserSummary};
 use lios_core::pack::PackOptions;
 use lios_core::restore::{RestoreConflictPolicy, RestoreOptions};
-use lios_core::storage::StorageAdapter;
+use lios_core::storage::{
+    plan_catalog_sync_changes, validate_catalog_sync_upload, CatalogSyncFile, CatalogSyncUpload,
+    StorageAdapter, StorageObject,
+};
 use lios_core::tasks::{TaskRecord, TaskState, TaskStore};
 use production_config::{
     configured_endpoint, generate_key_file_and_bind, persist_config, prepare_config_for_write,
@@ -46,7 +49,7 @@ type CommandResult<T> = std::result::Result<T, CommandError>;
 
 struct AppContext {
     paths: LiosPaths,
-    initialization_gate: InitializationGate,
+    catalog_mutation_gate: CatalogMutationGate,
     task_lifecycle_gate: Mutex<TaskLifecycleState>,
 }
 
@@ -64,7 +67,7 @@ impl AppContext {
         }
         Self {
             paths,
-            initialization_gate: InitializationGate::default(),
+            catalog_mutation_gate: CatalogMutationGate::default(),
             task_lifecycle_gate: Mutex::new(TaskLifecycleState::default()),
         }
     }
@@ -108,14 +111,8 @@ struct DatasetRepoListResult {
 
 #[derive(Serialize)]
 struct SyncWork {
-    upload: Vec<SyncUpload>,
+    upload: Vec<CatalogSyncUpload>,
     delete: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct SyncUpload {
-    path: String,
-    local_path: PathBuf,
 }
 
 fn to_err<E>(error: E) -> CommandError
@@ -381,10 +378,12 @@ async fn cleanup_if_idle<T>(
 async fn finish_active_worker(
     paths: &LiosPaths,
     gate: &Mutex<TaskLifecycleState>,
+    catalog_mutation_gate: &CatalogMutationGate,
     task_id: Uuid,
     intended_state: TaskState,
     error: Option<String>,
 ) -> CommandResult<TaskState> {
+    let _shared_staging_guard = catalog_mutation_gate.lock_shared_staging().await;
     let mut lifecycle = gate.lock().await;
     let current_state = task_store(paths)?
         .list()
@@ -444,37 +443,33 @@ fn desired_catalog_objects(
     paths: &LiosPaths,
     catalog: &Catalog,
     key: &KeyFile,
-) -> CommandResult<Vec<(String, Option<PathBuf>, String)>> {
+) -> CommandResult<Vec<CatalogSyncFile>> {
     let mut desired = Vec::new();
     let catalog_path = paths.staging.join(CATALOG_FILE);
-    desired.push((
-        CATALOG_FILE.to_string(),
-        Some(catalog_path.clone()),
-        sha256_hex_file(&catalog_path)?,
-    ));
+    desired.push(CatalogSyncFile {
+        path: CATALOG_FILE.to_string(),
+        local_path: Some(catalog_path.clone()),
+        expected_sha256: Some(sha256_hex_file(&catalog_path)?),
+        expected_size: Some(fs::metadata(&catalog_path).map_err(to_err)?.len()),
+    });
     for file in catalog
         .remote_files_for_selection(&CatalogSelection::All, key)
         .map_err(to_err)?
     {
         let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
-        if local_path.exists() {
-            desired.push((
-                file.path,
-                Some(local_path.clone()),
-                sha256_hex_file(&local_path)?,
-            ));
-        } else if let Some(sha256) = file.sha256 {
-            desired.push((file.path, None, sha256));
-        } else {
-            desired.push((file.path, None, String::new()));
-        }
+        desired.push(CatalogSyncFile {
+            path: file.path,
+            local_path: local_path.exists().then_some(local_path),
+            expected_sha256: file.sha256,
+            expected_size: None,
+        });
     }
     desired.sort_by(|a, b| {
-        let a_catalog = a.0 == CATALOG_FILE;
-        let b_catalog = b.0 == CATALOG_FILE;
-        a_catalog.cmp(&b_catalog).then_with(|| a.0.cmp(&b.0))
+        let a_catalog = a.path == CATALOG_FILE;
+        let b_catalog = b.path == CATALOG_FILE;
+        a_catalog.cmp(&b_catalog).then_with(|| a.path.cmp(&b.path))
     });
-    desired.dedup_by(|a, b| a.0 == b.0);
+    desired.dedup_by(|a, b| a.path == b.path);
     Ok(desired)
 }
 
@@ -486,36 +481,22 @@ async fn plan_catalog_sync(
     repo: &RepoConfig,
 ) -> CommandResult<SyncWork> {
     let desired = desired_catalog_objects(paths, catalog, key)?;
-    let desired_paths = desired
-        .iter()
-        .map(|(path, _, _)| path.clone())
-        .collect::<HashSet<_>>();
     let remote_objects = adapter
         .list_objects(&repo.namespace, &repo.dataset, "")
         .await
         .map_err(to_err)?;
-    let remote_by_path = remote_objects
-        .iter()
-        .map(|object| (object.path.as_str(), object.sha256.as_deref()))
-        .collect::<HashMap<_, _>>();
-    let upload = desired
-        .into_iter()
-        .filter_map(|(path, local_path, sha256)| {
-            let local_path = local_path?;
-            (remote_by_path.get(path.as_str()).copied().flatten() != Some(sha256.as_str()))
-                .then_some(SyncUpload { path, local_path })
-        })
-        .collect::<Vec<_>>();
-    let mut delete = remote_objects
-        .into_iter()
-        .filter(|object| {
-            object.path.starts_with("objects/") && !desired_paths.contains(&object.path)
-        })
-        .map(|object| object.path)
-        .collect::<Vec<_>>();
-    delete.sort();
-    delete.dedup();
-    Ok(SyncWork { upload, delete })
+    plan_catalog_sync_with_remote_objects(desired, remote_objects)
+}
+
+fn plan_catalog_sync_with_remote_objects(
+    desired: Vec<CatalogSyncFile>,
+    remote_objects: Vec<StorageObject>,
+) -> CommandResult<SyncWork> {
+    let plan = plan_catalog_sync_changes(desired, remote_objects).map_err(to_err)?;
+    Ok(SyncWork {
+        upload: plan.upload,
+        delete: plan.delete,
+    })
 }
 
 async fn execute_sync_work(
@@ -524,6 +505,7 @@ async fn execute_sync_work(
     work: &SyncWork,
 ) -> CommandResult<()> {
     for object in &work.upload {
+        validate_catalog_sync_upload(object).map_err(to_err)?;
         adapter
             .upload_object(
                 &repo.namespace,
@@ -672,7 +654,7 @@ async fn initialize_space(
             "space was not found or is not visible",
         ));
     }
-    let _initialization_guard = state.initialization_gate.lock().await;
+    let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
     ensure_space_can_initialize(
         &adapter,
         &repo.namespace,
@@ -717,6 +699,7 @@ async fn load_space_catalog(
             "space was not found or is not visible",
         ));
     }
+    let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
     let mut config = load_config(&state.paths)?;
     config.active_repo = Some(repo.clone());
     persist_config(&state.paths, &mut config)?;
@@ -745,6 +728,7 @@ async fn preview_upload_conflicts(
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
     let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
     let catalog_path = state.paths.staging.join(CATALOG_FILE);
     adapter
         .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
@@ -766,6 +750,7 @@ async fn create_folder(
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
     let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
     let local_path = state.paths.staging.join(CATALOG_FILE);
     adapter
         .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
@@ -794,6 +779,7 @@ async fn rename_node(
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
     let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
     let local_path = state.paths.staging.join(CATALOG_FILE);
     adapter
         .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
@@ -821,6 +807,7 @@ async fn search_catalog(
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
     let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
     let catalog_path = state.paths.staging.join(CATALOG_FILE);
     adapter
         .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
@@ -875,6 +862,7 @@ async fn enqueue_upload_to_folder(
         let config = load_config(&state.paths)?;
         let key = key_from_config(&config)?;
         let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
+        let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
         let catalog_path = state.paths.staging.join(CATALOG_FILE);
         adapter
             .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
@@ -882,11 +870,17 @@ async fn enqueue_upload_to_folder(
             .map_err(to_err)?;
         let catalog = Catalog::from_staging(state.paths.staging.clone());
         let upload_paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+        // The global mutation gate keeps this inventory snapshot valid against same-process
+        // writers. It does not protect against another device; remote revision checks come next.
+        let remote_objects = adapter
+            .list_objects(&repo.namespace, &repo.dataset, "")
+            .await
+            .map_err(to_err)?;
         update_task_phase(&state.paths, task.id, Some("preparing".to_string()))?;
         emit_tasks(&app, &state.paths);
         let preparing_started = Instant::now();
         let report = catalog
-            .add_paths_to_folder_with_progress_and_report(
+            .add_paths_to_folder_with_remote_inventory_and_progress_and_report(
                 &parent_node_id,
                 &upload_paths,
                 &conflict_resolutions,
@@ -895,6 +889,7 @@ async fn enqueue_upload_to_folder(
                     chunk_size: config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
                     staging_dir: state.paths.staging.clone(),
                 },
+                &remote_objects,
                 |progress| {
                     task.progress_done = progress.completed_chunks;
                     task.progress_total = progress.total_chunks;
@@ -913,7 +908,8 @@ async fn enqueue_upload_to_folder(
             )
             .map_err(to_err)?;
         report.ensure_no_skipped_paths().map_err(to_err)?;
-        let work = plan_catalog_sync(&state.paths, &catalog, &key, &adapter, &repo).await?;
+        let desired = desired_catalog_objects(&state.paths, &catalog, &key)?;
+        let work = plan_catalog_sync_with_remote_objects(desired, remote_objects)?;
         update_task_phase(&state.paths, task.id, Some("uploading".to_string()))?;
         task.progress_done = 0;
         task.bytes_done = 0;
@@ -939,6 +935,7 @@ async fn enqueue_upload_to_folder(
             if let Some(state) = task_interrupt(&state.paths, task.id)? {
                 return Ok::<Option<TaskState>, CommandError>(Some(state));
             }
+            validate_catalog_sync_upload(object).map_err(to_err)?;
             adapter
                 .upload_object(
                     &repo.namespace,
@@ -991,6 +988,7 @@ async fn enqueue_upload_to_folder(
             task.state = finish_active_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
+                &state.catalog_mutation_gate,
                 task.id,
                 TaskState::Completed,
                 None,
@@ -1004,6 +1002,7 @@ async fn enqueue_upload_to_folder(
             task.state = finish_active_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
+                &state.catalog_mutation_gate,
                 task.id,
                 interrupt_state,
                 None,
@@ -1017,6 +1016,7 @@ async fn enqueue_upload_to_folder(
             task.state = finish_active_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
+                &state.catalog_mutation_gate,
                 task.id,
                 TaskState::Failed,
                 Some(error.message.clone()),
@@ -1053,6 +1053,7 @@ async fn enqueue_delete_nodes(
         let config = load_config(&state.paths)?;
         let key = key_from_config(&config)?;
         let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
+        let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
         let catalog_path = state.paths.staging.join(CATALOG_FILE);
         adapter
             .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
@@ -1069,6 +1070,7 @@ async fn enqueue_delete_nodes(
             task.progress_total,
         )?;
         for object in &work.upload {
+            validate_catalog_sync_upload(object).map_err(to_err)?;
             adapter
                 .upload_object(
                     &repo.namespace,
@@ -1107,6 +1109,7 @@ async fn enqueue_delete_nodes(
             task.state = finish_active_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
+                &state.catalog_mutation_gate,
                 task.id,
                 TaskState::Completed,
                 None,
@@ -1119,6 +1122,7 @@ async fn enqueue_delete_nodes(
             task.state = finish_active_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
+                &state.catalog_mutation_gate,
                 task.id,
                 TaskState::Failed,
                 Some(error.message.clone()),
@@ -1151,6 +1155,7 @@ async fn enqueue_download(
         let config = load_config(&state.paths)?;
         let key = key_from_config(&config)?;
         let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
+        let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
         let catalog_path = state.paths.staging.join(CATALOG_FILE);
         adapter
             .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
@@ -1281,6 +1286,7 @@ async fn enqueue_download(
             task.state = finish_active_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
+                &state.catalog_mutation_gate,
                 task.id,
                 TaskState::Completed,
                 None,
@@ -1294,6 +1300,7 @@ async fn enqueue_download(
             task.state = finish_active_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
+                &state.catalog_mutation_gate,
                 task.id,
                 interrupt_state,
                 None,
@@ -1307,6 +1314,7 @@ async fn enqueue_download(
             task.state = finish_active_worker(
                 &state.paths,
                 &state.task_lifecycle_gate,
+                &state.catalog_mutation_gate,
                 task.id,
                 TaskState::Failed,
                 Some(error.message.clone()),
@@ -1332,6 +1340,7 @@ fn list_tasks(state: tauri::State<'_, AppContext>) -> CommandResult<Vec<TaskReco
 async fn cleanup_local_cache(
     state: tauri::State<'_, AppContext>,
 ) -> CommandResult<CacheCleanupReport> {
+    let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
     match cleanup_if_idle(&state.paths, &state.task_lifecycle_gate, || {
         cleanup_current_staging_cache(&state.paths, true, false)
     })
@@ -1441,8 +1450,8 @@ mod task_cleanup_tests {
 
     use super::{
         activate_existing_task, activate_new_task, cleanup_current_staging_cache, cleanup_if_idle,
-        clear_task_record, finish_active_worker, set_task_state, CommandErrorCode,
-        TaskLifecycleState,
+        clear_task_record, finish_active_worker, set_task_state, CatalogMutationGate,
+        CommandErrorCode, TaskLifecycleState,
     };
 
     #[tokio::test]
@@ -1623,6 +1632,7 @@ mod task_cleanup_tests {
         let staged = paths.staging.join("blocked-transfer.download");
         fs::write(&staged, b"worker still owns this").unwrap();
         let lifecycle = Mutex::new(TaskLifecycleState::default());
+        let catalog_mutation_gate = CatalogMutationGate::default();
 
         let task = activate_new_task(&paths, &lifecycle, TaskRecord::queued("blocked delete", 1))
             .await
@@ -1652,10 +1662,16 @@ mod task_cleanup_tests {
         assert!(skipped.is_none());
         assert!(staged.exists());
 
-        let final_state =
-            finish_active_worker(&paths, &lifecycle, task.id, TaskState::Completed, None)
-                .await
-                .unwrap();
+        let final_state = finish_active_worker(
+            &paths,
+            &lifecycle,
+            &catalog_mutation_gate,
+            task.id,
+            TaskState::Completed,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(final_state, TaskState::Canceled);
         assert!(!lifecycle.lock().await.active_workers.contains(&task.id));
@@ -1679,6 +1695,7 @@ mod task_cleanup_tests {
             let temp = tempdir().unwrap();
             let paths = LiosPaths::from_home(temp.path());
             let lifecycle = Mutex::new(TaskLifecycleState::default());
+            let catalog_mutation_gate = CatalogMutationGate::default();
             let task = activate_new_task(
                 &paths,
                 &lifecycle,
@@ -1701,10 +1718,16 @@ mod task_cleanup_tests {
                 .iter()
                 .any(|record| record.id == task.id));
 
-            let final_state =
-                finish_active_worker(&paths, &lifecycle, task.id, TaskState::Completed, None)
-                    .await
-                    .unwrap();
+            let final_state = finish_active_worker(
+                &paths,
+                &lifecycle,
+                &catalog_mutation_gate,
+                task.id,
+                TaskState::Completed,
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!(final_state, controlled_state);
 
             clear_task_record(&paths, &lifecycle, task.id)

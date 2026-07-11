@@ -82,6 +82,14 @@ pub fn encrypt_envelope_v2(
     Ok(envelope)
 }
 
+pub(crate) fn envelope_encoded_len_v2(plaintext_len: usize) -> Result<u64> {
+    let encoded_len = ENVELOPE_HEADER_LEN_V2
+        .checked_add(plaintext_len)
+        .and_then(|len| len.checked_add(AEAD_TAG_LEN))
+        .ok_or(LiosError::InvalidV2Format("envelope is too large"))?;
+    u64::try_from(encoded_len).map_err(|_| LiosError::InvalidV2Format("envelope is too large"))
+}
+
 pub fn decrypt_envelope_v2(
     key_file: &KeyFile,
     expected_kind: EnvelopeKindV2,

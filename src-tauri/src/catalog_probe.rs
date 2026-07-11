@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 use crate::command_error::{CommandError, CommandErrorCode};
 
+/// The caller must hold `CatalogMutationGate` because probing creates and removes files in the
+/// shared staging directory.
 pub async fn ensure_space_can_initialize<A: StorageAdapter + ?Sized>(
     adapter: &A,
     namespace: &str,

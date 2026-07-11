@@ -190,18 +190,6 @@ pub(crate) fn write_atomic_immutable(path: &Path, contents: &[u8]) -> io::Result
     }
 }
 
-pub(crate) fn publish_staged_new(source: &Path, destination: &Path) -> io::Result<()> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(source)?
-        .sync_all()?;
-    publish_new_file(source, destination)?;
-    let _ = fs::remove_file(source);
-    let _ = sync_parent(destination);
-    Ok(())
-}
-
 #[cfg(not(windows))]
 fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
