@@ -70,14 +70,32 @@ type PathsDto = {
 
 type TaskState =
   | "Queued"
+  | "Preparing"
   | "Running"
   | "Paused"
+  | "Retrying"
+  | "Committing"
   | "Failed"
   | "Completed"
   | "Canceled";
 
+type TaskItem = {
+  id: string;
+  task_id: string;
+  name: string;
+  source_path?: string | null;
+  size: number;
+  state: "Queued" | "Running" | "Skipped" | "Failed" | "Completed";
+  phase?: string | null;
+  bytes_done: number;
+  bytes_total: number;
+  error?: string | null;
+};
+
 type TaskRecord = {
   id: string;
+  account_id: string;
+  space_id: string;
   state: TaskState;
   label: string;
   phase?: string | null;
@@ -86,7 +104,12 @@ type TaskRecord = {
   bytes_total?: number;
   bytes_done?: number;
   speed_bps?: number;
+  eta_seconds?: number | null;
+  attempt: number;
+  created_at: string;
+  updated_at: string;
   error?: string | null;
+  items: TaskItem[];
 };
 
 type TaskUpdateEvent = {
@@ -241,17 +264,19 @@ function taskLabel(label: string) {
 }
 
 function taskStatusText(task: TaskRecord) {
-  if (task.state === "Running" && task.phase === "preparing") return "正在切片加密";
+  if (task.state === "Queued") return "等待中";
+  if (task.state === "Paused") return "已暂停：等待继续或取消";
+  if (task.state === "Completed") return "已完成";
+  if (task.state === "Canceled") return "已取消";
+  if (task.state === "Failed") return task.error ? `失败：${task.error}` : "失败";
+  if (task.state === "Preparing" || task.phase === "preparing") return "正在切片加密";
   if (task.state === "Running" && task.phase === "uploading") return "正在同步到远端";
   if (task.state === "Running" && task.phase === "downloading") return "正在下载";
   if (task.state === "Running" && task.phase === "restoring") return "正在恢复到本地";
   if (task.state === "Running") return task.progress_total > 0 ? "正在处理" : "正在准备";
-  if (task.state === "Queued") return "等待中";
-  if (task.state === "Paused") return "已暂停：当前版本不能从这里恢复";
-  if (task.state === "Completed") return "已完成";
-  if (task.state === "Canceled") return "已取消";
-  if (task.error) return `失败：${task.error}`;
-  return "失败";
+  if (task.state === "Retrying") return `正在重试${task.attempt > 0 ? `（第 ${task.attempt} 次）` : ""}`;
+  if (task.state === "Committing") return "正在提交远端变更";
+  return "处理中";
 }
 
 function taskProgressPercent(task: TaskRecord) {
@@ -276,7 +301,7 @@ function taskProgressText(task: TaskRecord) {
     const speed = task.speed_bps ? ` · ${formatBytes(task.speed_bps)}/s` : "";
     return `${task.progress_done}/${task.progress_total} ${unit} · ${taskProgressPercent(task)}%${speed}`;
   }
-  if (task.state === "Running") return "准备中";
+  if (["Preparing", "Running", "Retrying", "Committing"].includes(task.state)) return "准备中";
   if (task.state === "Queued") return "等待开始";
   return "-";
 }
@@ -381,9 +406,11 @@ function App() {
   const visibleItems = query.trim() ? searchResults : children;
   const crumbs = breadcrumb(catalogTree, currentFolderId);
   const selectedCount = selectedIds.size;
-  const runningTasks = tasks.filter((task) => task.state === "Running").length;
+  const runningTasks = tasks.filter((task) =>
+    ["Preparing", "Running", "Retrying", "Committing"].includes(task.state)
+  ).length;
   const activeTasks = tasks.filter((task) =>
-    ["Queued", "Running", "Paused"].includes(task.state)
+    ["Queued", "Preparing", "Running", "Paused", "Retrying", "Committing"].includes(task.state)
   ).length;
   const failedTasks = tasks.filter((task) => task.state === "Failed").length;
   const totalTasks = tasks.length;
@@ -1241,7 +1268,14 @@ function App() {
             ) : (
               tasks.map((task) => {
                 const progress = taskProgressPercent(task);
-                const isRunning = task.state === "Running";
+                const isCancelable = [
+                  "Queued",
+                  "Preparing",
+                  "Running",
+                  "Paused",
+                  "Retrying",
+                  "Committing",
+                ].includes(task.state);
                 return (
                   <article className={`taskRow ${task.state.toLowerCase()}`} key={task.id}>
                     <div className="taskIcon">{taskIcon(task.state)}</div>
@@ -1256,7 +1290,7 @@ function App() {
                       <small>{taskProgressText(task)}</small>
                     </div>
                     <div className="taskButtons">
-                      {isRunning ? (
+                      {isCancelable ? (
                         <button
                           className="iconDanger"
                           title="取消任务"
