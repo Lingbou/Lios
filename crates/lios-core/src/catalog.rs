@@ -125,9 +125,21 @@ pub struct ConflictResolution {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackReport {
     pub skipped_paths: Vec<SkippedPath>,
+    #[serde(default)]
+    pub packed_files: Vec<SourceFileSnapshot>,
+    #[serde(default)]
+    pub packed_directories: Vec<SourceDirectorySnapshot>,
 }
 
 impl PackReport {
+    pub fn source_snapshot(&self) -> SourceSnapshotReport {
+        SourceSnapshotReport {
+            files: self.packed_files.clone(),
+            directories: self.packed_directories.clone(),
+            skipped_paths: self.skipped_paths.clone(),
+        }
+    }
+
     pub fn ensure_no_skipped_paths(&self) -> Result<()> {
         if self.skipped_paths.is_empty() {
             return Ok(());
@@ -190,6 +202,69 @@ pub struct SkippedPath {
 #[serde(rename_all = "snake_case")]
 pub enum SkippedPathReason {
     SymbolicLinkOrJunction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceFileSnapshot {
+    pub source_path: PathBuf,
+    pub relative_path: PathBuf,
+    pub size: u64,
+    pub modified_at_ns: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceDirectorySnapshot {
+    pub source_path: PathBuf,
+    pub relative_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceSnapshotReport {
+    pub files: Vec<SourceFileSnapshot>,
+    #[serde(default)]
+    pub directories: Vec<SourceDirectorySnapshot>,
+    pub skipped_paths: Vec<SkippedPath>,
+}
+
+pub fn snapshot_source_files(paths: &[PathBuf]) -> Result<SourceSnapshotReport> {
+    let mut report = SourceSnapshotReport::default();
+    for path in paths {
+        let relative_path = PathBuf::from(file_name(path)?);
+        snapshot_source_path(path, &relative_path, &mut report)?;
+    }
+    Ok(report)
+}
+
+pub fn verify_source_file_unchanged(snapshot: &SourceFileSnapshot) -> Result<()> {
+    let path_kind = packable_path_kind(&snapshot.source_path)
+        .map_err(|error| map_missing_source_file(error, &snapshot.source_path))?;
+    if path_kind != Some(PackablePathKind::File) {
+        return Err(LiosError::Unsupported(format!(
+            "source file changed while it was being packed: {}",
+            snapshot.source_path.display()
+        )));
+    }
+    let current = snapshot_regular_file(&snapshot.source_path, &snapshot.relative_path)
+        .map_err(|error| map_missing_source_file(error, &snapshot.source_path))?;
+    if current.size != snapshot.size || current.modified_at_ns != snapshot.modified_at_ns {
+        return Err(LiosError::Unsupported(format!(
+            "source file changed while it was being packed: {}",
+            snapshot.source_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn map_missing_source_file(error: LiosError, path: &Path) -> LiosError {
+    match error {
+        LiosError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            LiosError::Unsupported(format!("source file no longer exists: {}", path.display()))
+        }
+        LiosError::Unsupported(message) if message.starts_with("source path no longer exists:") => {
+            LiosError::Unsupported(format!("source file no longer exists: {}", path.display()))
+        }
+        error => error,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -408,7 +483,8 @@ impl Catalog {
         let root_id = pack_path_v2(
             &mut plain,
             &source_path,
-            name,
+            name.clone(),
+            PathBuf::from(name),
             None,
             key,
             &options,
@@ -800,7 +876,9 @@ impl Catalog {
         }
 
         for path in paths {
-            let mut target_name = file_name(path)?;
+            let source_name = file_name(path)?;
+            let source_relative_path = PathBuf::from(&source_name);
+            let mut target_name = source_name;
             let Some(_) = packable_path_kind(path)? else {
                 report.skipped_paths.push(skipped_link(path));
                 continue;
@@ -852,6 +930,7 @@ impl Catalog {
                 &mut loaded.catalog,
                 path,
                 target_name,
+                source_relative_path,
                 Some(parent_id.to_string()),
                 key,
                 &options,
@@ -1646,7 +1725,7 @@ fn pack_stats(path: &Path, chunk_size: usize) -> Result<PackStats> {
         });
     };
     if path_kind == PackablePathKind::File {
-        let len = fs::symlink_metadata(path)?.len();
+        let len = source_metadata(path)?.len();
         if len == 0 {
             return Ok(PackStats {
                 chunks: 1,
@@ -1664,8 +1743,7 @@ fn pack_stats(path: &Path, chunk_size: usize) -> Result<PackStats> {
             chunks: 0,
             bytes: 0,
         };
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
+        for entry in source_directory_entries(path)? {
             let child = pack_stats(&entry.path(), chunk_size)?;
             total.chunks += child.chunks;
             total.bytes += child.bytes;
@@ -1683,6 +1761,7 @@ fn pack_path_v2(
     catalog: &mut CatalogV2,
     path: &Path,
     name: String,
+    relative_path: PathBuf,
     parent_id: Option<String>,
     key: &KeyFile,
     options: &PackOptions,
@@ -1694,6 +1773,10 @@ fn pack_path_v2(
     let node_id = random_id();
     match path_kind {
         PackablePathKind::Directory => {
+            report.packed_directories.push(SourceDirectorySnapshot {
+                source_path: path.to_path_buf(),
+                relative_path: relative_path.clone(),
+            });
             catalog.nodes.insert(
                 node_id.clone(),
                 CatalogNodeV2 {
@@ -1708,18 +1791,19 @@ fn pack_path_v2(
                     descriptor_encrypted_sha256: None,
                 },
             );
-            let mut entries = fs::read_dir(path)?.collect::<std::result::Result<Vec<_>, _>>()?;
-            entries.sort_by_key(|entry| entry.path());
+            let entries = source_directory_entries(path)?;
             for entry in entries {
                 let child_path = entry.path();
                 let Some(_) = packable_path_kind(&child_path)? else {
                     report.skipped_paths.push(skipped_link(&child_path));
                     continue;
                 };
+                let child_name = file_name(&child_path)?;
                 pack_path_v2(
                     catalog,
                     &child_path,
-                    file_name(&child_path)?,
+                    child_name.clone(),
+                    relative_path.join(child_name),
                     Some(node_id.clone()),
                     key,
                     options,
@@ -1730,8 +1814,16 @@ fn pack_path_v2(
             }
         }
         PackablePathKind::File => {
-            let object_id =
-                pack_content_object_v2(catalog, path, key, options, remote_objects, progress)?;
+            let (object_id, source_snapshot) = pack_content_object_v2(
+                catalog,
+                path,
+                &relative_path,
+                key,
+                options,
+                remote_objects,
+                progress,
+            )?;
+            report.packed_files.push(source_snapshot);
             let object = catalog.content_objects.get(&object_id).ok_or_else(|| {
                 LiosError::DataCorruption(format!("missing packed content object: {object_id}"))
             })?;
@@ -1770,19 +1862,21 @@ fn ensure_packable_path(path: &Path) -> Result<PackablePathKind> {
 fn pack_content_object_v2(
     catalog: &mut CatalogV2,
     path: &Path,
+    relative_path: &Path,
     key: &KeyFile,
     options: &PackOptions,
     remote_objects: &[StorageObject],
     progress: &mut PackProgressTracker<'_>,
-) -> Result<String> {
+) -> Result<(String, SourceFileSnapshot)> {
     ensure_packable_path_kind(path, PackablePathKind::File)?;
+    let source_snapshot = snapshot_regular_file(path, relative_path)?;
     let object_id = random_id();
     let object_dir = options.staging_dir.join(FILES_DIR).join(&object_id);
     let chunks_dir = object_dir.join(FILE_CHUNKS_DIR);
     fs::create_dir_all(&chunks_dir)?;
 
     let result = (|| {
-        let source = fs::File::open(path)?;
+        let source = fs::File::open(path).map_err(|error| map_source_io_error(error, path))?;
         let mut source = BufReader::new(source);
         let mut file_hasher = Sha256::new();
         let mut chunks = Vec::new();
@@ -1827,6 +1921,7 @@ fn pack_content_object_v2(
             }
         }
 
+        verify_source_file_unchanged(&source_snapshot)?;
         let content_sha256 = hex::encode(file_hasher.finalize());
         let candidate_ids = content_object_candidates(catalog, &content_sha256);
         let mut unavailable_object_ids = Vec::new();
@@ -1841,7 +1936,7 @@ fn pack_content_object_v2(
                     .content_index
                     .insert(content_sha256.clone(), existing_object_id.clone());
                 fs::remove_dir_all(&object_dir)?;
-                return Ok(existing_object_id);
+                return Ok((existing_object_id, source_snapshot));
             }
             let existing_object = &catalog.content_objects[&existing_object_id];
             if existing_content_is_remotely_available(existing_object, remote_objects)?
@@ -1851,7 +1946,7 @@ fn pack_content_object_v2(
                     .content_index
                     .insert(content_sha256.clone(), existing_object_id.clone());
                 fs::remove_dir_all(&object_dir)?;
-                return Ok(existing_object_id);
+                return Ok((existing_object_id, source_snapshot));
             }
             unavailable_object_ids.push(existing_object_id);
         }
@@ -1890,7 +1985,7 @@ fn pack_content_object_v2(
             replace_content_object_references(catalog, &unavailable_object_id, &object_id);
             catalog.content_objects.remove(&unavailable_object_id);
         }
-        Ok(object_id.clone())
+        Ok((object_id.clone(), source_snapshot))
     })();
 
     if result.is_err() {
@@ -2539,8 +2634,85 @@ fn file_name(path: &Path) -> Result<String> {
     normalize_name(&name)
 }
 
+fn snapshot_source_path(
+    path: &Path,
+    relative_path: &Path,
+    report: &mut SourceSnapshotReport,
+) -> Result<()> {
+    let Some(kind) = packable_path_kind(path)? else {
+        report.skipped_paths.push(skipped_link(path));
+        return Ok(());
+    };
+    match kind {
+        PackablePathKind::File => {
+            report
+                .files
+                .push(snapshot_regular_file(path, relative_path)?);
+        }
+        PackablePathKind::Directory => {
+            report.directories.push(SourceDirectorySnapshot {
+                source_path: path.to_path_buf(),
+                relative_path: relative_path.to_path_buf(),
+            });
+            let entries = source_directory_entries(path)?;
+            for entry in entries {
+                let child_path = entry.path();
+                let child_relative = relative_path.join(file_name(&child_path)?);
+                snapshot_source_path(&child_path, &child_relative, report)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_regular_file(path: &Path, relative_path: &Path) -> Result<SourceFileSnapshot> {
+    let metadata = source_metadata(path)?;
+    let modified = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            LiosError::Unsupported(format!(
+                "source file modification time predates the Unix epoch: {}",
+                path.display()
+            ))
+        })?;
+    let modified_at_ns = i64::try_from(modified.as_nanos()).map_err(|_| {
+        LiosError::Unsupported(format!(
+            "source file modification time is out of range: {}",
+            path.display()
+        ))
+    })?;
+    Ok(SourceFileSnapshot {
+        source_path: path.to_path_buf(),
+        relative_path: relative_path.to_path_buf(),
+        size: metadata.len(),
+        modified_at_ns: Some(modified_at_ns),
+    })
+}
+
+fn source_metadata(path: &Path) -> Result<fs::Metadata> {
+    fs::symlink_metadata(path).map_err(|error| map_source_io_error(error, path))
+}
+
+fn source_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
+    let entries = fs::read_dir(path).map_err(|error| map_source_io_error(error, path))?;
+    let mut collected = Vec::new();
+    for entry in entries {
+        collected.push(entry.map_err(|error| map_source_io_error(error, path))?);
+    }
+    collected.sort_by_key(|entry| entry.path());
+    Ok(collected)
+}
+
+fn map_source_io_error(error: std::io::Error, path: &Path) -> LiosError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return LiosError::Unsupported(format!("source path no longer exists: {}", path.display()));
+    }
+    error.into()
+}
+
 fn packable_path_kind(path: &Path) -> Result<Option<PackablePathKind>> {
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = source_metadata(path)?;
     if is_link_or_junction(path, &metadata)? {
         return Ok(None);
     }

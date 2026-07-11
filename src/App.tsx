@@ -26,11 +26,17 @@ import {
   X,
   XCircle
 } from "lucide-react";
-import { type MouseEvent, useEffect, useState } from "react";
+import { type MouseEvent, useEffect, useRef, useState } from "react";
 import liosPetalMark from "./assets/lios-petal-mark.svg";
 import { initializeWithExistingCatalog, loadCatalogState } from "./catalogState.ts";
 import { errorText } from "./commandError.ts";
 import { setupWarningMessage, type SetupWarning } from "./setupWarning.ts";
+import {
+  taskItemProgressPercent,
+  taskItemStatusText,
+  taskProgressPercent,
+  taskProgressText
+} from "./taskPresentation.ts";
 
 type RepoConfig = {
   namespace: string;
@@ -83,9 +89,11 @@ type TaskItem = {
   id: string;
   task_id: string;
   name: string;
+  relative_path?: string | null;
   source_path?: string | null;
+  source_modified_at_ns?: number | null;
   size: number;
-  state: "Queued" | "Running" | "Skipped" | "Failed" | "Completed";
+  state: "Queued" | "Running" | "Skipped" | "Failed" | "Completed" | "Canceled";
   phase?: string | null;
   bytes_done: number;
   bytes_total: number;
@@ -222,7 +230,7 @@ type View = "spaces" | "drive" | "settings";
 type CatalogStatus = "idle" | "loading" | "ready" | "missing" | "error";
 
 function formatBytes(bytes: number) {
-  if (!bytes) return "-";
+  if (!bytes) return "0 B";
   const units = ["KB", "MB", "GB", "TB"];
   let value = bytes / 1024;
   let unit = units.shift() ?? "KB";
@@ -275,35 +283,9 @@ function taskStatusText(task: TaskRecord) {
   if (task.state === "Running" && task.phase === "restoring") return "正在恢复到本地";
   if (task.state === "Running") return task.progress_total > 0 ? "正在处理" : "正在准备";
   if (task.state === "Retrying") return `正在重试${task.attempt > 0 ? `（第 ${task.attempt} 次）` : ""}`;
+  if (task.state === "Committing" && task.phase === "reconciling") return "正在核对远端提交结果";
   if (task.state === "Committing") return "正在提交远端变更";
   return "处理中";
-}
-
-function taskProgressPercent(task: TaskRecord) {
-  if (task.progress_total <= 0) return task.state === "Completed" ? 100 : 0;
-  return Math.min(100, Math.max(0, Math.round((task.progress_done / task.progress_total) * 100)));
-}
-
-function taskProgressText(task: TaskRecord) {
-  if (task.progress_total > 0) {
-    const unit =
-      task.phase === "preparing"
-        ? "分片"
-        : task.phase === "uploading"
-          ? "远端操作"
-          : task.phase === "downloading" || task.phase === "restoring"
-            ? "步骤"
-            : task.label === "upload"
-              ? "远端操作"
-              : task.label === "download" || task.label === "restore"
-                ? "步骤"
-                : "项";
-    const speed = task.speed_bps ? ` · ${formatBytes(task.speed_bps)}/s` : "";
-    return `${task.progress_done}/${task.progress_total} ${unit} · ${taskProgressPercent(task)}%${speed}`;
-  }
-  if (["Preparing", "Running", "Retrying", "Committing"].includes(task.state)) return "准备中";
-  if (task.state === "Queued") return "等待开始";
-  return "-";
 }
 
 function nodeKind(node: CatalogTreeNode): "Directory" | "File" {
@@ -397,6 +379,7 @@ function App() {
   const [conflicts, setConflicts] = useState<UploadConflict[]>([]);
   const [conflictActions, setConflictActions] = useState<Record<string, ConflictAction>>({});
   const [cacheCleanup, setCacheCleanup] = useState<CacheCleanupReport | null>(null);
+  const previousTaskStates = useRef<Map<string, TaskState>>(new Map());
 
   const tasks = snapshot?.tasks ?? [];
   const configured = Boolean(snapshot?.has_token && snapshot.config.key_file_path);
@@ -533,6 +516,27 @@ function App() {
   useEffect(() => {
     refreshSetup().catch((error) => setMessage(errorText(error)));
   }, []);
+
+  useEffect(() => {
+    let completedMutation = false;
+    const nextStates = new Map<string, TaskState>();
+    for (const task of tasks) {
+      const previous = previousTaskStates.current.get(task.id);
+      if (
+        previous !== undefined &&
+        previous !== "Completed" &&
+        task.state === "Completed" &&
+        (task.label === "upload" || task.label === "delete")
+      ) {
+        completedMutation = true;
+      }
+      nextStates.set(task.id, task.state);
+    }
+    previousTaskStates.current = nextStates;
+    if (completedMutation && activeSpace) {
+      reloadCatalog().catch((error) => setMessage(errorText(error)));
+    }
+  }, [tasks, activeSpace?.namespace, activeSpace?.dataset, activeSpace?.endpoint]);
 
   useEffect(() => {
     let active = true;
@@ -710,7 +714,6 @@ function App() {
         paths,
         conflictResolutions: resolutions
       });
-      await reloadCatalog();
     });
   }
 
@@ -763,7 +766,6 @@ function App() {
     const nodeIds = [...selectedIds];
     await run("删除", async () => {
       await appInvoke("enqueue_delete_nodes", { nodeIds });
-      await reloadCatalog();
     });
   }
 
@@ -1274,41 +1276,93 @@ function App() {
                   "Running",
                   "Paused",
                   "Retrying",
-                  "Committing",
                 ].includes(task.state);
                 return (
                   <article className={`taskRow ${task.state.toLowerCase()}`} key={task.id}>
-                    <div className="taskIcon">{taskIcon(task.state)}</div>
-                    <div className="taskInfo">
-                      <strong>{taskLabel(task.label)}</strong>
-                      <span>{taskStatusText(task)}</span>
-                    </div>
-                    <div className="taskProgress">
-                      <div className="meter" aria-label={`${progress}%`}>
-                        <span style={{ width: `${progress}%` }} />
+                    <div className="taskSummary">
+                      <div className="taskIcon">{taskIcon(task.state)}</div>
+                      <div className="taskInfo">
+                        <strong>
+                          {taskLabel(task.label)}
+                          {task.items.length > 0 && <small>{task.items.length} 个文件</small>}
+                        </strong>
+                        <span>{taskStatusText(task)}</span>
                       </div>
-                      <small>{taskProgressText(task)}</small>
+                      <div className="taskProgress">
+                        <div className="meter" aria-label={`${progress}%`}>
+                          <span style={{ width: `${progress}%` }} />
+                        </div>
+                        <small>{taskProgressText(task)}</small>
+                      </div>
+                      <div className="taskButtons">
+                        {task.state === "Failed" ? (
+                          <>
+                            <button
+                              title="重试任务"
+                              aria-label="重试任务"
+                              onClick={() =>
+                                run("重试任务", () => appInvoke("retry_task", { taskId: task.id }))
+                              }
+                            >
+                              <RefreshCw aria-hidden />
+                            </button>
+                            <button
+                              title="清除记录"
+                              aria-label="清除记录"
+                              onClick={() =>
+                                run("清除任务记录", () => appInvoke("clear_task", { taskId: task.id }))
+                              }
+                            >
+                              <Trash2 aria-hidden />
+                            </button>
+                          </>
+                        ) : isCancelable ? (
+                          <button
+                            className="iconDanger"
+                            title="取消任务"
+                            aria-label="取消任务"
+                            onClick={() => run("取消任务", () => appInvoke("cancel_task", { taskId: task.id }))}
+                          >
+                            <XCircle aria-hidden />
+                          </button>
+                        ) : (
+                          <button
+                            title="清除记录"
+                            aria-label="清除记录"
+                            onClick={() => run("清除任务记录", () => appInvoke("clear_task", { taskId: task.id }))}
+                          >
+                            <Trash2 aria-hidden />
+                          </button>
+                        )}
+                      </div>
                     </div>
-                    <div className="taskButtons">
-                      {isCancelable ? (
-                        <button
-                          className="iconDanger"
-                          title="取消任务"
-                          aria-label="取消任务"
-                          onClick={() => run("取消任务", () => appInvoke("cancel_task", { taskId: task.id }))}
-                        >
-                          <XCircle aria-hidden />
-                        </button>
-                      ) : (
-                        <button
-                          title="清除记录"
-                          aria-label="清除记录"
-                          onClick={() => run("清除任务记录", () => appInvoke("clear_task", { taskId: task.id }))}
-                        >
-                          <Trash2 aria-hidden />
-                        </button>
-                      )}
-                    </div>
+                    {task.items.length > 0 && (
+                      <div className="taskFileList" aria-label={`${taskLabel(task.label)}文件明细`}>
+                        {task.items.map((item) => {
+                          const itemProgress = taskItemProgressPercent(item);
+                          const itemTotal = item.bytes_total || item.size;
+                          return (
+                            <div className={`taskFileRow ${item.state.toLowerCase()}`} key={item.id}>
+                              <File aria-hidden />
+                              <div className="taskFileInfo">
+                                <strong title={item.relative_path || item.name}>
+                                  {(item.relative_path || item.name).replace(/\\/g, "/")}
+                                </strong>
+                                <span>{taskItemStatusText(item)}</span>
+                              </div>
+                              <div className="taskFileProgress">
+                                <div className="meter" aria-label={`${itemProgress}%`}>
+                                  <span style={{ width: `${itemProgress}%` }} />
+                                </div>
+                                <small>
+                                  {formatBytes(item.bytes_done)} / {formatBytes(itemTotal)} · {itemProgress}%
+                                </small>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </article>
                 );
               })
