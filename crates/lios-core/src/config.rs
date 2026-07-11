@@ -38,10 +38,12 @@ pub struct LiosPaths {
 pub struct LiosConfig {
     pub active_repo: Option<RepoConfig>,
     pub key_file_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<PathBuf>,
     pub chunk_size: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoConfig {
     pub namespace: String,
     pub dataset: String,

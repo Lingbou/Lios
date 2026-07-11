@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AlertTriangle,
@@ -30,6 +30,13 @@ import { type MouseEvent, useEffect, useRef, useState } from "react";
 import liosPetalMark from "./assets/lios-petal-mark.svg";
 import { initializeWithExistingCatalog, loadCatalogState } from "./catalogState.ts";
 import { errorText } from "./commandError.ts";
+import {
+  conciseRecoveryKeyPath,
+  recoveryKeyBackupText,
+  recoveryKeyConfirmationText,
+  type RecoveryKeyStatus,
+  type RecoveryKeyVerification
+} from "./recoveryKeyPresentation.ts";
 import { setupWarningMessage, type SetupWarning } from "./setupWarning.ts";
 import {
   taskCompletionReloadsCatalog,
@@ -66,6 +73,7 @@ type DatasetRepoListResult = {
 type LiosConfig = {
   active_repo?: RepoConfig | null;
   key_file_path?: string | null;
+  backup_path?: string | null;
   chunk_size?: number | null;
 };
 
@@ -188,9 +196,17 @@ type CatalogRebuildDialog = {
   error: string;
 };
 
+type RecoveryKeyImportDialog = {
+  path: string;
+  verification: RecoveryKeyVerification;
+  importing: boolean;
+  error: string;
+};
+
 type Snapshot = {
   paths: PathsDto;
   config: LiosConfig;
+  recovery_key: RecoveryKeyStatus;
   has_token: boolean;
   tasks: TaskRecord[];
   warning: SetupWarning | null;
@@ -221,8 +237,13 @@ function previewSnapshot(): Snapshot {
     },
     config: {
       active_repo: null,
-      key_file_path: "~\\.lios\\keys\\default.key",
+      key_file_path: "~\\.lios\\recovery.key",
       chunk_size: 134217728
+    },
+    recovery_key: {
+      key_location: "~\\.lios\\recovery.key",
+      backed_up: false,
+      backup_location: null
     },
     has_token: false,
     tasks: [],
@@ -402,6 +423,7 @@ function App() {
   const [conflictActions, setConflictActions] = useState<Record<string, ConflictAction>>({});
   const [cacheCleanup, setCacheCleanup] = useState<CacheCleanupReport | null>(null);
   const [rebuildDialog, setRebuildDialog] = useState<CatalogRebuildDialog | null>(null);
+  const [recoveryKeyImport, setRecoveryKeyImport] = useState<RecoveryKeyImportDialog | null>(null);
   const previousTaskStates = useRef<Map<string, TaskState>>(new Map());
   const rebuildPreviewRequest = useRef(0);
 
@@ -830,6 +852,97 @@ function App() {
     });
   }
 
+  async function exportRecoveryKey() {
+    const destination = await save({
+      defaultPath: "lios-recovery.key",
+      filters: [{ name: "Lios recovery key", extensions: ["key", "yaml", "yml"] }]
+    });
+    if (typeof destination !== "string") return;
+    await run("导出恢复密钥", async () => {
+      await appInvoke<RecoveryKeyStatus>("export_recovery_key", { destination });
+      setMessage("恢复密钥备份已导出。请将它保存在独立且安全的位置。");
+    });
+  }
+
+  async function selectRecoveryKeyForImport() {
+    const selected = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Lios recovery key", extensions: ["key", "yaml", "yml"] }]
+    });
+    if (typeof selected !== "string") return;
+    setBusy("验证恢复密钥");
+    setMessage("");
+    try {
+      const verification = await appInvoke<RecoveryKeyVerification>("verify_recovery_key", {
+        path: selected
+      });
+      setRecoveryKeyImport({ path: selected, verification, importing: false, error: "" });
+    } catch (error) {
+      setMessage(errorText(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function refreshVerifiedCatalog(space: RepoConfig) {
+    const outcome = await loadCatalogState(() =>
+      appInvoke<CatalogLoadResult>("load_space_catalog", { space })
+    );
+    if (outcome.status === "missing") {
+      setCatalogTree(null);
+      setCurrentFolderId(null);
+      setCatalogStatus("missing");
+      return;
+    }
+    const result = outcome.catalog;
+    setActiveSpace(space);
+    setCatalogTree(result.tree);
+    setCurrentFolderId(result.tree.id);
+    setCatalogStatus("ready");
+    setSelectedIds(new Set());
+    setSearchResults([]);
+    setQuery("");
+  }
+
+  async function confirmRecoveryKeyImport() {
+    const dialog = recoveryKeyImport;
+    if (!dialog || dialog.importing) return;
+    setBusy("导入恢复密钥");
+    setRecoveryKeyImport({ ...dialog, importing: true, error: "" });
+    let verification: RecoveryKeyVerification;
+    try {
+      verification = await appInvoke<RecoveryKeyVerification>("import_recovery_key", {
+        path: dialog.path
+      });
+    } catch (error) {
+      setRecoveryKeyImport((current) =>
+        current ? { ...current, importing: false, error: errorText(error) } : current
+      );
+      setBusy(null);
+      return;
+    }
+
+    setRecoveryKeyImport(null);
+    try {
+      await refreshSetup(false);
+      if (
+        verification.catalog_checked &&
+        verification.checked_space &&
+        sameSpace(selectedSpace, verification.checked_space)
+      ) {
+        await refreshVerifiedCatalog(verification.checked_space);
+        setMessage("恢复密钥已导入，并已刷新验证过的空间。");
+      } else {
+        setMessage("恢复密钥已导入。外部密钥文件必须保持可用。");
+      }
+    } catch (error) {
+      setMessage(`恢复密钥已导入，但刷新状态失败：${errorText(error)}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function verifySpace(full: boolean) {
     if (!selectedSpace) {
       setMessage("先从账号中选择一个空间。");
@@ -1143,6 +1256,48 @@ function App() {
               </div>
             </div>
 
+            <div className="settingsBlock recoveryKeyBlock">
+              <div className="settingsHeaderRow">
+                <div>
+                  <h2>恢复密钥</h2>
+                  <p>用于打开已加密的 Lios 空间</p>
+                </div>
+                <div className="settingsActions">
+                  <button
+                    onClick={exportRecoveryKey}
+                    disabled={!snapshot?.recovery_key.key_location || busy !== null}
+                  >
+                    <Download aria-hidden />
+                    导出备份
+                  </button>
+                  <button
+                    onClick={selectRecoveryKeyForImport}
+                    disabled={busy !== null || recoveryKeyImport !== null}
+                  >
+                    <UploadCloud aria-hidden />
+                    导入密钥
+                  </button>
+                </div>
+              </div>
+              <div className="recoveryKeySummary">
+                <div className="recoveryKeyLocation">
+                  <KeyRound aria-hidden />
+                  <span>
+                    <small>当前密钥</small>
+                    <strong title={snapshot?.recovery_key.key_location ?? undefined}>
+                      {conciseRecoveryKeyPath(snapshot?.recovery_key.key_location)}
+                    </strong>
+                  </span>
+                </div>
+                <span
+                  className={`backupStatus ${snapshot?.recovery_key.backed_up ? "ready" : "missing"}`}
+                  title={snapshot?.recovery_key.backup_location ?? undefined}
+                >
+                  {recoveryKeyBackupText(snapshot?.recovery_key)}
+                </span>
+              </div>
+            </div>
+
             <div className="settingsBlock">
               <div className="settingsHeaderRow">
                 <div>
@@ -1190,10 +1345,6 @@ function App() {
                 </div>
               )}
               <dl className="pathGrid">
-                <div>
-                  <dt>Key</dt>
-                  <dd>{displayPath(snapshot?.config.key_file_path)}</dd>
-                </div>
                 <div>
                   <dt>Config</dt>
                   <dd>{displayPath(snapshot?.paths.config)}</dd>
@@ -1666,6 +1817,72 @@ function App() {
                   {rebuildDialog.status === "submitting" ? "正在加入任务" : "确认恢复"}
                 </button>
               </div>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {recoveryKeyImport && (
+        <div className="modalBackdrop">
+          <section
+            className="recoveryKeyModal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="recovery-key-import-title"
+          >
+            <div className="modalHeader">
+              <div>
+                <h2 id="recovery-key-import-title">导入恢复密钥</h2>
+                <p>{conciseRecoveryKeyPath(recoveryKeyImport.path)}</p>
+              </div>
+              <button
+                onClick={() => setRecoveryKeyImport(null)}
+                disabled={recoveryKeyImport.importing}
+                title="关闭"
+                aria-label="关闭"
+              >
+                <X aria-hidden />
+              </button>
+            </div>
+            <div className="recoveryKeyModalBody">
+              <div className="recoveryVerificationResult">
+                <CheckCircle2 aria-hidden />
+                <span>
+                  <strong>密钥验证通过</strong>
+                  <small>{recoveryKeyConfirmationText(recoveryKeyImport.verification)}</small>
+                </span>
+              </div>
+              <div className="externalKeyNotice">
+                <KeyRound aria-hidden />
+                <span>
+                  Lios 不会把此密钥复制到 ~/.lios。导入后请勿移动、改名或删除所选文件。
+                </span>
+              </div>
+              {recoveryKeyImport.error && (
+                <div className="rebuildError" role="alert">
+                  <AlertTriangle aria-hidden />
+                  <span>
+                    <strong>密钥导入失败</strong>
+                    <small>{recoveryKeyImport.error}</small>
+                  </span>
+                </div>
+              )}
+            </div>
+            <div className="modalActions">
+              <button
+                onClick={() => setRecoveryKeyImport(null)}
+                disabled={recoveryKeyImport.importing}
+              >
+                取消
+              </button>
+              <button
+                className="primary"
+                onClick={confirmRecoveryKeyImport}
+                disabled={recoveryKeyImport.importing}
+              >
+                <KeyRound aria-hidden />
+                {recoveryKeyImport.importing ? "正在重新验证" : "确认导入"}
+              </button>
             </div>
           </section>
         </div>

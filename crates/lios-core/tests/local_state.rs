@@ -70,6 +70,7 @@ fn config_roundtrips_as_yaml_without_token_material() {
             endpoint: "https://www.modelscope.cn".to_string(),
         }),
         key_file_path: Some(tmp.path().join("recovery.key")),
+        backup_path: Some(tmp.path().join("backups/recovery.key")),
         chunk_size: Some(128 * 1024 * 1024),
     };
 
@@ -78,6 +79,11 @@ fn config_roundtrips_as_yaml_without_token_material() {
     let loaded = LiosConfig::load(&path).unwrap();
 
     assert_eq!(loaded.active_repo.unwrap().dataset, "cold-backup");
+    assert_eq!(
+        loaded.backup_path.as_deref(),
+        Some(tmp.path().join("backups/recovery.key").as_path())
+    );
+    assert!(raw_yaml.contains("backup_path:"));
     assert!(!raw_yaml.contains("token"));
     assert!(!raw_yaml.contains("secret"));
 }
