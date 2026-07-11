@@ -30,7 +30,23 @@ fn local_paths_follow_lios_layout() {
     assert_eq!(paths.config, tmp.path().join(".lios/config.yaml"));
     assert_eq!(paths.database, tmp.path().join(".lios/lios.db"));
     assert_eq!(paths.staging, tmp.path().join(".lios/staging"));
+    assert_eq!(paths.logs, tmp.path().join(".lios/logs"));
     assert_eq!(paths.credentials, tmp.path().join(".lios/credentials.enc"));
+}
+
+#[test]
+fn ensure_dirs_ignores_an_unavailable_logs_path_and_keeps_staging_usable() {
+    let tmp = tempdir().unwrap();
+    let paths = LiosPaths::from_home(tmp.path());
+    std::fs::create_dir_all(&paths.home).unwrap();
+    std::fs::write(&paths.logs, "logs are blocked by a file").unwrap();
+
+    paths.ensure_dirs().unwrap();
+
+    let staged = paths.staging.join("probe.bin");
+    std::fs::write(&staged, b"usable").unwrap();
+    assert_eq!(std::fs::read(staged).unwrap(), b"usable");
+    assert!(paths.logs.is_file());
 }
 
 #[test]
