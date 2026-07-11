@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "test:frontend": "node --test tests/catalogState.test.ts tests/taskPresentation.test.ts tests/recoveryKeyPresentation.test.ts",
+    "test:frontend": "node --test tests/catalogState.test.ts tests/taskPresentation.test.ts tests/recoveryKeyPresentation.test.ts tests/appHardening.test.ts",
     "build": "tsc && vite build",
     "tauri": "tauri"
   },

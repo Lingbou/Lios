@@ -163,6 +163,27 @@ pub(crate) fn write_private_atomic_new(path: &Path, contents: &[u8]) -> io::Resu
     temp.persist_new(path)
 }
 
+pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    set_private_directory_permissions(path)
+}
+
+pub(crate) fn append_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = destination_parent(path);
+    ensure_private_directory(parent)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    set_private_permissions(&file, path)?;
+    file.write_all(contents)?;
+    file.flush()
+}
+
 pub(crate) fn write_atomic_immutable(path: &Path, contents: &[u8]) -> io::Result<()> {
     match fs::read(path) {
         Ok(existing) if existing == contents => return Ok(()),
@@ -234,8 +255,25 @@ fn set_private_permissions(file: &File, _path: &Path) -> io::Result<()> {
     file.set_permissions(fs::Permissions::from_mode(0o600))
 }
 
+#[cfg(unix)]
+fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
 #[cfg(windows)]
 fn set_private_permissions(_file: &File, path: &Path) -> io::Result<()> {
+    set_private_path_permissions(path)
+}
+
+#[cfg(windows)]
+fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
+    set_private_path_permissions(path)
+}
+
+#[cfg(windows)]
+fn set_private_path_permissions(path: &Path) -> io::Result<()> {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
 
@@ -346,6 +384,11 @@ fn set_private_permissions(_file: &File, path: &Path) -> io::Result<()> {
 
 #[cfg(not(any(unix, windows)))]
 fn set_private_permissions(_file: &File, _path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_private_directory_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

@@ -82,6 +82,7 @@ type PathsDto = {
   config: string;
   database: string;
   staging: string;
+  logs: string;
   credentials: string;
 };
 
@@ -233,6 +234,7 @@ function previewSnapshot(): Snapshot {
       config: "~\\.lios\\config.yaml",
       database: "~\\.lios\\lios.db",
       staging: "~\\.lios\\staging",
+      logs: "~\\.lios\\logs",
       credentials: "~\\.lios\\credentials.enc"
     },
     config: {
@@ -1357,6 +1359,12 @@ function App() {
                   <dt>Staging</dt>
                   <dd>{displayPath(snapshot?.paths.staging)}</dd>
                 </div>
+                <div>
+                  <dt>Logs</dt>
+                  <dd title={snapshot?.paths.logs ?? undefined}>
+                    {conciseRecoveryKeyPath(snapshot?.paths.logs)}
+                  </dd>
+                </div>
               </dl>
             </div>
           </section>
@@ -1600,9 +1608,9 @@ function App() {
                         <span>{taskStatusText(task)}</span>
                       </div>
                       <div className="taskProgress">
-                        <div className="meter" aria-label={`${progress}%`}>
-                          <span style={{ width: `${progress}%` }} />
-                        </div>
+                        <progress className="meter" max={100} value={progress} aria-label={`${progress}%`}>
+                          {progress}%
+                        </progress>
                         <small>{taskProgressText(task)}</small>
                       </div>
                       <div className="taskButtons">
@@ -1662,9 +1670,14 @@ function App() {
                                 <span>{taskItemStatusText(item)}</span>
                               </div>
                               <div className="taskFileProgress">
-                                <div className="meter" aria-label={`${itemProgress}%`}>
-                                  <span style={{ width: `${itemProgress}%` }} />
-                                </div>
+                                <progress
+                                  className="meter"
+                                  max={100}
+                                  value={itemProgress}
+                                  aria-label={`${itemProgress}%`}
+                                >
+                                  {itemProgress}%
+                                </progress>
                                 <small>
                                   {formatBytes(item.bytes_done)} / {formatBytes(itemTotal)} · {itemProgress}%
                                 </small>

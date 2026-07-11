@@ -1,3 +1,5 @@
+mod app_log;
+
 pub mod catalog_mutation_gate;
 pub mod catalog_probe;
 pub mod command_error;
@@ -17,6 +19,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use app_log::AppLogger;
 use catalog_mutation_gate::CatalogMutationGate;
 use catalog_probe::{ensure_space_can_initialize, map_catalog_load_error};
 use command_error::{CommandError, CommandErrorCode};
@@ -72,6 +75,7 @@ type CommandResult<T> = std::result::Result<T, CommandError>;
 
 struct AppContext {
     paths: LiosPaths,
+    app_log: AppLogger,
     catalog_mutation_gate: CatalogMutationGate,
     config_mutation_gate: ConfigMutationGate,
     task_lifecycle_gate: Mutex<TaskLifecycleState>,
@@ -87,8 +91,15 @@ impl AppContext {
     fn new() -> Self {
         let paths = LiosPaths::default_user();
         let _ = cleanup_temporary_staging(&paths.staging);
+        let app_log = AppLogger::new(&paths);
+        app_log.log(
+            "info",
+            "app_started",
+            serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+        );
         Self {
             paths,
+            app_log,
             catalog_mutation_gate: CatalogMutationGate::default(),
             config_mutation_gate: ConfigMutationGate::default(),
             task_lifecycle_gate: Mutex::new(TaskLifecycleState::default()),
@@ -103,6 +114,7 @@ struct PathsDto {
     config: String,
     database: String,
     staging: String,
+    logs: String,
     credentials: String,
 }
 
@@ -172,8 +184,18 @@ fn paths_dto(paths: &LiosPaths) -> PathsDto {
         config: paths.config.display().to_string(),
         database: paths.database.display().to_string(),
         staging: paths.staging.display().to_string(),
+        logs: paths.logs.display().to_string(),
         credentials: paths.credentials.display().to_string(),
     }
+}
+
+fn recovery_log_details(catalog_checked: bool, repo: Option<&RepoConfig>) -> serde_json::Value {
+    let scope = repo.map(TaskScope::from_repo);
+    serde_json::json!({
+        "catalog_checked": catalog_checked,
+        "account_id": scope.as_ref().map(|scope| scope.account_id.as_str()),
+        "space_id": scope.as_ref().map(|scope| scope.space_id.as_str()),
+    })
 }
 
 fn load_config(paths: &LiosPaths) -> CommandResult<LiosConfig> {
@@ -344,6 +366,79 @@ fn update_task_state(
     task_store(paths)?
         .update_state(id, state, error)
         .map_err(to_err)
+}
+
+fn safe_task_kind(label: &str) -> &'static str {
+    match label {
+        "upload" => "upload",
+        "delete" => "delete",
+        "download" => "download",
+        "verify_quick" => "verify_quick",
+        "verify_full" => "verify_full",
+        "rebuild" => "rebuild",
+        _ => "unknown",
+    }
+}
+
+struct TaskLogFields<'a> {
+    id: Uuid,
+    kind: &'a str,
+    state: &'a TaskState,
+    attempt: u32,
+}
+
+fn log_task_event(
+    app: &tauri::AppHandle,
+    level: &str,
+    event: &str,
+    task: TaskLogFields<'_>,
+    error: Option<(CommandErrorCode, bool)>,
+) {
+    let mut details = serde_json::json!({
+        "task_id": task.id,
+        "task_kind": safe_task_kind(task.kind),
+        "state": task.state,
+        "attempt": task.attempt,
+    });
+    if let Some((code, retryable)) = error {
+        if let Some(details) = details.as_object_mut() {
+            details.insert("error_code".to_string(), serde_json::json!(code));
+            details.insert("retryable".to_string(), serde_json::json!(retryable));
+        }
+    }
+    app.state::<AppContext>().app_log.log(level, event, details);
+}
+
+fn log_persisted_task_outcome(
+    app: &tauri::AppHandle,
+    paths: &LiosPaths,
+    task_id: Uuid,
+    error: Option<(CommandErrorCode, bool)>,
+) {
+    let Some(task) = TaskStore::open(&paths.database)
+        .ok()
+        .and_then(|store| store.get(task_id).ok().flatten())
+    else {
+        return;
+    };
+    let (level, event) = match &task.state {
+        TaskState::Completed => ("info", "task_finished"),
+        TaskState::Failed => ("error", "task_failed"),
+        TaskState::Paused | TaskState::Canceled => ("warn", "task_interrupted"),
+        _ => return,
+    };
+    log_task_event(
+        app,
+        level,
+        event,
+        TaskLogFields {
+            id: task.id,
+            kind: &task.label,
+            state: &task.state,
+            attempt: task.attempt,
+        },
+        error,
+    );
 }
 
 fn update_terminal_task_items(
@@ -1071,6 +1166,16 @@ enum StartupReconciliationOutcome {
     Stop,
 }
 
+fn startup_reconciliation_terminal_error(
+    outcome: StartupReconciliationOutcome,
+) -> Option<Option<(CommandErrorCode, bool)>> {
+    match outcome {
+        StartupReconciliationOutcome::Continue => Some(None),
+        StartupReconciliationOutcome::Replay => None,
+        StartupReconciliationOutcome::Stop => Some(Some((CommandErrorCode::RemoteConflict, false))),
+    }
+}
+
 async fn retry_storage_operation<T>(
     mut operation: impl FnMut() -> CommandResult<T>,
 ) -> CommandResult<T> {
@@ -1356,6 +1461,11 @@ async fn run_catalog_reconciliation_locked(
         task_id,
     )
     .await;
+    if let Ok(outcome) = &result {
+        if let Some(error) = startup_reconciliation_terminal_error(*outcome) {
+            log_persisted_task_outcome(&app, &paths, task_id, error);
+        }
+    }
     emit_tasks(&app, &paths);
     result
 }
@@ -1414,6 +1524,12 @@ async fn run_startup_space_work(
                     &error.message,
                 )
                 .await;
+                log_persisted_task_outcome(
+                    &app,
+                    &state.paths,
+                    task_id,
+                    Some((error.code, error.retryable)),
+                );
                 emit_tasks(&app, &state.paths);
                 return;
             }
@@ -1473,6 +1589,12 @@ async fn run_startup_space_work(
                         &reconcile_error.message,
                     )
                     .await;
+                    log_persisted_task_outcome(
+                        &app,
+                        &state.paths,
+                        task_id,
+                        Some((reconcile_error.code, reconcile_error.retryable)),
+                    );
                     emit_tasks(&app, &state.paths);
                     return;
                 }
@@ -1485,8 +1607,14 @@ async fn run_startup_space_work(
                     task_id,
                     TaskItemState::Failed,
                     None,
-                    Some(error.message),
+                    Some(error.message.clone()),
                     false,
+                );
+                log_persisted_task_outcome(
+                    &app,
+                    &state.paths,
+                    task_id,
+                    Some((error.code, error.retryable)),
                 );
             }
         }
@@ -1525,6 +1653,12 @@ fn spawn_persisted_task(app: tauri::AppHandle, task_id: Uuid) {
                             None,
                             Some(error.message.clone()),
                             false,
+                        );
+                        log_persisted_task_outcome(
+                            &app,
+                            &state.paths,
+                            task_id,
+                            Some((error.code, error.retryable)),
                         );
                     }
                 }
@@ -1592,6 +1726,18 @@ async fn run_persisted_task_locked(
         .get(task_id)
         .map_err(to_err)?
         .ok_or_else(|| CommandError::invalid_input("claimed task disappeared"))?;
+    log_task_event(
+        &app,
+        "info",
+        "task_started",
+        TaskLogFields {
+            id: task.id,
+            kind: spec.label(),
+            state: &task.state,
+            attempt: task.attempt,
+        },
+        None,
+    );
     {
         let state = app.state::<AppContext>();
         state
@@ -1603,6 +1749,7 @@ async fn run_persisted_task_locked(
     }
     let control = manager.register(task_id).await;
     emit_tasks(&app, &paths);
+    let mut terminal_error = None;
     let finalization = async {
         loop {
             let execution = execute_task_with_retries(
@@ -1691,6 +1838,7 @@ async fn run_persisted_task_locked(
                     let decision = match decision {
                         Ok(decision) => decision,
                         Err(error) => {
+                            terminal_error = Some((error.code, error.retryable));
                             let applied = fail_unrecoverable_reconciliation_with_retry(
                                 &paths,
                                 task_id,
@@ -1707,6 +1855,9 @@ async fn run_persisted_task_locked(
                             break if applied { Ok(()) } else { Err(error) };
                         }
                     };
+                    if decision == CatalogReconcileDecision::Conflict {
+                        terminal_error = Some((CommandErrorCode::RemoteConflict, false));
+                    }
                     if decision == CatalogReconcileDecision::Replay {
                         manager
                             .restore_transfer(execution_permit)
@@ -1757,6 +1908,7 @@ async fn run_persisted_task_locked(
                     break applied;
                 }
                 Err(error) => {
+                    terminal_error = Some((error.code, error.retryable));
                     let result = finish_active_worker(
                         &task_paths,
                         &state.task_lifecycle_gate,
@@ -1776,10 +1928,12 @@ async fn run_persisted_task_locked(
     manager.remove(&control).await;
     let staging_cleanup = cleanup_terminal_task_staging_and_record(&task_paths, &spec, task_id);
     emit_tasks(&app, &paths);
-    match finalization {
+    let result = match finalization {
         Ok(()) => staging_cleanup,
         Err(error) => Err(error),
-    }
+    };
+    log_persisted_task_outcome(&app, &paths, task_id, terminal_error);
+    result
 }
 
 async fn execute_task_with_retries(
@@ -1840,6 +1994,18 @@ async fn execute_task_with_retries(
                         None,
                     ));
                 }
+                log_task_event(
+                    app,
+                    "warn",
+                    "task_retry_scheduled",
+                    TaskLogFields {
+                        id: task.id,
+                        kind: spec.label(),
+                        state: &TaskState::Retrying,
+                        attempt: next_attempt,
+                    },
+                    Some((error.code, error.retryable)),
+                );
                 store
                     .update_items_state(
                         task.id,
@@ -3839,11 +4005,20 @@ fn export_recovery_key(
     state: tauri::State<'_, AppContext>,
     destination: String,
 ) -> CommandResult<RecoveryKeyStatus> {
-    export_recovery_key_for_paths(
+    let status = export_recovery_key_for_paths(
         &state.paths,
         &state.config_mutation_gate,
         Path::new(&destination),
-    )
+    )?;
+    let active_repo = LiosConfig::load(&state.paths.config)
+        .ok()
+        .and_then(|config| config.active_repo);
+    state.app_log.log(
+        "info",
+        "recovery_key_exported",
+        recovery_log_details(false, active_repo.as_ref()),
+    );
+    Ok(status)
 }
 
 #[tauri::command]
@@ -3859,7 +4034,18 @@ async fn import_recovery_key(
     state: tauri::State<'_, AppContext>,
     path: String,
 ) -> CommandResult<RecoveryKeyVerification> {
-    import_recovery_key_for_paths(&state.paths, &state.config_mutation_gate, Path::new(&path)).await
+    let verification =
+        import_recovery_key_for_paths(&state.paths, &state.config_mutation_gate, Path::new(&path))
+            .await?;
+    state.app_log.log(
+        "info",
+        "recovery_key_imported",
+        recovery_log_details(
+            verification.catalog_checked,
+            verification.checked_space.as_ref(),
+        ),
+    );
+    Ok(verification)
 }
 
 #[tauri::command]
@@ -4246,6 +4432,15 @@ pub fn run() {
             let handle = app.handle().clone();
             let paths = app.state::<AppContext>().paths.clone();
             let recovery = recover_startup_tasks(&paths)?;
+            app.state::<AppContext>().app_log.log(
+                "info",
+                "startup_task_recovery",
+                serde_json::json!({
+                    "queued": recovery.queued.len(),
+                    "reconcile": recovery.reconcile.len(),
+                    "total": recovery.queued.len() + recovery.reconcile.len(),
+                }),
+            );
             start_terminal_task_staging_cleanup(&handle, &paths);
             emit_tasks(&handle, &paths);
             start_startup_tasks(&handle, &paths, recovery)?;
@@ -4528,8 +4723,9 @@ mod task_cleanup_tests {
         activate_existing_task, activate_new_task, cleanup_current_staging_cache, cleanup_if_idle,
         clear_task_record, finish_active_worker, finish_committed_worker, group_startup_tasks,
         reconciliation_error_should_wait, recover_startup_tasks, retry_storage_operation,
-        set_task_state, task_state_blocks_clear, task_state_is_active, CatalogMutationGate,
-        CommandError, CommandErrorCode, StartupTaskRecovery, TaskLifecycleState,
+        set_task_state, startup_reconciliation_terminal_error, task_state_blocks_clear,
+        task_state_is_active, CatalogMutationGate, CommandError, CommandErrorCode,
+        StartupReconciliationOutcome, StartupTaskRecovery, TaskLifecycleState,
     };
 
     #[test]
@@ -4582,6 +4778,22 @@ mod task_cleanup_tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].reconcile, vec![committing.id]);
         assert_eq!(groups[0].queued, vec![replayable.id]);
+    }
+
+    #[test]
+    fn startup_reconciliation_logs_only_terminal_decisions() {
+        assert_eq!(
+            startup_reconciliation_terminal_error(StartupReconciliationOutcome::Continue),
+            Some(None)
+        );
+        assert_eq!(
+            startup_reconciliation_terminal_error(StartupReconciliationOutcome::Stop),
+            Some(Some((CommandErrorCode::RemoteConflict, false)))
+        );
+        assert_eq!(
+            startup_reconciliation_terminal_error(StartupReconciliationOutcome::Replay),
+            None
+        );
     }
 
     #[test]
