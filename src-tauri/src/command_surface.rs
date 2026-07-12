@@ -23,6 +23,7 @@ macro_rules! with_registered_commands {
             verify_recovery_key,
             import_recovery_key,
             list_tasks,
+            list_task_items,
             cleanup_local_cache,
             pause_task,
             resume_task,
@@ -82,6 +83,7 @@ mod tests {
             "enqueue_verify_space",
             "preview_rebuild_catalog",
             "enqueue_rebuild_catalog",
+            "list_task_items",
             "retry_task",
         ] {
             assert!(REGISTERED_COMMANDS.contains(&command), "{command}");

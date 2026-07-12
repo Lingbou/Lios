@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -23,13 +22,24 @@ import {
   Square,
   Trash2,
   UploadCloud,
-  X,
-  XCircle
+  X
 } from "lucide-react";
-import { type MouseEvent, useEffect, useRef, useState } from "react";
+import { type MouseEvent, useCallback, useEffect, useRef, useState } from "react";
 import liosPetalMark from "./assets/lios-petal-mark.svg";
-import { initializeWithExistingCatalog, loadCatalogState } from "./catalogState.ts";
+import {
+  createLatestSerialExecutor,
+  initializeWithExistingCatalog,
+  loadCatalogState
+} from "./catalogState.ts";
 import { errorText } from "./commandError.ts";
+import { TaskCenter } from "./features/tasks/TaskCenter.tsx";
+import { createTaskApi } from "./features/tasks/taskApi.ts";
+import {
+  newCatalogMutationCompletions,
+  seedCatalogMutationCompletions
+} from "./features/tasks/taskPresentation.ts";
+import { type TaskSummary } from "./features/tasks/taskTypes.ts";
+import { useTasks } from "./features/tasks/useTasks.ts";
 import {
   conciseRecoveryKeyPath,
   recoveryKeyBackupText,
@@ -38,15 +48,6 @@ import {
   type RecoveryKeyVerification
 } from "./recoveryKeyPresentation.ts";
 import { setupWarningMessage, type SetupWarning } from "./setupWarning.ts";
-import {
-  taskCompletionReloadsCatalog,
-  taskItemProgressPercent,
-  taskItemStatusText,
-  taskLabelText,
-  taskProgressPercent,
-  taskProgressText,
-  taskStatusText
-} from "./taskPresentation.ts";
 
 type RepoConfig = {
   namespace: string;
@@ -58,6 +59,7 @@ type SpaceSummary = RepoConfig & {
   visibility?: string | null;
   updated_at?: string | null;
   description?: string | null;
+  task_space_id?: string;
 };
 
 type ModelScopeUserSummary = {
@@ -84,56 +86,6 @@ type PathsDto = {
   staging: string;
   logs: string;
   credentials: string;
-};
-
-type TaskState =
-  | "Queued"
-  | "Preparing"
-  | "Running"
-  | "Paused"
-  | "Retrying"
-  | "Committing"
-  | "Failed"
-  | "Completed"
-  | "Canceled";
-
-type TaskItem = {
-  id: string;
-  task_id: string;
-  name: string;
-  relative_path?: string | null;
-  source_path?: string | null;
-  source_modified_at_ns?: number | null;
-  size: number;
-  state: "Queued" | "Running" | "Skipped" | "Failed" | "Completed" | "Canceled";
-  phase?: string | null;
-  bytes_done: number;
-  bytes_total: number;
-  error?: string | null;
-};
-
-type TaskRecord = {
-  id: string;
-  account_id: string;
-  space_id: string;
-  state: TaskState;
-  label: string;
-  phase?: string | null;
-  progress_total: number;
-  progress_done: number;
-  bytes_total?: number;
-  bytes_done?: number;
-  speed_bps?: number;
-  eta_seconds?: number | null;
-  attempt: number;
-  created_at: string;
-  updated_at: string;
-  error?: string | null;
-  items: TaskItem[];
-};
-
-type TaskUpdateEvent = {
-  tasks: TaskRecord[];
 };
 
 type CacheCleanupReport = {
@@ -209,7 +161,8 @@ type Snapshot = {
   config: LiosConfig;
   recovery_key: RecoveryKeyStatus;
   has_token: boolean;
-  tasks: TaskRecord[];
+  active_task_space_id: string | null;
+  tasks: TaskSummary[];
   warning: SetupWarning | null;
 };
 
@@ -248,6 +201,7 @@ function previewSnapshot(): Snapshot {
       backup_location: null
     },
     has_token: false,
+    active_task_space_id: null,
     tasks: [],
     warning: null
   };
@@ -256,11 +210,17 @@ function previewSnapshot(): Snapshot {
 async function appInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
   if (hasTauriRuntime()) return invoke<T>(command, args);
   if (command === "current_setup") return previewSnapshot() as T;
+  if (command === "list_tasks") return [] as T;
+  if (command === "list_task_items") {
+    return { task_id: args?.taskId, offset: args?.offset ?? 0, total: 0, items: [] } as T;
+  }
   if (command === "list_dataset_repos") {
     return { user: { username: "Preview" }, repositories: [] } as T;
   }
   throw new Error("这个操作需要在 Lios 桌面端中执行");
 }
+
+const taskApi = createTaskApi(appInvoke);
 
 type UploadConflict = {
   source_path: string;
@@ -305,12 +265,6 @@ function displayPath(value?: string | null) {
 
 function formatCacheBytes(bytes: number) {
   return bytes <= 0 ? "0 B" : formatBytes(bytes);
-}
-
-function taskIcon(state: TaskState) {
-  if (state === "Completed") return <CheckCircle2 aria-hidden />;
-  if (state === "Failed" || state === "Canceled") return <XCircle aria-hidden />;
-  return <RefreshCw aria-hidden />;
 }
 
 function nodeKind(node: CatalogTreeNode): "Directory" | "File" {
@@ -420,16 +374,28 @@ function App() {
   const [createSpaceError, setCreateSpaceError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState("");
+  const handleTaskError = useCallback((error: unknown) => setMessage(errorText(error)), []);
+  const {
+    tasks,
+    ready: tasksReady,
+    pendingActions,
+    onAction: runTaskAction,
+    listTaskItems,
+    refreshTasks,
+    syncTasks,
+    upsertTask
+  } = useTasks({ api: taskApi, onError: handleTaskError });
   const [pendingUpload, setPendingUpload] = useState<string[]>([]);
   const [conflicts, setConflicts] = useState<UploadConflict[]>([]);
   const [conflictActions, setConflictActions] = useState<Record<string, ConflictAction>>({});
   const [cacheCleanup, setCacheCleanup] = useState<CacheCleanupReport | null>(null);
   const [rebuildDialog, setRebuildDialog] = useState<CatalogRebuildDialog | null>(null);
   const [recoveryKeyImport, setRecoveryKeyImport] = useState<RecoveryKeyImportDialog | null>(null);
-  const previousTaskStates = useRef<Map<string, TaskState>>(new Map());
+  const catalogLoads = useRef(createLatestSerialExecutor()).current;
+  const catalogMutationCompletions = useRef<Set<string>>(new Set());
+  const catalogMutationCompletionBaselineReady = useRef(false);
   const rebuildPreviewRequest = useRef(0);
 
-  const tasks = snapshot?.tasks ?? [];
   const configured = Boolean(snapshot?.has_token && snapshot.config.key_file_path);
   const currentFolder = findNode(catalogTree, currentFolderId);
   const children =
@@ -437,9 +403,6 @@ function App() {
   const visibleItems = query.trim() ? searchResults : children;
   const crumbs = breadcrumb(catalogTree, currentFolderId);
   const selectedCount = selectedIds.size;
-  const runningTasks = tasks.filter((task) =>
-    ["Preparing", "Running", "Retrying", "Committing"].includes(task.state)
-  ).length;
   const activeTasks = tasks.filter((task) =>
     ["Queued", "Preparing", "Running", "Paused", "Retrying", "Committing"].includes(task.state)
   ).length;
@@ -448,8 +411,6 @@ function App() {
       task.label === "rebuild" &&
       ["Queued", "Preparing", "Running", "Paused", "Retrying", "Committing"].includes(task.state)
   );
-  const failedTasks = tasks.filter((task) => task.state === "Failed").length;
-  const totalTasks = tasks.length;
   const hasToken = Boolean(snapshot?.has_token);
   const selectedSpace = activeSpace ?? snapshot?.config.active_repo ?? null;
 
@@ -502,11 +463,22 @@ function App() {
 
   async function refreshSetup(loadSpaces = true) {
     const next = await appInvoke<Snapshot>("current_setup");
+    if (!catalogMutationCompletionBaselineReady.current) {
+      seedCatalogMutationCompletions(catalogMutationCompletions.current, next.tasks);
+      catalogMutationCompletionBaselineReady.current = true;
+      syncTasks(next.tasks);
+    }
     setSnapshot(next);
     const warning = setupWarningMessage(next.warning);
     if (warning) setMessage(warning);
     const configuredRepo = next.config.active_repo;
-    let visibleActiveRepo = configuredRepo ?? null;
+    const scopedConfiguredRepo: SpaceSummary | null = configuredRepo
+      ? {
+          ...configuredRepo,
+          task_space_id: next.active_task_space_id ?? undefined
+        }
+      : null;
+    let visibleActiveRepo = scopedConfiguredRepo;
     setManualEndpoint((current) => configuredRepo?.endpoint || current);
     if (loadSpaces && next.has_token) {
       setSpacesLoaded(false);
@@ -516,7 +488,10 @@ function App() {
       setModelscopeUser(result.user);
       setSpaces(result.repositories);
       setSpacesLoaded(true);
-      if (configuredRepo && !result.repositories.some((space) => sameSpace(space, configuredRepo))) {
+      const configuredSpace = configuredRepo
+        ? result.repositories.find((space) => sameSpace(space, configuredRepo))
+        : undefined;
+      if (configuredRepo && !configuredSpace) {
         visibleActiveRepo = null;
         setCatalogTree(null);
         setCatalogStatus("idle");
@@ -525,6 +500,8 @@ function App() {
         setSearchResults([]);
         setQuery("");
         setMessage("");
+      } else if (configuredSpace) {
+        visibleActiveRepo = configuredSpace;
       }
     } else if (
       spacesLoaded &&
@@ -542,20 +519,14 @@ function App() {
       setCatalogStatus("idle");
       setCurrentFolderId(null);
     }
-  }
-
-  async function refreshTasks() {
-    const nextTasks = await appInvoke<TaskRecord[]>("list_tasks");
-    setSnapshot((current) => (current ? { ...current, tasks: nextTasks } : current));
+    return scopedConfiguredRepo;
   }
 
   async function run(label: string, action: () => Promise<unknown>) {
     setBusy(label);
     setMessage("");
     try {
-      const pending = action();
-      await refreshTasks().catch(() => undefined);
-      await pending;
+      await action();
       await refreshSetup(false);
       await refreshTasks().catch(() => undefined);
     } catch (error) {
@@ -572,51 +543,18 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let completedMutation = false;
-    const nextStates = new Map<string, TaskState>();
-    for (const task of tasks) {
-      const previous = previousTaskStates.current.get(task.id);
-      if (taskCompletionReloadsCatalog(previous, task)) {
-        completedMutation = true;
-      }
-      nextStates.set(task.id, task.state);
-    }
-    previousTaskStates.current = nextStates;
-    if (completedMutation && activeSpace) {
-      reloadCatalog().catch((error) => setMessage(errorText(error)));
-    }
-  }, [tasks, activeSpace?.namespace, activeSpace?.dataset, activeSpace?.endpoint]);
+    if (!tasksReady || !catalogMutationCompletionBaselineReady.current) return;
+    if (!activeSpace?.task_space_id) return;
 
-  useEffect(() => {
-    let active = true;
-    let removeListener: (() => void) | null = null;
-    listen<TaskUpdateEvent>("lios-tasks-updated", (event) => {
-      if (active) {
-        setSnapshot((current) => (current ? { ...current, tasks: event.payload.tasks } : current));
-      }
-    })
-      .then((unlisten) => {
-        removeListener = unlisten;
-      })
-      .catch(() => undefined);
-    const pull = async () => {
-      try {
-        const nextTasks = await appInvoke<TaskRecord[]>("list_tasks");
-        if (active) {
-          setSnapshot((current) => (current ? { ...current, tasks: nextTasks } : current));
-        }
-      } catch {
-        // The main setup path surfaces command errors; task polling should not steal focus.
-      }
-    };
-    const timer = window.setInterval(pull, 1000);
-    pull();
-    return () => {
-      active = false;
-      removeListener?.();
-      window.clearInterval(timer);
-    };
-  }, []);
+    const completedMutations = newCatalogMutationCompletions(
+      catalogMutationCompletions.current,
+      tasks,
+      activeSpace.task_space_id
+    );
+    if (completedMutations.length > 0) {
+      reloadCatalog(false, activeSpace).catch((error) => setMessage(errorText(error)));
+    }
+  }, [tasks, tasksReady, activeSpace?.task_space_id]);
 
   useEffect(() => {
     if (view === "drive" && activeSpace && catalogStatus === "idle") {
@@ -633,26 +571,30 @@ function App() {
     setSelectedIds(new Set());
     setSearchResults([]);
     setQuery("");
-    try {
-      const outcome = await loadCatalogState(() =>
-        appInvoke<CatalogLoadResult>("load_space_catalog", { space })
-      );
-      if (outcome.status === "missing") {
-        setCatalogStatus("missing");
-        setMessage("");
-        return;
+    await catalogLoads.run(async (request) => {
+      try {
+        const outcome = await loadCatalogState(() =>
+          appInvoke<CatalogLoadResult>("load_space_catalog", { space })
+        );
+        if (!request.isCurrent()) return;
+        if (outcome.status === "missing") {
+          setCatalogStatus("missing");
+          setMessage("");
+          return;
+        }
+        const result = outcome.catalog;
+        setCatalogTree(result.tree);
+        setCurrentFolderId(result.tree.id);
+        setCatalogStatus("ready");
+        setMessage(result.warnings.join("; "));
+      } catch (error) {
+        if (!request.isCurrent()) return;
+        setCatalogTree(null);
+        setCurrentFolderId(null);
+        setCatalogStatus("error");
+        setMessage(errorText(error));
       }
-      const result = outcome.catalog;
-      setCatalogTree(result.tree);
-      setCurrentFolderId(result.tree.id);
-      setCatalogStatus("ready");
-      setMessage(result.warnings.join("; "));
-    } catch (error) {
-      setCatalogTree(null);
-      setCurrentFolderId(null);
-      setCatalogStatus("error");
-      setMessage(errorText(error));
-    }
+    });
   }
 
   async function initializeActiveSpace() {
@@ -682,34 +624,43 @@ function App() {
     }
   }
 
-  async function reloadCatalog(rethrow = false) {
-    if (!activeSpace) return;
+  async function reloadCatalog(rethrow = false, targetSpace = activeSpace) {
+    if (!targetSpace) return;
     setCatalogStatus("loading");
     setMessage("");
-    try {
-      const outcome = await loadCatalogState(() =>
-        appInvoke<CatalogLoadResult>("load_space_catalog", { space: activeSpace })
-      );
-      if (outcome.status === "missing") {
+    return catalogLoads.run(async (request) => {
+      try {
+        const outcome = await loadCatalogState(() =>
+          appInvoke<CatalogLoadResult>("load_space_catalog", { space: targetSpace })
+        );
+        if (!request.isCurrent()) return;
+        if (outcome.status === "missing") {
+          setCatalogTree(null);
+          setCurrentFolderId(null);
+          setCatalogStatus("missing");
+          return;
+        }
+        const result = outcome.catalog;
+        setCatalogTree(result.tree);
+        if (!currentFolderId) setCurrentFolderId(result.tree.id);
+        setCatalogStatus("ready");
+        setSelectedIds(new Set());
+        setMessage(result.warnings.join("; "));
+        const trimmedQuery = query.trim();
+        if (trimmedQuery) {
+          const results = await appInvoke<DriveItem[]>("search_catalog", { query: trimmedQuery });
+          if (!request.isCurrent()) return;
+          setSearchResults(results);
+        }
+      } catch (error) {
+        if (!request.isCurrent()) return;
         setCatalogTree(null);
         setCurrentFolderId(null);
-        setCatalogStatus("missing");
-        return;
+        setCatalogStatus("error");
+        setMessage(errorText(error));
+        if (rethrow) throw error;
       }
-      const result = outcome.catalog;
-      setCatalogTree(result.tree);
-      if (!currentFolderId) setCurrentFolderId(result.tree.id);
-      setCatalogStatus("ready");
-      setSelectedIds(new Set());
-      setMessage(result.warnings.join("; "));
-      if (query.trim()) await searchCatalog(query);
-    } catch (error) {
-      setCatalogTree(null);
-      setCurrentFolderId(null);
-      setCatalogStatus("error");
-      setMessage(errorText(error));
-      if (rethrow) throw error;
-    }
+    });
   }
 
   function toggleSelection(id: string) {
@@ -758,11 +709,12 @@ function App() {
   async function startUpload(paths: string[], resolutions: ConflictResolution[]) {
     if (!currentFolderId) return;
     await run("上传", async () => {
-      await appInvoke("enqueue_upload_to_folder", {
+      const task = await appInvoke<TaskSummary>("enqueue_upload_to_folder", {
         parentNodeId: currentFolderId,
         paths,
         conflictResolutions: resolutions
       });
+      upsertTask(task);
     });
   }
 
@@ -814,7 +766,8 @@ function App() {
     if (!ok) return;
     const nodeIds = [...selectedIds];
     await run("删除", async () => {
-      await appInvoke("enqueue_delete_nodes", { nodeIds });
+      const task = await appInvoke<TaskSummary>("enqueue_delete_nodes", { nodeIds });
+      upsertTask(task);
     });
   }
 
@@ -824,7 +777,8 @@ function App() {
     const output = await open({ directory: true, multiple: false });
     if (typeof output !== "string") return;
     await run("下载", async () => {
-      await appInvoke("enqueue_download", { nodeIds, outputDir: output });
+      const task = await appInvoke<TaskSummary>("enqueue_download", { nodeIds, outputDir: output });
+      upsertTask(task);
     });
   }
 
@@ -888,23 +842,30 @@ function App() {
   }
 
   async function refreshVerifiedCatalog(space: RepoConfig) {
-    const outcome = await loadCatalogState(() =>
-      appInvoke<CatalogLoadResult>("load_space_catalog", { space })
-    );
-    if (outcome.status === "missing") {
-      setCatalogTree(null);
-      setCurrentFolderId(null);
-      setCatalogStatus("missing");
-      return;
-    }
-    const result = outcome.catalog;
-    setActiveSpace(space);
-    setCatalogTree(result.tree);
-    setCurrentFolderId(result.tree.id);
-    setCatalogStatus("ready");
-    setSelectedIds(new Set());
-    setSearchResults([]);
-    setQuery("");
+    return catalogLoads.run(async (request) => {
+      try {
+        const outcome = await loadCatalogState(() =>
+          appInvoke<CatalogLoadResult>("load_space_catalog", { space })
+        );
+        if (!request.isCurrent()) return;
+        if (outcome.status === "missing") {
+          setCatalogTree(null);
+          setCurrentFolderId(null);
+          setCatalogStatus("missing");
+          return;
+        }
+        const result = outcome.catalog;
+        setCatalogTree(result.tree);
+        setCurrentFolderId(result.tree.id);
+        setCatalogStatus("ready");
+        setSelectedIds(new Set());
+        setSearchResults([]);
+        setQuery("");
+      } catch (error) {
+        if (!request.isCurrent()) return;
+        throw error;
+      }
+    });
   }
 
   async function confirmRecoveryKeyImport() {
@@ -951,7 +912,11 @@ function App() {
       return;
     }
     await run(full ? "完整检查" : "快速检查", async () => {
-      await appInvoke("enqueue_verify_space", { space: selectedSpace, full });
+      const task = await appInvoke<TaskSummary>("enqueue_verify_space", {
+        space: selectedSpace,
+        full
+      });
+      upsertTask(task);
     });
   }
 
@@ -1013,9 +978,9 @@ function App() {
 
     const preview = dialog.preview;
     setRebuildDialog({ ...dialog, status: "submitting", error: "" });
-    let task: TaskRecord;
+    let task: TaskSummary;
     try {
-      task = await appInvoke<TaskRecord>("enqueue_rebuild_catalog", {
+      task = await appInvoke<TaskSummary>("enqueue_rebuild_catalog", {
         space: dialog.space,
         expectedRevision: preview.revision
       });
@@ -1034,20 +999,9 @@ function App() {
       return;
     }
 
-    previousTaskStates.current.set(task.id, task.state);
-    setSnapshot((current) =>
-      current
-        ? {
-            ...current,
-            tasks: [task, ...current.tasks.filter((currentTask) => currentTask.id !== task.id)]
-          }
-        : current
-    );
+    upsertTask(task);
     setRebuildDialog(null);
     await refreshTasks().catch(() => undefined);
-    if (task.state === "Completed" && activeSpace) {
-      await reloadCatalog().catch((error) => setMessage(errorText(error)));
-    }
   }
 
   async function selectAccount() {
@@ -1094,10 +1048,10 @@ function App() {
         endpoint: manualEndpoint
       };
       await appInvoke("create_dataset_repo", space);
-      await refreshSetup(true);
+      const scopedSpace = await refreshSetup(true);
       setCreateSpaceOpen(false);
       setNewSpaceName("");
-      await loadSpace(space);
+      if (scopedSpace) await loadSpace(scopedSpace);
     } catch (error) {
       const text = errorText(error);
       setCreateSpaceError(text);
@@ -1575,124 +1529,13 @@ function App() {
           </>
         )}
 
-        <section className="taskDrawer" aria-label="任务">
-          <div className="taskHeader">
-            <div>
-              <span>任务</span>
-              <small>传输中心</small>
-            </div>
-            <small>{runningTasks} 运行 / {failedTasks} 失败 / {totalTasks} 记录</small>
-          </div>
-          <div className="taskRows">
-            {tasks.length === 0 ? (
-              <div className="taskEmpty">暂无任务</div>
-            ) : (
-              tasks.map((task) => {
-                const progress = taskProgressPercent(task);
-                const isCancelable = [
-                  "Queued",
-                  "Preparing",
-                  "Running",
-                  "Paused",
-                  "Retrying",
-                ].includes(task.state);
-                return (
-                  <article className={`taskRow ${task.state.toLowerCase()}`} key={task.id}>
-                    <div className="taskSummary">
-                      <div className="taskIcon">{taskIcon(task.state)}</div>
-                      <div className="taskInfo">
-                        <strong>
-                          {taskLabelText(task.label)}
-                          {task.items.length > 0 && <small>{task.items.length} 个文件</small>}
-                        </strong>
-                        <span>{taskStatusText(task)}</span>
-                      </div>
-                      <div className="taskProgress">
-                        <progress className="meter" max={100} value={progress} aria-label={`${progress}%`}>
-                          {progress}%
-                        </progress>
-                        <small>{taskProgressText(task)}</small>
-                      </div>
-                      <div className="taskButtons">
-                        {task.state === "Failed" ? (
-                          <>
-                            <button
-                              title="重试任务"
-                              aria-label="重试任务"
-                              onClick={() =>
-                                run("重试任务", () => appInvoke("retry_task", { taskId: task.id }))
-                              }
-                            >
-                              <RefreshCw aria-hidden />
-                            </button>
-                            <button
-                              title="清除记录"
-                              aria-label="清除记录"
-                              onClick={() =>
-                                run("清除任务记录", () => appInvoke("clear_task", { taskId: task.id }))
-                              }
-                            >
-                              <Trash2 aria-hidden />
-                            </button>
-                          </>
-                        ) : isCancelable ? (
-                          <button
-                            className="iconDanger"
-                            title="取消任务"
-                            aria-label="取消任务"
-                            onClick={() => run("取消任务", () => appInvoke("cancel_task", { taskId: task.id }))}
-                          >
-                            <XCircle aria-hidden />
-                          </button>
-                        ) : (
-                          <button
-                            title="清除记录"
-                            aria-label="清除记录"
-                            onClick={() => run("清除任务记录", () => appInvoke("clear_task", { taskId: task.id }))}
-                          >
-                            <Trash2 aria-hidden />
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                    {task.items.length > 0 && (
-                      <div className="taskFileList" aria-label={`${taskLabelText(task.label)}文件明细`}>
-                        {task.items.map((item) => {
-                          const itemProgress = taskItemProgressPercent(item);
-                          const itemTotal = item.bytes_total || item.size;
-                          return (
-                            <div className={`taskFileRow ${item.state.toLowerCase()}`} key={item.id}>
-                              <File aria-hidden />
-                              <div className="taskFileInfo">
-                                <strong title={item.relative_path || item.name}>
-                                  {(item.relative_path || item.name).replace(/\\/g, "/")}
-                                </strong>
-                                <span>{taskItemStatusText(item)}</span>
-                              </div>
-                              <div className="taskFileProgress">
-                                <progress
-                                  className="meter"
-                                  max={100}
-                                  value={itemProgress}
-                                  aria-label={`${itemProgress}%`}
-                                >
-                                  {itemProgress}%
-                                </progress>
-                                <small>
-                                  {formatBytes(item.bytes_done)} / {formatBytes(itemTotal)} · {itemProgress}%
-                                </small>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </article>
-                );
-              })
-            )}
-          </div>
-        </section>
+        <TaskCenter
+          tasks={tasks}
+          pendingActions={pendingActions}
+          onAction={runTaskAction}
+          listTaskItems={listTaskItems}
+          onError={handleTaskError}
+        />
       </section>
 
       {rebuildDialog && (

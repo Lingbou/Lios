@@ -36,3 +36,4 @@ walkdir = "2"
 [dev-dependencies]
 async-trait = "0.1"
 httpmock = "0.7"
+rusqlite = { version = "0.33", features = ["bundled"] }

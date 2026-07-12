@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { initializeWithExistingCatalog, loadCatalogState } from "../src/catalogState.ts";
+import {
+  createLatestSerialExecutor,
+  initializeWithExistingCatalog,
+  loadCatalogState
+} from "../src/catalogState.ts";
 import { commandError as parseCommandError } from "../src/commandError.ts";
 import { setupWarningMessage } from "../src/setupWarning.ts";
 
@@ -10,6 +14,54 @@ const commandError = (code: string, message = code) => ({
   message,
   retryable: false,
   details: null
+});
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
+test("latest serial executor prevents overlapping work and skips superseded queued requests", async () => {
+  const executor = createLatestSerialExecutor();
+  const started = deferred<void>();
+  const release = deferred<void>();
+  const events: string[] = [];
+  let active = 0;
+  let maximumActive = 0;
+
+  const first = executor.run(async (request) => {
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    events.push("first-started");
+    started.resolve();
+    await release.promise;
+    events.push(request.isCurrent() ? "first-current" : "first-superseded");
+    active -= 1;
+  });
+  await started.promise;
+
+  const second = executor.run(async () => {
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    events.push("second-started");
+    active -= 1;
+  });
+  const third = executor.run(async (request) => {
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    events.push(request.isCurrent() ? "third-current" : "third-superseded");
+    active -= 1;
+  });
+
+  assert.deepEqual(events, ["first-started"]);
+  release.resolve();
+  await Promise.all([first, second, third]);
+
+  assert.equal(maximumActive, 1);
+  assert.deepEqual(events, ["first-started", "first-superseded", "third-current"]);
 });
 
 test("existing catalog resolves to ready", async () => {

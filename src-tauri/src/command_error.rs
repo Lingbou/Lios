@@ -82,6 +82,131 @@ impl From<RemoteError> for CommandError {
     }
 }
 
+fn safe_unsupported_message(message: String) -> String {
+    const LOCAL_PATH_PREFIXES: &[(&str, &str)] = &[
+        (
+            "source paths no longer exist:",
+            "selected sources no longer exist",
+        ),
+        (
+            "source path no longer exists:",
+            "selected source no longer exists",
+        ),
+        (
+            "source file no longer exists:",
+            "selected source file no longer exists",
+        ),
+        (
+            "source file changed while it was being packed:",
+            "selected source file changed while it was being prepared",
+        ),
+        (
+            "source path changed before packing:",
+            "selected source changed before it was prepared",
+        ),
+        (
+            "source path is not a file or directory:",
+            "selected source is not a file or directory",
+        ),
+        (
+            "upload source contains unsupported symbolic links or junctions:",
+            "upload source contains unsupported symbolic links or junctions",
+        ),
+        (
+            "restore path contains symlink or junction:",
+            "restore destination contains unsupported symbolic links or junctions",
+        ),
+        (
+            "blob source is not a regular file:",
+            "local blob source is not a regular file",
+        ),
+        ("destination already exists:", "destination already exists"),
+        (
+            "immutable destination already exists:",
+            "destination already exists",
+        ),
+        (
+            "source file modification time predates the Unix epoch:",
+            "selected source file has an unsupported modification time",
+        ),
+        (
+            "source file modification time is out of range:",
+            "selected source file has an unsupported modification time",
+        ),
+        ("skipped ", "some selected upload paths are unsupported"),
+    ];
+
+    LOCAL_PATH_PREFIXES
+        .iter()
+        .find_map(|(prefix, safe)| message.starts_with(prefix).then(|| (*safe).to_string()))
+        .unwrap_or(message)
+}
+
+fn contains_absolute_local_path(message: &str) -> bool {
+    let trimmed = message.trim_matches(|character: char| {
+        character.is_whitespace()
+            || matches!(character, '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}')
+    });
+    if (trimmed.starts_with('/') && !trimmed.starts_with("//"))
+        || message.contains("IO error for operation on /")
+        || message.contains("walkdir error for operation on /")
+    {
+        return true;
+    }
+
+    let bytes = message.as_bytes();
+    for index in 0..bytes.len() {
+        let previous_is_boundary = index == 0
+            || bytes[index - 1].is_ascii_whitespace()
+            || matches!(
+                bytes[index - 1],
+                b'\'' | b'"' | b'(' | b'[' | b'{' | b':' | b';' | b'='
+            );
+        if !previous_is_boundary {
+            continue;
+        }
+        if index + 2 < bytes.len()
+            && bytes[index].is_ascii_alphabetic()
+            && bytes[index + 1] == b':'
+            && matches!(bytes[index + 2], b'/' | b'\\')
+        {
+            return true;
+        }
+        if index + 1 < bytes.len() && bytes[index] == b'\\' && bytes[index + 1] == b'\\' {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn sanitize_persisted_message(message: String) -> String {
+    let sanitized = safe_unsupported_message(message);
+    const SAFE_REMOTE_PREFIXES: &[&str] = &[
+        "invalid remote object path in catalog:",
+        "invalid recovery node descriptor path:",
+        "legacy path is outside the managed objects prefix:",
+        "catalog object is unavailable locally and remotely:",
+        "blob oid must be exactly 64 lowercase hexadecimal characters:",
+        "the desired upload list contains a delete action for ",
+        "duplicate upload action for ",
+        "duplicate remote action for ",
+        "the same path is uploaded and deleted in one plan: ",
+        "upload path is outside Lios-managed storage:",
+        "delete path is outside Lios-managed storage:",
+    ];
+    if SAFE_REMOTE_PREFIXES
+        .iter()
+        .any(|prefix| sanitized.starts_with(prefix))
+    {
+        return sanitized;
+    }
+    if contains_absolute_local_path(&sanitized) {
+        "local file operation failed".to_string()
+    } else {
+        sanitized
+    }
+}
+
 impl From<LiosError> for CommandError {
     fn from(error: LiosError) -> Self {
         match error {
@@ -107,41 +232,42 @@ impl From<LiosError> for CommandError {
                 false,
                 None,
             ),
-            LiosError::Json(error) => Self::new(
+            LiosError::Json(_) | LiosError::Yaml(_) => Self::new(
                 CommandErrorCode::CorruptedData,
-                error.to_string(),
+                "stored data could not be decoded",
                 false,
                 None,
             ),
-            LiosError::Yaml(error) => Self::new(
-                CommandErrorCode::CorruptedData,
-                error.to_string(),
-                false,
-                None,
-            ),
-            LiosError::MissingFileName(path) | LiosError::InvalidRelativePath(path) => {
-                Self::invalid_input(path.display().to_string())
+            LiosError::MissingFileName(_) => Self::invalid_input("selected path has no file name"),
+            LiosError::InvalidRelativePath(_) => {
+                Self::invalid_input("path is outside the allowed location")
             }
             LiosError::InvalidTaskScopeId => {
                 Self::invalid_input("invalid internal task scope identifier")
             }
-            LiosError::Unsupported(message) => Self::invalid_input(message),
-            LiosError::Storage(message) => {
-                Self::new(CommandErrorCode::Storage, message, false, None)
+            LiosError::Unsupported(message) => {
+                Self::invalid_input(sanitize_persisted_message(message))
             }
+            LiosError::Storage(_) => Self::new(
+                CommandErrorCode::Storage,
+                "local storage operation failed",
+                false,
+                None,
+            ),
             LiosError::StorageTransaction(error) => {
                 Self::new(CommandErrorCode::Storage, error.to_string(), false, None)
             }
             LiosError::Io(error) => error.into(),
-            LiosError::Database(error) => {
-                Self::new(CommandErrorCode::Storage, error.to_string(), false, None)
-            }
-            LiosError::WalkDir(error) => {
-                Self::new(CommandErrorCode::Storage, error.to_string(), false, None)
-            }
-            LiosError::Uuid(error) => Self::new(
+            LiosError::Database(_) => Self::new(
+                CommandErrorCode::Storage,
+                "local task database operation failed",
+                false,
+                None,
+            ),
+            LiosError::WalkDir(error) => error.into(),
+            LiosError::Uuid(_) => Self::new(
                 CommandErrorCode::CorruptedData,
-                error.to_string(),
+                "stored identifier is invalid",
                 false,
                 None,
             ),
@@ -151,33 +277,54 @@ impl From<LiosError> for CommandError {
 
 impl From<std::io::Error> for CommandError {
     fn from(error: std::io::Error) -> Self {
-        Self::new(CommandErrorCode::Storage, error.to_string(), false, None)
+        let message = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "destination already exists"
+        } else {
+            "local file operation failed"
+        };
+        Self::new(CommandErrorCode::Storage, message, false, None)
     }
 }
 
 impl From<walkdir::Error> for CommandError {
-    fn from(error: walkdir::Error) -> Self {
-        Self::new(CommandErrorCode::Storage, error.to_string(), false, None)
+    fn from(_error: walkdir::Error) -> Self {
+        Self::new(
+            CommandErrorCode::Storage,
+            "local directory scan failed",
+            false,
+            None,
+        )
     }
 }
 
 impl From<std::path::StripPrefixError> for CommandError {
-    fn from(error: std::path::StripPrefixError) -> Self {
-        Self::invalid_input(error.to_string())
+    fn from(_error: std::path::StripPrefixError) -> Self {
+        Self::invalid_input("path is outside the allowed location")
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use httpmock::Method::POST;
     use httpmock::MockServer;
     use lios_core::modelscope::ModelScopeAdapter;
+    use lios_core::storage::StorageTransactionError;
     use lios_core::tasks::{TaskRecord, TaskStore};
     use lios_core::{LiosError, RemoteError, RemoteErrorKind};
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{CommandError, CommandErrorCode};
+    use super::{sanitize_persisted_message, CommandError, CommandErrorCode};
+
+    fn missing_walkdir_error(path: &Path) -> walkdir::Error {
+        walkdir::WalkDir::new(path)
+            .into_iter()
+            .next()
+            .expect("walkdir should inspect its root")
+            .unwrap_err()
+    }
 
     #[test]
     fn serializes_stable_command_error_shape() {
@@ -279,6 +426,193 @@ mod tests {
             .code,
             CommandErrorCode::Storage
         );
+    }
+
+    #[test]
+    fn local_error_serialization_uses_stable_messages_without_absolute_paths() {
+        for (sentinel, marker) in [
+            (
+                r"C:\Users\LIOS_WINDOWS_PRIVATE\Documents\secret.bin",
+                "LIOS_WINDOWS_PRIVATE",
+            ),
+            (
+                "/home/LIOS_UNIX_PRIVATE/Documents/secret.bin",
+                "LIOS_UNIX_PRIVATE",
+            ),
+        ] {
+            let path = PathBuf::from(sentinel);
+            let strip_error = path.strip_prefix(path.join("not-a-prefix")).unwrap_err();
+            let cases = vec![
+                (
+                    "unsupported",
+                    CommandError::from(LiosError::Unsupported(format!(
+                        "source path no longer exists: {}",
+                        path.display()
+                    ))),
+                    CommandErrorCode::InvalidInput,
+                    "selected source no longer exists",
+                ),
+                (
+                    "changed source",
+                    CommandError::from(LiosError::Unsupported(format!(
+                        "source file changed while it was being packed: {}",
+                        path.display()
+                    ))),
+                    CommandErrorCode::InvalidInput,
+                    "selected source file changed while it was being prepared",
+                ),
+                (
+                    "unsupported source link",
+                    CommandError::from(LiosError::Unsupported(format!(
+                        "upload source contains unsupported symbolic links or junctions: {}",
+                        path.display()
+                    ))),
+                    CommandErrorCode::InvalidInput,
+                    "upload source contains unsupported symbolic links or junctions",
+                ),
+                (
+                    "unsupported restore link",
+                    CommandError::from(LiosError::Unsupported(format!(
+                        "restore path contains symlink or junction: {}",
+                        path.display()
+                    ))),
+                    CommandErrorCode::InvalidInput,
+                    "restore destination contains unsupported symbolic links or junctions",
+                ),
+                (
+                    "unsupported source timestamp",
+                    CommandError::from(LiosError::Unsupported(format!(
+                        "source file modification time is out of range: {}",
+                        path.display()
+                    ))),
+                    CommandErrorCode::InvalidInput,
+                    "selected source file has an unsupported modification time",
+                ),
+                (
+                    "skipped source",
+                    CommandError::from(LiosError::Unsupported(format!(
+                        "skipped 1 path: {}",
+                        path.display()
+                    ))),
+                    CommandErrorCode::InvalidInput,
+                    "some selected upload paths are unsupported",
+                ),
+                (
+                    "missing file name",
+                    CommandError::from(LiosError::MissingFileName(path.clone())),
+                    CommandErrorCode::InvalidInput,
+                    "selected path has no file name",
+                ),
+                (
+                    "invalid relative path",
+                    CommandError::from(LiosError::InvalidRelativePath(path.clone())),
+                    CommandErrorCode::InvalidInput,
+                    "path is outside the allowed location",
+                ),
+                (
+                    "I/O",
+                    CommandError::from(LiosError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("cannot open {}", path.display()),
+                    ))),
+                    CommandErrorCode::Storage,
+                    "local file operation failed",
+                ),
+                (
+                    "existing destination",
+                    CommandError::from(LiosError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("destination already exists: {}", path.display()),
+                    ))),
+                    CommandErrorCode::Storage,
+                    "destination already exists",
+                ),
+                (
+                    "walkdir",
+                    CommandError::from(LiosError::WalkDir(missing_walkdir_error(&path))),
+                    CommandErrorCode::Storage,
+                    "local directory scan failed",
+                ),
+                (
+                    "strip prefix",
+                    CommandError::from(strip_error),
+                    CommandErrorCode::InvalidInput,
+                    "path is outside the allowed location",
+                ),
+                (
+                    "storage",
+                    CommandError::from(LiosError::Storage(format!(
+                        "staging operation failed at {}",
+                        path.display()
+                    ))),
+                    CommandErrorCode::Storage,
+                    "local storage operation failed",
+                ),
+            ];
+
+            for (operation, error, expected_code, expected_message) in cases {
+                assert_eq!(error.code, expected_code, "{operation}");
+                assert!(!error.retryable, "{operation}");
+                assert_eq!(error.message, expected_message, "{operation}");
+                let serialized = serde_json::to_string(&error).unwrap();
+                assert!(!serialized.contains(marker), "{operation}: {serialized}");
+            }
+        }
+    }
+
+    #[test]
+    fn safe_validation_context_remains_actionable() {
+        let endpoint_message =
+            "ModelScope endpoint must be https://modelscope.cn or https://www.modelscope.cn";
+        let endpoint = CommandError::from(LiosError::Unsupported(endpoint_message.to_string()));
+        assert_eq!(endpoint.code, CommandErrorCode::InvalidInput);
+        assert_eq!(endpoint.message, endpoint_message);
+
+        for message in [
+            "source file changed before upload: folder/a.bin",
+            "persisted source file snapshot is incomplete: a.bin",
+        ] {
+            let error = CommandError::from(LiosError::Unsupported(message.to_string()));
+            assert_eq!(error.message, message);
+        }
+
+        let transaction = CommandError::from(LiosError::StorageTransaction(
+            StorageTransactionError::UnmanagedUploadPath(
+                "objects/files/outside-managed-prefix.enc".to_string(),
+            ),
+        ));
+        assert_eq!(transaction.code, CommandErrorCode::Storage);
+        assert_eq!(
+            transaction.message,
+            "upload path is outside Lios-managed storage: objects/files/outside-managed-prefix.enc"
+        );
+
+        for message in [
+            "invalid remote object path in catalog: /objects/x",
+            "upload path is outside Lios-managed storage: /objects/x",
+            "invalid remote object path in catalog: C:/objects/x",
+            r"upload path is outside Lios-managed storage: C:\objects\x",
+        ] {
+            assert_eq!(sanitize_persisted_message(message.to_string()), message);
+        }
+        for path in ["/data/alice/secret.bin", "/workspace/private/secret.bin"] {
+            assert_eq!(
+                sanitize_persisted_message(path.to_string()),
+                "local file operation failed"
+            );
+        }
+        assert_eq!(
+            sanitize_persisted_message(
+                "blob source is not a regular file: /data/alice/secret.bin".to_string()
+            ),
+            "local blob source is not a regular file"
+        );
+    }
+
+    #[test]
+    fn invalid_blob_oid_validation_context_remains_actionable() {
+        let message = "blob oid must be exactly 64 lowercase hexadecimal characters: C:/objects/x";
+        assert_eq!(sanitize_persisted_message(message.to_string()), message);
     }
 
     #[tokio::test]

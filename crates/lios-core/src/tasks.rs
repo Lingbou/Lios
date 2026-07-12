@@ -190,6 +190,12 @@ pub struct TaskItem {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskItemsPage {
+    pub total: u64,
+    pub items: Vec<TaskItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CheckpointState {
     Pending,
@@ -272,6 +278,49 @@ pub struct TaskRecord {
     pub error: Option<String>,
     pub items: Vec<TaskItem>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskSummary {
+    pub id: Uuid,
+    pub account_id: String,
+    pub space_id: String,
+    pub state: TaskState,
+    pub label: String,
+    pub phase: Option<String>,
+    pub progress_total: u64,
+    pub progress_done: u64,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    pub speed_bps: u64,
+    pub eta_seconds: Option<u64>,
+    pub attempt: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub error: Option<String>,
+    pub item_count: u64,
+    pub can_retry: bool,
+}
+
+type RawTaskSummary = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    i64,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+);
 
 impl TaskRecord {
     pub fn queued(label: impl Into<String>, progress_total: u64) -> Self {
@@ -585,6 +634,18 @@ impl TaskStore {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let spec_json = transaction
+            .query_row(
+                "SELECT spec_json FROM tasks WHERE id = ?1 AND state = ?2",
+                rusqlite::params![id.to_string(), TaskState::Failed.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if !valid_task_spec(spec_json.as_deref()) {
+            transaction.commit()?;
+            return Ok(false);
+        }
         let changed = transaction.execute(
             r#"
             UPDATE tasks
@@ -597,7 +658,7 @@ impl TaskStore {
                 attempt = 0,
                 error = NULL,
                 updated_at = ?3
-            WHERE id = ?1 AND state = ?4 AND spec_json IS NOT NULL
+            WHERE id = ?1 AND state = ?4
             "#,
             rusqlite::params![
                 id.to_string(),
@@ -886,6 +947,47 @@ impl TaskStore {
         Ok(queued)
     }
 
+    pub fn list_queued_summaries_with_specs(&self) -> Result<Vec<(TaskSummary, TaskSpec)>> {
+        self.query_summaries_with_specs(TaskState::Queued, None)
+    }
+
+    pub fn list_startup_summaries_with_specs(&self) -> Result<Vec<(TaskSummary, TaskSpec)>> {
+        self.query_summaries_with_specs(TaskState::Queued, Some(TaskState::Committing))
+    }
+
+    fn query_summaries_with_specs(
+        &self,
+        primary_state: TaskState,
+        secondary_state: Option<TaskState>,
+    ) -> Result<Vec<(TaskSummary, TaskSpec)>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT tasks.id, account_id, space_id, state, label, phase, progress_total,
+                   progress_done, bytes_total, bytes_done, speed_bps, eta_seconds,
+                   attempt, created_at, updated_at, error,
+                   (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id), spec_json
+            FROM tasks
+            WHERE spec_json IS NOT NULL
+              AND (state = ?1 OR (?2 IS NOT NULL AND state = ?2))
+            ORDER BY tasks.rowid ASC
+            "#,
+        )?;
+        let secondary_state = secondary_state.as_ref().map(TaskState::as_str);
+        let rows = statement.query_map(
+            rusqlite::params![primary_state.as_str(), secondary_state],
+            |row| Ok((raw_task_summary(row)?, row.get::<_, String>(17)?)),
+        )?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            let (summary, spec_json) = row?;
+            let Ok(spec) = serde_json::from_str(&spec_json) else {
+                continue;
+            };
+            tasks.push((decode_task_summary(summary)?, spec));
+        }
+        Ok(tasks)
+    }
+
     pub fn claim_queued(&mut self, id: Uuid) -> Result<Option<TaskSpec>> {
         let transaction = self
             .connection
@@ -977,61 +1079,48 @@ impl TaskStore {
     }
 
     pub fn list_items(&self, task_id: Uuid) -> Result<Vec<TaskItem>> {
-        let mut statement = self.connection.prepare(
-            r#"
-            SELECT id, name, source_path, source_modified_at_ns, size, state, phase,
-                   relative_path, bytes_done, bytes_total, error
-            FROM task_items
-            WHERE task_id = ?1
-            ORDER BY rowid ASC
-            "#,
-        )?;
-        let rows = statement.query_map(rusqlite::params![task_id.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, Option<String>>(10)?,
-            ))
-        })?;
-        let mut items = Vec::new();
-        for row in rows {
-            let (
-                id,
-                name,
-                source_path,
-                source_modified_at_ns,
-                size,
-                state,
-                phase,
-                relative_path,
-                bytes_done,
-                bytes_total,
-                error,
-            ) = row?;
-            items.push(TaskItem {
-                id: Uuid::parse_str(&id)?,
-                task_id,
-                name,
-                relative_path: relative_path.map(PathBuf::from),
-                source_path: source_path.map(PathBuf::from),
-                source_modified_at_ns,
-                size: persisted_u64(size, "task item size")?,
-                state: TaskItemState::from_str(&state)?,
-                phase,
-                bytes_done: persisted_u64(bytes_done, "task item completed bytes")?,
-                bytes_total: persisted_u64(bytes_total, "task item byte total")?,
-                error,
-            });
-        }
-        Ok(items)
+        list_items_window_on(&self.connection, task_id, 0, -1)
+    }
+
+    pub fn list_items_page(&self, task_id: Uuid, offset: u64, limit: u64) -> Result<Vec<TaskItem>> {
+        list_items_window_on(
+            &self.connection,
+            task_id,
+            sqlite_integer(offset, "task item page offset")?,
+            sqlite_integer(limit, "task item page limit")?,
+        )
+    }
+
+    pub fn get_items_page(
+        &self,
+        task_id: Uuid,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Option<TaskItemsPage>> {
+        let offset = sqlite_integer(offset, "task item page offset")?;
+        let limit = sqlite_integer(limit, "task item page limit")?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let total = transaction
+            .query_row(
+                r#"
+                SELECT (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id)
+                FROM tasks
+                WHERE id = ?1
+                "#,
+                rusqlite::params![task_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(total) = total else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let items = list_items_window_on(&transaction, task_id, offset, limit)?;
+        transaction.commit()?;
+        Ok(Some(TaskItemsPage {
+            total: persisted_u64(total, "task item count")?,
+            items,
+        }))
     }
 
     pub fn upsert_checkpoint(&self, checkpoint: &TaskObjectCheckpoint) -> Result<()> {
@@ -1363,93 +1452,217 @@ impl TaskStore {
     }
 
     pub fn list(&self) -> Result<Vec<TaskRecord>> {
-        let raw_tasks = {
-            let mut statement = self.connection.prepare(
-                r#"
-                SELECT id, account_id, space_id, state, label, phase, progress_total,
-                       progress_done, bytes_total, bytes_done, speed_bps, eta_seconds,
-                       attempt, created_at, updated_at, error
-                FROM tasks
-                ORDER BY rowid ASC
-                "#,
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, Option<i64>>(11)?,
-                    row.get::<_, i64>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, String>(14)?,
-                    row.get::<_, Option<String>>(15)?,
-                ))
-            })?;
-            let mut raw = Vec::new();
-            for row in rows {
-                raw.push(row?);
-            }
-            raw
-        };
         let mut tasks = Vec::new();
-        for row in raw_tasks {
-            let (
-                id,
-                account_id,
-                space_id,
-                state,
-                label,
-                phase,
-                progress_total,
-                progress_done,
-                bytes_total,
-                bytes_done,
-                speed_bps,
-                eta_seconds,
-                attempt,
-                created_at,
-                updated_at,
-                error,
-            ) = row;
-            let id = Uuid::parse_str(&id)?;
+        for summary in self.list_summaries()? {
             tasks.push(TaskRecord {
-                id,
-                account_id,
-                space_id,
-                state: TaskState::from_str(&state)?,
-                label,
-                phase,
-                progress_total: persisted_u64(progress_total, "task progress total")?,
-                progress_done: persisted_u64(progress_done, "task progress completed")?,
-                bytes_total: persisted_u64(bytes_total, "task byte total")?,
-                bytes_done: persisted_u64(bytes_done, "task completed bytes")?,
-                speed_bps: persisted_u64(speed_bps, "task speed")?,
-                eta_seconds: eta_seconds
-                    .map(|value| persisted_u64(value, "task ETA"))
-                    .transpose()?,
-                attempt: u32::try_from(persisted_u64(attempt, "task attempt")?).map_err(|_| {
-                    LiosError::DataCorruption("persisted task attempt exceeds u32".to_string())
-                })?,
-                created_at,
-                updated_at,
-                error,
-                items: self.list_items(id)?,
+                id: summary.id,
+                account_id: summary.account_id,
+                space_id: summary.space_id,
+                state: summary.state,
+                label: summary.label,
+                phase: summary.phase,
+                progress_total: summary.progress_total,
+                progress_done: summary.progress_done,
+                bytes_total: summary.bytes_total,
+                bytes_done: summary.bytes_done,
+                speed_bps: summary.speed_bps,
+                eta_seconds: summary.eta_seconds,
+                attempt: summary.attempt,
+                created_at: summary.created_at,
+                updated_at: summary.updated_at,
+                error: summary.error,
+                items: self.list_items(summary.id)?,
             });
         }
         Ok(tasks)
     }
 
+    pub fn list_summaries(&self) -> Result<Vec<TaskSummary>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT tasks.id, account_id, space_id, state, label, phase, progress_total,
+                   progress_done, bytes_total, bytes_done, speed_bps, eta_seconds,
+                   attempt, created_at, updated_at, error,
+                   (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id),
+                   CASE WHEN tasks.state = 'Failed' THEN spec_json ELSE NULL END
+            FROM tasks
+            ORDER BY tasks.rowid ASC
+            "#,
+        )?;
+        let rows = statement.query_map([], raw_task_summary)?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(decode_task_summary(row?)?);
+        }
+        Ok(summaries)
+    }
+
+    pub fn get_summary(&self, id: Uuid) -> Result<Option<TaskSummary>> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT tasks.id, account_id, space_id, state, label, phase, progress_total,
+                       progress_done, bytes_total, bytes_done, speed_bps, eta_seconds,
+                       attempt, created_at, updated_at, error,
+                       (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id),
+                       CASE WHEN tasks.state = 'Failed' THEN spec_json ELSE NULL END
+                FROM tasks
+                WHERE tasks.id = ?1
+                "#,
+                rusqlite::params![id.to_string()],
+                raw_task_summary,
+            )
+            .optional()?
+            .map(decode_task_summary)
+            .transpose()
+    }
+
     pub fn get(&self, id: Uuid) -> Result<Option<TaskRecord>> {
         Ok(self.list()?.into_iter().find(|task| task.id == id))
     }
+}
+
+fn raw_task_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTaskSummary> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, Option<String>>(5)?,
+        row.get::<_, i64>(6)?,
+        row.get::<_, i64>(7)?,
+        row.get::<_, i64>(8)?,
+        row.get::<_, i64>(9)?,
+        row.get::<_, i64>(10)?,
+        row.get::<_, Option<i64>>(11)?,
+        row.get::<_, i64>(12)?,
+        row.get::<_, String>(13)?,
+        row.get::<_, String>(14)?,
+        row.get::<_, Option<String>>(15)?,
+        row.get::<_, i64>(16)?,
+        row.get::<_, Option<String>>(17)?,
+    ))
+}
+
+fn decode_task_summary(raw: RawTaskSummary) -> Result<TaskSummary> {
+    let (
+        id,
+        account_id,
+        space_id,
+        state,
+        label,
+        phase,
+        progress_total,
+        progress_done,
+        bytes_total,
+        bytes_done,
+        speed_bps,
+        eta_seconds,
+        attempt,
+        created_at,
+        updated_at,
+        error,
+        item_count,
+        spec_json,
+    ) = raw;
+    let state = TaskState::from_str(&state)?;
+    let can_retry = state == TaskState::Failed && valid_task_spec(spec_json.as_deref());
+    Ok(TaskSummary {
+        id: Uuid::parse_str(&id)?,
+        account_id,
+        space_id,
+        state,
+        label,
+        phase,
+        progress_total: persisted_u64(progress_total, "task progress total")?,
+        progress_done: persisted_u64(progress_done, "task progress completed")?,
+        bytes_total: persisted_u64(bytes_total, "task byte total")?,
+        bytes_done: persisted_u64(bytes_done, "task completed bytes")?,
+        speed_bps: persisted_u64(speed_bps, "task speed")?,
+        eta_seconds: eta_seconds
+            .map(|value| persisted_u64(value, "task ETA"))
+            .transpose()?,
+        attempt: u32::try_from(persisted_u64(attempt, "task attempt")?).map_err(|_| {
+            LiosError::DataCorruption("persisted task attempt exceeds u32".to_string())
+        })?,
+        created_at,
+        updated_at,
+        error,
+        item_count: persisted_u64(item_count, "task item count")?,
+        can_retry,
+    })
+}
+
+fn valid_task_spec(spec_json: Option<&str>) -> bool {
+    spec_json.is_some_and(|json| serde_json::from_str::<TaskSpec>(json).is_ok())
+}
+
+fn list_items_window_on(
+    connection: &rusqlite::Connection,
+    task_id: Uuid,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<TaskItem>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT id, name, source_path, source_modified_at_ns, size, state, phase,
+               relative_path, bytes_done, bytes_total, error
+        FROM task_items
+        WHERE task_id = ?1
+        ORDER BY rowid ASC
+        LIMIT ?2 OFFSET ?3
+        "#,
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![task_id.to_string(), limit, offset],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        },
+    )?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (
+            id,
+            name,
+            source_path,
+            source_modified_at_ns,
+            size,
+            state,
+            phase,
+            relative_path,
+            bytes_done,
+            bytes_total,
+            error,
+        ) = row?;
+        items.push(TaskItem {
+            id: Uuid::parse_str(&id)?,
+            task_id,
+            name,
+            relative_path: relative_path.map(PathBuf::from),
+            source_path: source_path.map(PathBuf::from),
+            source_modified_at_ns,
+            size: persisted_u64(size, "task item size")?,
+            state: TaskItemState::from_str(&state)?,
+            phase,
+            bytes_done: persisted_u64(bytes_done, "task item completed bytes")?,
+            bytes_total: persisted_u64(bytes_total, "task item byte total")?,
+            error,
+        });
+    }
+    Ok(items)
 }
 
 fn upsert_task_on(

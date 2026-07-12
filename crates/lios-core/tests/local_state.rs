@@ -417,6 +417,417 @@ fn task_store_can_delete_a_task_record() {
 }
 
 #[test]
+fn task_store_lists_summaries_in_stable_order_with_item_counts() {
+    let tmp = tempdir().unwrap();
+    let store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let first = TaskRecord::queued("upload album", 2);
+    let second = TaskRecord::queued("download album", 1);
+
+    store.insert(&first).unwrap();
+    store.insert(&second).unwrap();
+    for (task_id, name) in [
+        (first.id, "a.bin"),
+        (first.id, "b.bin"),
+        (second.id, "c.bin"),
+    ] {
+        store
+            .upsert_item(&TaskItem {
+                id: Uuid::new_v4(),
+                task_id,
+                name: name.to_string(),
+                relative_path: Some(name.into()),
+                source_path: Some(tmp.path().join(name)),
+                source_modified_at_ns: Some(1),
+                size: 1,
+                state: TaskItemState::Queued,
+                phase: None,
+                bytes_done: 0,
+                bytes_total: 1,
+                error: None,
+            })
+            .unwrap();
+    }
+
+    let summaries = store.list_summaries().unwrap();
+
+    assert_eq!(
+        summaries.iter().map(|task| task.id).collect::<Vec<_>>(),
+        vec![first.id, second.id]
+    );
+    assert_eq!(summaries[0].item_count, 2);
+    assert_eq!(summaries[1].item_count, 1);
+    assert_eq!(
+        store.get_summary(first.id).unwrap(),
+        Some(summaries[0].clone())
+    );
+    assert_eq!(store.get_summary(Uuid::new_v4()).unwrap(), None);
+}
+
+#[test]
+fn task_store_summaries_report_retry_capability_without_failing_on_malformed_specs() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let store = TaskStore::open(&db_path).unwrap();
+    let spec = TaskSpec::Delete {
+        account_id: "account-a".to_string(),
+        space_id: "space-a".to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let valid = TaskRecord::queued_for_spec(&spec);
+    let missing = TaskRecord::queued("legacy task", 0);
+    let malformed = TaskRecord::queued_for_spec(&spec);
+
+    store.insert_with_spec(&valid, &spec).unwrap();
+    store.insert(&missing).unwrap();
+    store.insert_with_spec(&malformed, &spec).unwrap();
+    for task in [&valid, &missing, &malformed] {
+        store
+            .update_state(task.id, TaskState::Failed, Some("failed".to_string()))
+            .unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET spec_json = '{malformed' WHERE id = ?1",
+            rusqlite::params![malformed.id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let summaries = store.list_summaries().unwrap();
+    let can_retry = |id| {
+        summaries
+            .iter()
+            .find(|summary| summary.id == id)
+            .unwrap()
+            .can_retry
+    };
+
+    assert!(can_retry(valid.id));
+    assert!(!can_retry(missing.id));
+    assert!(!can_retry(malformed.id));
+    for (id, expected) in [(valid.id, true), (missing.id, false), (malformed.id, false)] {
+        assert_eq!(store.get_summary(id).unwrap().unwrap().can_retry, expected);
+    }
+}
+
+#[test]
+fn task_store_summary_listing_does_not_decode_task_items() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let store = TaskStore::open(&db_path).unwrap();
+    let task = TaskRecord::queued("upload album", 1);
+    let item = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        name: "broken.bin".to_string(),
+        relative_path: None,
+        source_path: Some(tmp.path().join("private-source.bin")),
+        source_modified_at_ns: None,
+        size: 1,
+        state: TaskItemState::Queued,
+        phase: None,
+        bytes_done: 0,
+        bytes_total: 1,
+        error: None,
+    };
+    store.insert(&task).unwrap();
+    store.upsert_item(&item).unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute(
+            "UPDATE task_items SET state = 'FutureState' WHERE id = ?1",
+            rusqlite::params![item.id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = TaskStore::open(&db_path).unwrap();
+    let summaries = store.list_summaries().unwrap();
+
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, task.id);
+    assert_eq!(summaries[0].item_count, 1);
+    assert!(matches!(
+        store.list().unwrap_err(),
+        LiosError::DataCorruption(_)
+    ));
+}
+
+#[test]
+fn task_store_lists_queued_summaries_with_specs_without_decoding_items() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let store = TaskStore::open(&db_path).unwrap();
+    let spec = TaskSpec::Delete {
+        account_id: "account-a".to_string(),
+        space_id: "space-a".to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let task = TaskRecord::queued_for_spec(&spec);
+    let item = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        name: "broken.bin".to_string(),
+        relative_path: None,
+        source_path: None,
+        source_modified_at_ns: None,
+        size: 1,
+        state: TaskItemState::Queued,
+        phase: None,
+        bytes_done: 0,
+        bytes_total: 1,
+        error: None,
+    };
+    store.insert_with_spec(&task, &spec).unwrap();
+    store.upsert_item(&item).unwrap();
+    let historical = TaskRecord::queued("historical task", 0);
+    store.insert(&historical).unwrap();
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute(
+            "UPDATE task_items SET state = 'FutureState' WHERE id = ?1",
+            rusqlite::params![item.id.to_string()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET state = 'FutureState' WHERE id = ?1",
+            rusqlite::params![historical.id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let queued = store.list_queued_summaries_with_specs().unwrap();
+
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].0.id, task.id);
+    assert_eq!(queued[0].1.account_id(), spec.account_id());
+    assert_eq!(queued[0].1.space_id(), spec.space_id());
+    assert!(matches!(
+        store.list_queued_with_specs().unwrap_err(),
+        LiosError::DataCorruption(_)
+    ));
+}
+
+#[test]
+fn task_store_lists_startup_summaries_with_specs_using_direct_state_filtering() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let store = TaskStore::open(&db_path).unwrap();
+    let spec = TaskSpec::Delete {
+        account_id: "account-a".to_string(),
+        space_id: "space-a".to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let queued = TaskRecord::queued_for_spec(&spec);
+    let committing = TaskRecord::queued_for_spec(&spec);
+    let historical = TaskRecord::queued("historical task", 0);
+    store.insert_with_spec(&queued, &spec).unwrap();
+    store.insert_with_spec(&committing, &spec).unwrap();
+    store
+        .update_state(committing.id, TaskState::Committing, None)
+        .unwrap();
+    store.insert(&historical).unwrap();
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET state = 'FutureState' WHERE id = ?1",
+            rusqlite::params![historical.id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let startup = store.list_startup_summaries_with_specs().unwrap();
+
+    assert_eq!(startup.len(), 2);
+    assert_eq!(startup[0].0.id, queued.id);
+    assert_eq!(startup[0].0.state, TaskState::Queued);
+    assert_eq!(startup[1].0.id, committing.id);
+    assert_eq!(startup[1].0.state, TaskState::Committing);
+    assert!(startup
+        .iter()
+        .all(|(_, loaded)| loaded.account_id() == spec.account_id()));
+}
+
+#[test]
+fn task_store_spec_summary_queries_skip_malformed_specs() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let store = TaskStore::open(&db_path).unwrap();
+    let spec = TaskSpec::Delete {
+        account_id: "account-a".to_string(),
+        space_id: "space-a".to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let valid_queued = TaskRecord::queued_for_spec(&spec);
+    let malformed_queued = TaskRecord::queued_for_spec(&spec);
+    let valid_committing = TaskRecord::queued_for_spec(&spec);
+    let malformed_committing = TaskRecord::queued_for_spec(&spec);
+    for task in [
+        &valid_queued,
+        &malformed_queued,
+        &valid_committing,
+        &malformed_committing,
+    ] {
+        store.insert_with_spec(task, &spec).unwrap();
+    }
+    for task in [&valid_committing, &malformed_committing] {
+        store
+            .update_state(task.id, TaskState::Committing, None)
+            .unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    for task in [&malformed_queued, &malformed_committing] {
+        connection
+            .execute(
+                "UPDATE tasks SET spec_json = '{malformed' WHERE id = ?1",
+                rusqlite::params![task.id.to_string()],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let queued = store.list_queued_summaries_with_specs().unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].0.id, valid_queued.id);
+    assert_eq!(queued[0].1.account_id(), spec.account_id());
+    assert_eq!(queued[0].1.space_id(), spec.space_id());
+
+    let startup = store.list_startup_summaries_with_specs().unwrap();
+    assert_eq!(startup.len(), 2);
+    assert_eq!(startup[0].0.id, valid_queued.id);
+    assert_eq!(startup[1].0.id, valid_committing.id);
+    assert!(startup
+        .iter()
+        .all(|(_, loaded)| loaded.account_id() == spec.account_id()));
+}
+
+#[test]
+fn task_store_pages_items_in_stable_order() {
+    let tmp = tempdir().unwrap();
+    let store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let task = TaskRecord::queued("upload album", 5);
+    store.insert(&task).unwrap();
+    for index in 0..5 {
+        store
+            .upsert_item(&TaskItem {
+                id: Uuid::new_v4(),
+                task_id: task.id,
+                name: format!("{index}.bin"),
+                relative_path: Some(format!("folder/{index}.bin").into()),
+                source_path: Some(tmp.path().join(format!("{index}.bin"))),
+                source_modified_at_ns: Some(index),
+                size: index as u64,
+                state: TaskItemState::Queued,
+                phase: None,
+                bytes_done: 0,
+                bytes_total: index as u64,
+                error: None,
+            })
+            .unwrap();
+    }
+
+    let first_page = store.list_items_page(task.id, 0, 2).unwrap();
+    let second_page = store.list_items_page(task.id, 2, 2).unwrap();
+    let final_page = store.list_items_page(task.id, 4, 2).unwrap();
+
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["0.bin", "1.bin"]
+    );
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["2.bin", "3.bin"]
+    );
+    assert_eq!(
+        final_page
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["4.bin"]
+    );
+    assert!(store.list_items_page(task.id, 5, 2).unwrap().is_empty());
+    assert!(store
+        .list_items_page(Uuid::new_v4(), 0, 2)
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        store.list_items_page(task.id, u64::MAX, 1).unwrap_err(),
+        LiosError::DataCorruption(_)
+    ));
+}
+
+#[test]
+fn task_store_reads_item_page_with_snapshot_consistent_total_and_existence() {
+    let tmp = tempdir().unwrap();
+    let store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let task = TaskRecord::queued("upload album", 2);
+    store.insert(&task).unwrap();
+    for name in ["a.bin", "b.bin"] {
+        store
+            .upsert_item(&TaskItem {
+                id: Uuid::new_v4(),
+                task_id: task.id,
+                name: name.to_string(),
+                relative_path: Some(name.into()),
+                source_path: None,
+                source_modified_at_ns: None,
+                size: 1,
+                state: TaskItemState::Queued,
+                phase: None,
+                bytes_done: 0,
+                bytes_total: 1,
+                error: None,
+            })
+            .unwrap();
+    }
+
+    let first = store.get_items_page(task.id, 0, 1).unwrap().unwrap();
+    let tail = store.get_items_page(task.id, 2, 1).unwrap().unwrap();
+
+    assert_eq!(first.total, 2);
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].name, "a.bin");
+    assert_eq!(tail.total, 2);
+    assert!(tail.items.is_empty());
+    assert!(store
+        .get_items_page(Uuid::new_v4(), 0, 1)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn task_store_persists_specs_items_checkpoints_and_content_index() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("lios.db");
@@ -1040,6 +1451,88 @@ fn task_store_schedules_automatic_retry_and_requeues_manual_retry() {
     assert_eq!(item.phase, None);
     assert_eq!(item.bytes_done, 0);
     assert_eq!(item.error, None);
+}
+
+#[test]
+fn task_store_does_not_requeue_failed_tasks_with_malformed_specs() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let mut store = TaskStore::open(&db_path).unwrap();
+    let spec = TaskSpec::Upload {
+        account_id: "account-a".to_string(),
+        space_id: "space-a".to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        parent_node_id: "root".to_string(),
+        source_paths: vec![tmp.path().join("album.bin")],
+        source_snapshot: None,
+        chunk_size: 128 * 1024 * 1024,
+        conflict_resolutions: Vec::new(),
+    };
+    let task = TaskRecord::queued_for_spec(&spec);
+    let item = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        name: "album.bin".to_string(),
+        relative_path: Some("album.bin".into()),
+        source_path: Some(tmp.path().join("album.bin")),
+        source_modified_at_ns: Some(123456789),
+        size: 4096,
+        state: TaskItemState::Failed,
+        phase: Some("uploading".to_string()),
+        bytes_done: 2048,
+        bytes_total: 4096,
+        error: Some("item failed".to_string()),
+    };
+    store.insert_with_spec(&task, &spec).unwrap();
+    store.upsert_item(&item).unwrap();
+    store
+        .update_state(task.id, TaskState::Running, None)
+        .unwrap();
+    assert!(store
+        .schedule_retry(task.id, 3, "network unavailable")
+        .unwrap());
+    store
+        .update_transfer(task.id, 3, 5, 2048, 4096, 128)
+        .unwrap();
+    store.update_eta(task.id, Some(11)).unwrap();
+    store
+        .update_state(
+            task.id,
+            TaskState::Failed,
+            Some("permanent failure".to_string()),
+        )
+        .unwrap();
+
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET spec_json = '{malformed' WHERE id = ?1",
+            rusqlite::params![task.id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let before = store.get(task.id).unwrap().unwrap();
+    let before_items = store.list_items(task.id).unwrap();
+
+    assert!(!store.requeue_failed(task.id).unwrap());
+
+    let after = store.get(task.id).unwrap().unwrap();
+    assert_eq!(after.state, TaskState::Failed);
+    assert_eq!(after.phase, before.phase);
+    assert_eq!(after.progress_done, before.progress_done);
+    assert_eq!(after.progress_total, before.progress_total);
+    assert_eq!(after.bytes_done, before.bytes_done);
+    assert_eq!(after.bytes_total, before.bytes_total);
+    assert_eq!(after.speed_bps, before.speed_bps);
+    assert_eq!(after.eta_seconds, before.eta_seconds);
+    assert_eq!(after.attempt, before.attempt);
+    assert_eq!(after.error, before.error);
+    assert_eq!(store.list_items(task.id).unwrap(), before_items);
 }
 
 #[test]
