@@ -22,7 +22,7 @@ use std::path::{Component, Path, PathBuf};
 use app_log::AppLogger;
 use catalog_mutation_gate::CatalogMutationGate;
 use catalog_probe::{ensure_space_can_initialize, map_catalog_load_error};
-use command_error::{CommandError, CommandErrorCode};
+use command_error::{sanitize_persisted_message, CommandError, CommandErrorCode};
 use command_surface::with_registered_commands;
 use config_mutation_gate::ConfigMutationGate;
 use download_service::prepare_download_task;
@@ -49,8 +49,8 @@ use lios_core::storage::{
     StorageObject,
 };
 use lios_core::tasks::{
-    CheckpointState, TaskCatalogCheckpoint, TaskItemState, TaskObjectCheckpoint, TaskRecord,
-    TaskSpec, TaskState, TaskStore,
+    CheckpointState, TaskCatalogCheckpoint, TaskItem, TaskItemState, TaskObjectCheckpoint,
+    TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary,
 };
 use production_config::{
     configured_endpoint, persist_config, prepare_startup_config, validate_repo, SetupWarning,
@@ -124,13 +124,53 @@ struct SetupSnapshot {
     config: LiosConfig,
     recovery_key: RecoveryKeyStatus,
     has_token: bool,
-    tasks: Vec<TaskRecord>,
+    active_task_space_id: Option<String>,
+    tasks: Vec<TaskSummary>,
     warning: Option<SetupWarning>,
 }
 
 #[derive(Clone, Serialize)]
 struct TaskUpdateEvent {
-    tasks: Vec<TaskRecord>,
+    tasks: Vec<TaskSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskItemDto {
+    id: Uuid,
+    task_id: Uuid,
+    name: String,
+    relative_path: Option<PathBuf>,
+    size: u64,
+    state: TaskItemState,
+    phase: Option<String>,
+    bytes_done: u64,
+    bytes_total: u64,
+    error: Option<String>,
+}
+
+impl From<TaskItem> for TaskItemDto {
+    fn from(item: TaskItem) -> Self {
+        Self {
+            id: item.id,
+            task_id: item.task_id,
+            name: item.name,
+            relative_path: item.relative_path,
+            size: item.size,
+            state: item.state,
+            phase: item.phase,
+            bytes_done: item.bytes_done,
+            bytes_total: item.bytes_total,
+            error: item.error.map(sanitize_persisted_message),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TaskItemsPageDto {
+    task_id: Uuid,
+    offset: u64,
+    total: u64,
+    items: Vec<TaskItemDto>,
 }
 
 #[derive(Serialize)]
@@ -152,7 +192,38 @@ struct CatalogRebuildPreviewResult {
 #[derive(Serialize)]
 struct DatasetRepoListResult {
     user: ModelScopeUserSummary,
-    repositories: Vec<DatasetRepoSummary>,
+    repositories: Vec<DatasetRepoSummaryDto>,
+}
+
+#[derive(Serialize)]
+struct DatasetRepoSummaryDto {
+    namespace: String,
+    dataset: String,
+    endpoint: String,
+    visibility: Option<String>,
+    updated_at: Option<String>,
+    description: Option<String>,
+    task_space_id: String,
+}
+
+impl From<DatasetRepoSummary> for DatasetRepoSummaryDto {
+    fn from(repo: DatasetRepoSummary) -> Self {
+        let task_space_id = TaskScope::from_repo(&RepoConfig {
+            namespace: repo.namespace.clone(),
+            dataset: repo.dataset.clone(),
+            endpoint: repo.endpoint.clone(),
+        })
+        .space_id;
+        Self {
+            namespace: repo.namespace,
+            dataset: repo.dataset,
+            endpoint: repo.endpoint,
+            visibility: repo.visibility,
+            updated_at: repo.updated_at,
+            description: repo.description,
+            task_space_id,
+        }
+    }
 }
 
 struct SyncWork {
@@ -215,17 +286,62 @@ struct TaskTransferUpdate {
     eta_seconds: Option<u64>,
 }
 
+fn webview_safe_task_summary(mut task: TaskSummary) -> TaskSummary {
+    task.error = task.error.map(sanitize_persisted_message);
+    task
+}
+
+fn webview_safe_task_summaries(tasks: Vec<TaskSummary>) -> Vec<TaskSummary> {
+    tasks.into_iter().map(webview_safe_task_summary).collect()
+}
+
+fn task_summaries_for_paths(paths: &LiosPaths) -> CommandResult<Vec<TaskSummary>> {
+    task_store(paths)?
+        .list_summaries()
+        .map(webview_safe_task_summaries)
+        .map_err(to_err)
+}
+
 fn emit_tasks(app: &tauri::AppHandle, paths: &LiosPaths) {
-    if let Ok(tasks) = task_store(paths).and_then(|store| store.list().map_err(to_err)) {
+    if let Ok(tasks) = task_summaries_for_paths(paths) {
         let _ = app.emit("lios-tasks-updated", TaskUpdateEvent { tasks });
     }
 }
 
+fn list_task_items_for_paths(
+    paths: &LiosPaths,
+    task_id: Uuid,
+    offset: u64,
+    limit: u64,
+) -> CommandResult<TaskItemsPageDto> {
+    const JAVASCRIPT_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    if !(1..=200).contains(&limit) {
+        return Err(CommandError::invalid_input(
+            "task item page limit must be between 1 and 200",
+        ));
+    }
+    if offset > JAVASCRIPT_MAX_SAFE_INTEGER || i64::try_from(offset).is_err() {
+        return Err(CommandError::invalid_input(
+            "task item page offset exceeds the supported range",
+        ));
+    }
+    let store = task_store(paths)?;
+    let page = store
+        .get_items_page(task_id, offset, limit)
+        .map_err(to_err)?
+        .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
+    Ok(TaskItemsPageDto {
+        task_id,
+        offset,
+        total: page.total,
+        items: page.items.into_iter().map(TaskItemDto::from).collect(),
+    })
+}
+
 fn task_interrupt_core(paths: &LiosPaths, id: Uuid) -> lios_core::Result<Option<TaskState>> {
     let state = TaskStore::open(&paths.database)?
-        .list()?
-        .into_iter()
-        .find(|task| task.id == id)
+        .get_summary(id)?
         .map(|task| task.state);
     match state {
         Some(TaskState::Paused) => Ok(Some(TaskState::Paused)),
@@ -417,7 +533,7 @@ fn log_persisted_task_outcome(
 ) {
     let Some(task) = TaskStore::open(&paths.database)
         .ok()
-        .and_then(|store| store.get(task_id).ok().flatten())
+        .and_then(|store| store.get_summary(task_id).ok().flatten())
     else {
         return;
     };
@@ -714,7 +830,7 @@ fn cleanup_is_safe(paths: &LiosPaths, lifecycle: &TaskLifecycleState) -> Command
         return Ok(false);
     }
     Ok(!task_store(paths)?
-        .list()
+        .list_summaries()
         .map_err(to_err)?
         .iter()
         .any(|task| task_state_is_active(&task.state)))
@@ -765,10 +881,8 @@ async fn finish_worker(
     let mut lifecycle = gate.lock().await;
     let result = (|| {
         let current_state = task_store(paths)?
-            .list()
+            .get_summary(task_id)
             .map_err(to_err)?
-            .into_iter()
-            .find(|task| task.id == task_id)
             .map(|task| task.state);
         let final_state = match (preserve_control_state, current_state) {
             (true, Some(TaskState::Canceled)) => TaskState::Canceled,
@@ -809,7 +923,7 @@ async fn finish_committed_worker(
         let mut store = TaskStore::open(&paths.database).map_err(to_err)?;
         if store.complete_reconciled_commit(task_id).map_err(to_err)?
             || store
-                .get(task_id)
+                .get_summary(task_id)
                 .map_err(to_err)?
                 .is_some_and(|task| task.state == TaskState::Completed)
         {
@@ -842,7 +956,7 @@ async fn clear_task_record(
         ));
     }
     let store = task_store(paths)?;
-    let task = store.get(task_id).map_err(to_err)?;
+    let task = store.get_summary(task_id).map_err(to_err)?;
     if task
         .as_ref()
         .is_some_and(|task| task_state_blocks_clear(&task.state))
@@ -909,7 +1023,7 @@ fn cleanup_terminal_task_staging(
     if terminal_staging_cleanup_label(spec).is_none() {
         return Ok(());
     }
-    let Some(task) = task_store(paths)?.get(task_id).map_err(to_err)? else {
+    let Some(task) = task_store(paths)?.get_summary(task_id).map_err(to_err)? else {
         return Ok(());
     };
     if task_state_is_active(&task.state) || !paths.staging.exists() {
@@ -968,7 +1082,7 @@ fn remove_scoped_staging_directory(
 
 fn append_task_warning(paths: &LiosPaths, task_id: Uuid, warning: &str) -> CommandResult<()> {
     let store = task_store(paths)?;
-    let Some(task) = store.get(task_id).map_err(to_err)? else {
+    let Some(task) = store.get_summary(task_id).map_err(to_err)? else {
         return Ok(());
     };
     let message = task
@@ -1001,7 +1115,7 @@ fn cleanup_terminal_task_staging_and_record(
 
 fn cleanup_terminal_task_staging_after_restart(paths: &LiosPaths) -> lios_core::Result<()> {
     let store = TaskStore::open(&paths.database)?;
-    for task in store.list()? {
+    for task in store.list_summaries()? {
         if task_state_is_active(&task.state) {
             continue;
         }
@@ -1074,32 +1188,62 @@ struct StartupSpaceWork {
     queued: Vec<Uuid>,
 }
 
+fn submission_summary(task: &TaskRecord) -> CommandResult<TaskSummary> {
+    let item_count = u64::try_from(task.items.len()).map_err(|_| {
+        CommandError::new(
+            CommandErrorCode::Internal,
+            "task item count exceeds the supported range",
+            false,
+            None,
+        )
+    })?;
+    Ok(webview_safe_task_summary(TaskSummary {
+        id: task.id,
+        account_id: task.account_id.clone(),
+        space_id: task.space_id.clone(),
+        state: task.state.clone(),
+        label: task.label.clone(),
+        phase: task.phase.clone(),
+        progress_total: task.progress_total,
+        progress_done: task.progress_done,
+        bytes_total: task.bytes_total,
+        bytes_done: task.bytes_done,
+        speed_bps: task.speed_bps,
+        eta_seconds: task.eta_seconds,
+        attempt: task.attempt,
+        created_at: task.created_at.clone(),
+        updated_at: task.updated_at.clone(),
+        error: task.error.clone(),
+        item_count,
+        can_retry: false,
+    }))
+}
+
 fn submit_and_spawn(
     app: &tauri::AppHandle,
     state: &AppContext,
     spec: TaskSpec,
     source_files: &[SourceFileSnapshot],
-) -> CommandResult<TaskRecord> {
+) -> CommandResult<TaskSummary> {
     let task = persist_submission(&state.paths, &spec, source_files).map_err(to_err)?;
+    let summary = submission_summary(&task)?;
     emit_tasks(app, &state.paths);
     spawn_persisted_task(app.clone(), task.id);
-    Ok(task)
+    Ok(summary)
 }
 
 fn recover_startup_tasks(paths: &LiosPaths) -> lios_core::Result<StartupTaskRecovery> {
     let mut store = TaskStore::open(&paths.database)?;
     store.recover_after_restart("legacy task cannot be resumed")?;
-    let reconcile = store
-        .list()?
-        .into_iter()
-        .filter(|task| task.state == TaskState::Committing)
-        .map(|task| task.id)
-        .collect();
-    let queued = store
-        .list_queued_with_specs()?
-        .into_iter()
-        .map(|(task, _spec)| task.id)
-        .collect();
+    let mut queued = Vec::new();
+    let mut reconcile = Vec::new();
+    for (task, _spec) in store.list_startup_summaries_with_specs()? {
+        match task.state {
+            TaskState::Queued => queued.push(task.id),
+            TaskState::Committing => reconcile.push(task.id),
+            _ => {}
+        }
+    }
     Ok(StartupTaskRecovery { queued, reconcile })
 }
 
@@ -1229,7 +1373,7 @@ async fn reconcile_catalog_checkpoint_loop(
         let current_state = retry_storage_operation(|| {
             TaskStore::open(&paths.database)
                 .map_err(to_err)?
-                .get(task_id)
+                .get_summary(task_id)
                 .map_err(to_err)
         })
         .await?
@@ -1378,7 +1522,7 @@ async fn run_catalog_reconciliation_locked(
     let context = retry_storage_operation(|| {
         let store = TaskStore::open(&paths.database).map_err(to_err)?;
         let task = store
-            .get(task_id)
+            .get_summary(task_id)
             .map_err(to_err)?
             .ok_or_else(|| CommandError::invalid_input("reconciliation task was not found"))?;
         if task.state != TaskState::Committing {
@@ -1414,7 +1558,7 @@ async fn run_catalog_reconciliation_locked(
     if retry_storage_operation(|| {
         TaskStore::open(&paths.database)
             .map_err(to_err)?
-            .get(task_id)
+            .get_summary(task_id)
             .map_err(to_err)
     })
     .await?
@@ -1562,7 +1706,7 @@ async fn run_startup_space_work(
         };
         let state = app.state::<AppContext>();
         let task_state = TaskStore::open(&state.paths.database)
-            .and_then(|store| store.get(task_id))
+            .and_then(|store| store.get_summary(task_id))
             .ok()
             .flatten()
             .map(|task| task.state);
@@ -1634,7 +1778,7 @@ fn spawn_persisted_task(app: tauri::AppHandle, task_id: Uuid) {
         if let Err(error) = run_persisted_task(app.clone(), task_id).await {
             let state = app.state::<AppContext>();
             if let Ok(store) = TaskStore::open(&state.paths.database) {
-                if let Some(task) = store.get(task_id).ok().flatten() {
+                if let Some(task) = store.get_summary(task_id).ok().flatten() {
                     if task.state == TaskState::Committing {
                         let _ = store.record_reconciliation_wait(
                             task_id,
@@ -1954,7 +2098,7 @@ async fn execute_task_with_retries(
             Err(error) => {
                 let store = TaskStore::open(&paths.database).map_err(to_err)?;
                 if store
-                    .get(task.id)
+                    .get_summary(task.id)
                     .map_err(to_err)?
                     .is_some_and(|persisted| persisted.state == TaskState::Committing)
                 {
@@ -3691,12 +3835,17 @@ fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnap
         let warning = prepare_startup_config(&state.paths, &mut config)?;
         (config, warning)
     };
-    let tasks = task_store(&state.paths)?.list().map_err(to_err)?;
+    let active_task_space_id = config
+        .active_repo
+        .as_ref()
+        .map(|repo| TaskScope::from_repo(repo).space_id);
+    let tasks = task_summaries_for_paths(&state.paths)?;
     Ok(SetupSnapshot {
         paths: paths_dto(&state.paths),
         recovery_key: recovery_key_status(&config),
         config,
         has_token: state.paths.credentials.exists(),
+        active_task_space_id,
         tasks,
         warning,
     })
@@ -3777,7 +3926,10 @@ async fn list_dataset_repos(
     let repositories = adapter
         .list_dataset_repos_for_owner(Some(&user.username))
         .await
-        .map_err(to_err)?;
+        .map_err(to_err)?
+        .into_iter()
+        .map(DatasetRepoSummaryDto::from)
+        .collect();
     Ok(DatasetRepoListResult { user, repositories })
 }
 
@@ -4055,7 +4207,7 @@ async fn enqueue_upload_to_folder(
     parent_node_id: String,
     paths: Vec<String>,
     mut conflict_resolutions: Vec<ConflictResolution>,
-) -> CommandResult<TaskRecord> {
+) -> CommandResult<TaskSummary> {
     if paths.is_empty() {
         return Err(CommandError::invalid_input("upload paths cannot be empty"));
     }
@@ -4103,7 +4255,7 @@ async fn enqueue_delete_nodes(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     node_ids: Vec<String>,
-) -> CommandResult<TaskRecord> {
+) -> CommandResult<TaskSummary> {
     if node_ids.is_empty() {
         return Err(CommandError::invalid_input(
             "delete selection cannot be empty",
@@ -4128,7 +4280,7 @@ async fn enqueue_download(
     state: tauri::State<'_, AppContext>,
     node_ids: Vec<String>,
     output_dir: String,
-) -> CommandResult<TaskRecord> {
+) -> CommandResult<TaskSummary> {
     let prepared = prepare_download_task(node_ids, output_dir)?;
     let CatalogSelection::Nodes(node_ids) = prepared.selection else {
         return Err(CommandError::invalid_input(
@@ -4155,7 +4307,7 @@ async fn enqueue_verify_space(
     state: tauri::State<'_, AppContext>,
     space: RepoConfig,
     full: bool,
-) -> CommandResult<TaskRecord> {
+) -> CommandResult<TaskSummary> {
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
     read_token(&state.paths)?;
@@ -4265,7 +4417,7 @@ async fn enqueue_rebuild_catalog(
     state: tauri::State<'_, AppContext>,
     space: RepoConfig,
     expected_revision: String,
-) -> CommandResult<TaskRecord> {
+) -> CommandResult<TaskSummary> {
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
     read_token(&state.paths)?;
@@ -4287,8 +4439,18 @@ async fn enqueue_rebuild_catalog(
 }
 
 #[tauri::command]
-fn list_tasks(state: tauri::State<'_, AppContext>) -> CommandResult<Vec<TaskRecord>> {
-    task_store(&state.paths)?.list().map_err(to_err)
+fn list_tasks(state: tauri::State<'_, AppContext>) -> CommandResult<Vec<TaskSummary>> {
+    task_summaries_for_paths(&state.paths)
+}
+
+#[tauri::command]
+fn list_task_items(
+    state: tauri::State<'_, AppContext>,
+    task_id: Uuid,
+    offset: u64,
+    limit: u64,
+) -> CommandResult<TaskItemsPageDto> {
+    list_task_items_for_paths(&state.paths, task_id, offset, limit)
 }
 
 #[tauri::command]
@@ -4313,7 +4475,7 @@ async fn pause_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
-) -> CommandResult<Vec<TaskRecord>> {
+) -> CommandResult<Vec<TaskSummary>> {
     interrupt_task_state(
         &state.paths,
         &state.task_lifecycle_gate,
@@ -4324,7 +4486,10 @@ async fn pause_task(
     state.task_manager.cancel(task_id).await;
     let store = task_store(&state.paths)?;
     emit_tasks(&app, &state.paths);
-    store.list().map_err(to_err)
+    store
+        .list_summaries()
+        .map(webview_safe_task_summaries)
+        .map_err(to_err)
 }
 
 #[tauri::command]
@@ -4332,7 +4497,7 @@ async fn resume_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
-) -> CommandResult<Vec<TaskRecord>> {
+) -> CommandResult<Vec<TaskSummary>> {
     if state.task_manager.is_running(task_id).await {
         let app_handle = app.clone();
         let paths = state.paths.clone();
@@ -4359,7 +4524,10 @@ async fn resume_task(
     }
     let store = task_store(&state.paths)?;
     emit_tasks(&app, &state.paths);
-    store.list().map_err(to_err)
+    store
+        .list_summaries()
+        .map(webview_safe_task_summaries)
+        .map_err(to_err)
 }
 
 #[tauri::command]
@@ -4367,7 +4535,7 @@ async fn retry_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
-) -> CommandResult<Vec<TaskRecord>> {
+) -> CommandResult<Vec<TaskSummary>> {
     if state.task_manager.is_running(task_id).await {
         return Err(CommandError::invalid_input(
             "task worker must stop before retrying",
@@ -4381,7 +4549,10 @@ async fn retry_task(
     }
     emit_tasks(&app, &state.paths);
     spawn_persisted_task(app.clone(), task_id);
-    store.list().map_err(to_err)
+    store
+        .list_summaries()
+        .map(webview_safe_task_summaries)
+        .map_err(to_err)
 }
 
 #[tauri::command]
@@ -4389,7 +4560,7 @@ async fn cancel_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
-) -> CommandResult<Vec<TaskRecord>> {
+) -> CommandResult<Vec<TaskSummary>> {
     interrupt_task_state(
         &state.paths,
         &state.task_lifecycle_gate,
@@ -4400,7 +4571,10 @@ async fn cancel_task(
     state.task_manager.cancel(task_id).await;
     let store = task_store(&state.paths)?;
     emit_tasks(&app, &state.paths);
-    store.list().map_err(to_err)
+    store
+        .list_summaries()
+        .map(webview_safe_task_summaries)
+        .map_err(to_err)
 }
 
 #[tauri::command]
@@ -4408,11 +4582,14 @@ async fn clear_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
-) -> CommandResult<Vec<TaskRecord>> {
+) -> CommandResult<Vec<TaskSummary>> {
     clear_task_record(&state.paths, &state.task_lifecycle_gate, task_id).await?;
     let store = task_store(&state.paths)?;
     emit_tasks(&app, &state.paths);
-    store.list().map_err(to_err)
+    store
+        .list_summaries()
+        .map(webview_safe_task_summaries)
+        .map_err(to_err)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -4449,6 +4626,473 @@ pub fn run() {
         .invoke_handler(with_registered_commands!(generate_tauri_handler))
         .run(tauri::generate_context!())
         .expect("failed to run Lios desktop app");
+}
+
+#[cfg(test)]
+mod task_center_backend_tests {
+    use std::path::PathBuf;
+
+    use lios_core::catalog::SourceFileSnapshot;
+    use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
+    use lios_core::tasks::{
+        TaskItem, TaskItemState, TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary,
+    };
+    use lios_core::LiosError;
+    use serde_json::json;
+    use tempfile::tempdir;
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::{
+        activate_new_task, cleanup_is_safe, clear_task_record, finish_active_worker,
+        interrupt_task_state, list_task_items_for_paths, observed_task_interrupt, paths_dto,
+        persist_submission, recover_startup_tasks, recovery_key_status, submission_summary,
+        task_summaries_for_paths, CatalogMutationGate, CommandError, CommandErrorCode,
+        SetupSnapshot, TaskLifecycleState, TaskUpdateEvent,
+    };
+
+    fn corrupt_task_item_state(paths: &LiosPaths, item_id: Uuid) {
+        let connection = rusqlite::Connection::open(&paths.database).unwrap();
+        connection
+            .execute(
+                "UPDATE task_items SET state = 'FutureState' WHERE id = ?1",
+                rusqlite::params![item_id.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn insert_malformed_task(paths: &LiosPaths, state: TaskState) -> TaskRecord {
+        let store = TaskStore::open(&paths.database).unwrap();
+        let task = TaskRecord::queued("malformed item task", 1);
+        let item = TaskItem {
+            id: Uuid::new_v4(),
+            task_id: task.id,
+            name: "broken.bin".to_string(),
+            relative_path: None,
+            source_path: None,
+            source_modified_at_ns: None,
+            size: 1,
+            state: TaskItemState::Queued,
+            phase: None,
+            bytes_done: 0,
+            bytes_total: 1,
+            error: None,
+        };
+        store.insert(&task).unwrap();
+        store.update_state(task.id, state, None).unwrap();
+        store.upsert_item(&item).unwrap();
+        corrupt_task_item_state(paths, item.id);
+        task
+    }
+
+    fn summary() -> TaskSummary {
+        TaskSummary {
+            id: Uuid::new_v4(),
+            account_id: "account-a".to_string(),
+            space_id: "space-a".to_string(),
+            state: TaskState::Running,
+            label: "upload album".to_string(),
+            phase: Some("uploading".to_string()),
+            progress_total: 2,
+            progress_done: 1,
+            bytes_total: 20,
+            bytes_done: 10,
+            speed_bps: 5,
+            eta_seconds: Some(2),
+            attempt: 1,
+            created_at: "2026-07-12T00:00:00Z".to_string(),
+            updated_at: "2026-07-12T00:00:01Z".to_string(),
+            error: None,
+            item_count: 2,
+            can_retry: false,
+        }
+    }
+
+    fn assert_summary_json(value: &serde_json::Value) {
+        assert_eq!(value["item_count"], json!(2));
+        assert_eq!(value["can_retry"], json!(false));
+        assert!(value.get("items").is_none());
+        assert!(value.get("source_path").is_none());
+        assert!(value.get("source_modified_at_ns").is_none());
+    }
+
+    #[test]
+    fn setup_and_task_events_serialize_summaries_without_item_details() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let config = LiosConfig::default();
+        let task = summary();
+        let setup = SetupSnapshot {
+            paths: paths_dto(&paths),
+            recovery_key: recovery_key_status(&config),
+            config,
+            has_token: false,
+            active_task_space_id: None,
+            tasks: vec![task.clone()],
+            warning: None,
+        };
+        let event = TaskUpdateEvent { tasks: vec![task] };
+
+        assert_summary_json(&serde_json::to_value(setup).unwrap()["tasks"][0]);
+        assert_summary_json(&serde_json::to_value(event).unwrap()["tasks"][0]);
+    }
+
+    #[tokio::test]
+    async fn persisted_failed_task_events_do_not_expose_absolute_local_paths() {
+        const WINDOWS_SENTINEL: &str = r"C:\Users\LIOS_WINDOWS_PRIVATE\Documents\secret.bin";
+        const UNIX_SENTINEL: &str = "/home/LIOS_UNIX_PRIVATE/Documents/secret.bin";
+
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let lifecycle = Mutex::new(TaskLifecycleState::default());
+        let catalog_mutation_gate = CatalogMutationGate::default();
+        let task = activate_new_task(&paths, &lifecycle, TaskRecord::queued("upload", 1))
+            .await
+            .unwrap();
+        let error = CommandError::from(LiosError::Unsupported(format!(
+            "source paths no longer exist: {WINDOWS_SENTINEL}; {UNIX_SENTINEL}"
+        )));
+
+        let final_state = finish_active_worker(
+            &paths,
+            &lifecycle,
+            &catalog_mutation_gate,
+            task.id,
+            TaskState::Failed,
+            Some(error.message),
+        )
+        .await
+        .unwrap();
+        let summary = TaskStore::open(&paths.database)
+            .unwrap()
+            .get_summary(task.id)
+            .unwrap()
+            .unwrap();
+        let event = serde_json::to_string(&TaskUpdateEvent {
+            tasks: vec![summary.clone()],
+        })
+        .unwrap();
+
+        assert_eq!(final_state, TaskState::Failed);
+        assert_eq!(
+            summary.error.as_deref(),
+            Some("selected sources no longer exist")
+        );
+        for marker in ["LIOS_WINDOWS_PRIVATE", "LIOS_UNIX_PRIVATE"] {
+            assert!(!event.contains(marker), "{event}");
+        }
+    }
+
+    #[test]
+    fn webview_task_reads_scrub_historical_absolute_path_errors() {
+        const WINDOWS_SENTINEL: &str = r"C:\Users\LIOS_OLD_WINDOWS_PRIVATE\Documents\secret.bin";
+        const UNIX_SENTINEL: &str = "/home/LIOS_OLD_UNIX_PRIVATE/Documents/secret.bin";
+
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let store = TaskStore::open(&paths.database).unwrap();
+        let task = TaskRecord::queued("upload", 1);
+        store.insert(&task).unwrap();
+        store
+            .upsert_item(&TaskItem {
+                id: Uuid::new_v4(),
+                task_id: task.id,
+                name: "secret.bin".to_string(),
+                relative_path: Some(PathBuf::from("folder/secret.bin")),
+                source_path: Some(PathBuf::from(WINDOWS_SENTINEL)),
+                source_modified_at_ns: None,
+                size: 1,
+                state: TaskItemState::Queued,
+                phase: None,
+                bytes_done: 0,
+                bytes_total: 1,
+                error: None,
+            })
+            .unwrap();
+        store
+            .update_state(
+                task.id,
+                TaskState::Failed,
+                Some(format!("source path no longer exists: {WINDOWS_SENTINEL}")),
+            )
+            .unwrap();
+        store
+            .update_items_state(
+                task.id,
+                TaskItemState::Failed,
+                None,
+                Some(format!(
+                    "IO error for operation on {UNIX_SENTINEL}: permission denied"
+                )),
+                false,
+            )
+            .unwrap();
+        drop(store);
+
+        let summaries = task_summaries_for_paths(&paths).unwrap();
+        let items = list_task_items_for_paths(&paths, task.id, 0, 20).unwrap();
+        let serialized = serde_json::to_string(&(summaries, items)).unwrap();
+
+        for marker in ["LIOS_OLD_WINDOWS_PRIVATE", "LIOS_OLD_UNIX_PRIVATE"] {
+            assert!(!serialized.contains(marker), "{serialized}");
+        }
+    }
+
+    #[test]
+    fn task_submission_response_is_a_safe_summary() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let sentinel = temp.path().join("private").join("secret.bin");
+        let source = SourceFileSnapshot {
+            source_path: sentinel.clone(),
+            relative_path: "secret.bin".into(),
+            size: 7,
+            modified_at_ns: Some(123_456_789),
+        };
+        let spec = TaskSpec::Upload {
+            account_id: "account-a".to_string(),
+            space_id: "space-a".to_string(),
+            repo: RepoConfig {
+                namespace: "novix".to_string(),
+                dataset: "safe-summary".to_string(),
+                endpoint: "https://modelscope.cn".to_string(),
+            },
+            parent_node_id: "root".to_string(),
+            source_paths: vec![sentinel.clone()],
+            source_snapshot: None,
+            chunk_size: 1,
+            conflict_resolutions: Vec::new(),
+        };
+        let task = persist_submission(&paths, &spec, std::slice::from_ref(&source)).unwrap();
+
+        let summary = submission_summary(&task).unwrap();
+        let value = serde_json::to_value(summary).unwrap();
+        let serialized = value.to_string();
+
+        assert_eq!(value["item_count"], json!(1));
+        assert_eq!(value["can_retry"], json!(false));
+        assert!(value.get("items").is_none());
+        assert!(value.get("source_path").is_none());
+        assert!(value.get("source_modified_at_ns").is_none());
+        assert!(!serialized.contains(sentinel.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn task_item_page_validates_limits_and_missing_tasks() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let store = TaskStore::open(&paths.database).unwrap();
+        let task = TaskRecord::queued("upload album", 1);
+        store.insert(&task).unwrap();
+        store
+            .upsert_item(&TaskItem {
+                id: Uuid::new_v4(),
+                task_id: task.id,
+                name: "a.bin".to_string(),
+                relative_path: Some("a.bin".into()),
+                source_path: Some(temp.path().join("a.bin")),
+                source_modified_at_ns: None,
+                size: 1,
+                state: TaskItemState::Queued,
+                phase: None,
+                bytes_done: 0,
+                bytes_total: 1,
+                error: None,
+            })
+            .unwrap();
+        drop(store);
+
+        for limit in [0, 201] {
+            let error = list_task_items_for_paths(&paths, task.id, 0, limit).unwrap_err();
+            assert_eq!(error.code, CommandErrorCode::InvalidInput);
+        }
+        let missing = list_task_items_for_paths(&paths, Uuid::new_v4(), 0, 20).unwrap_err();
+        assert_eq!(missing.code, CommandErrorCode::InvalidInput);
+
+        let page = list_task_items_for_paths(&paths, task.id, 0, 20).unwrap();
+        assert_eq!(page.task_id, task.id);
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 1);
+    }
+
+    #[test]
+    fn task_item_page_serialization_omits_sensitive_source_fields() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let store = TaskStore::open(&paths.database).unwrap();
+        let task = TaskRecord::queued("upload album", 1);
+        store.insert(&task).unwrap();
+        store
+            .upsert_item(&TaskItem {
+                id: Uuid::new_v4(),
+                task_id: task.id,
+                name: "a.bin".to_string(),
+                relative_path: Some("folder/a.bin".into()),
+                source_path: Some(temp.path().join("private/a.bin")),
+                source_modified_at_ns: Some(123),
+                size: 1,
+                state: TaskItemState::Queued,
+                phase: Some("preparing".to_string()),
+                bytes_done: 0,
+                bytes_total: 1,
+                error: None,
+            })
+            .unwrap();
+        drop(store);
+
+        let page = list_task_items_for_paths(&paths, task.id, 0, 20).unwrap();
+        let value = serde_json::to_value(page).unwrap();
+        let item = &value["items"][0];
+
+        assert_eq!(item["name"], json!("a.bin"));
+        assert_eq!(item["relative_path"], json!("folder/a.bin"));
+        assert!(item.get("source_path").is_none());
+        assert!(item.get("source_modified_at_ns").is_none());
+    }
+
+    #[test]
+    fn task_item_page_rejects_offsets_unsafe_for_javascript_or_sqlite() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let store = TaskStore::open(&paths.database).unwrap();
+        let task = TaskRecord::queued("upload album", 0);
+        store.insert(&task).unwrap();
+        drop(store);
+
+        for offset in [9_007_199_254_740_992, u64::MAX] {
+            let error = list_task_items_for_paths(&paths, task.id, offset, 20).unwrap_err();
+            assert_eq!(error.code, CommandErrorCode::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn state_queries_ignore_malformed_items_on_unrelated_tasks() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        insert_malformed_task(&paths, TaskState::Completed);
+        let store = TaskStore::open(&paths.database).unwrap();
+        let active = TaskRecord::queued("active task", 0);
+        store.insert(&active).unwrap();
+        store
+            .update_state(active.id, TaskState::Running, None)
+            .unwrap();
+        drop(store);
+
+        assert_eq!(super::task_interrupt_core(&paths, active.id).unwrap(), None);
+        assert_eq!(
+            observed_task_interrupt(&paths, active.id, &CancellationToken::new()).unwrap(),
+            None
+        );
+        assert!(!cleanup_is_safe(&paths, &TaskLifecycleState::default()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn control_paths_ignore_malformed_items_on_the_target_task() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let task = insert_malformed_task(&paths, TaskState::Running);
+        let lifecycle = Mutex::new(TaskLifecycleState::default());
+
+        interrupt_task_state(&paths, &lifecycle, task.id, TaskState::Canceled)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            observed_task_interrupt(&paths, task.id, &CancellationToken::new()).unwrap(),
+            Some(TaskState::Canceled)
+        );
+        assert_eq!(
+            TaskStore::open(&paths.database)
+                .unwrap()
+                .get_summary(task.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Canceled
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_and_clear_paths_ignore_malformed_items_on_the_target_task() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let paused = insert_malformed_task(&paths, TaskState::Paused);
+        let lifecycle = Mutex::new(TaskLifecycleState::default());
+
+        let final_state = finish_active_worker(
+            &paths,
+            &lifecycle,
+            &CatalogMutationGate::default(),
+            paused.id,
+            TaskState::Completed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(final_state, TaskState::Paused);
+
+        let completed = insert_malformed_task(&paths, TaskState::Completed);
+        clear_task_record(&paths, &lifecycle, completed.id)
+            .await
+            .unwrap();
+        assert!(TaskStore::open(&paths.database)
+            .unwrap()
+            .get_summary(completed.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn startup_recovery_lists_queued_specs_without_decoding_items() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let spec = TaskSpec::Delete {
+            account_id: "account-a".to_string(),
+            space_id: "space-a".to_string(),
+            repo: RepoConfig {
+                namespace: "novix".to_string(),
+                dataset: "cold".to_string(),
+                endpoint: "https://modelscope.cn".to_string(),
+            },
+            node_ids: vec!["node-a".to_string()],
+        };
+        let task = TaskRecord::queued_for_spec(&spec);
+        let item = TaskItem {
+            id: Uuid::new_v4(),
+            task_id: task.id,
+            name: "broken.bin".to_string(),
+            relative_path: None,
+            source_path: None,
+            source_modified_at_ns: None,
+            size: 1,
+            state: TaskItemState::Queued,
+            phase: None,
+            bytes_done: 0,
+            bytes_total: 1,
+            error: None,
+        };
+        let store = TaskStore::open(&paths.database).unwrap();
+        store.insert_with_spec(&task, &spec).unwrap();
+        store.upsert_item(&item).unwrap();
+        corrupt_task_item_state(&paths, item.id);
+        drop(store);
+
+        let recovery = recover_startup_tasks(&paths).unwrap();
+
+        assert_eq!(recovery.queued, vec![task.id]);
+        assert!(recovery.reconcile.is_empty());
+        let queued = TaskStore::open(&paths.database)
+            .unwrap()
+            .list_queued_summaries_with_specs()
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0.id, task.id);
+        assert_eq!(queued[0].1.account_id(), spec.account_id());
+        assert_eq!(queued[0].1.space_id(), spec.space_id());
+    }
 }
 
 #[cfg(test)]

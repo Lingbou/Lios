@@ -850,7 +850,7 @@ select:focus {
 }
 
 .taskRows {
-  max-height: 220px;
+  max-height: min(420px, calc(100vh - 120px));
   overflow: auto;
   display: grid;
   gap: 8px;
@@ -875,10 +875,23 @@ select:focus {
 .taskSummary {
   min-width: 0;
   display: grid;
-  grid-template-columns: 30px minmax(0, 1fr) minmax(160px, 280px) auto;
+  grid-template-columns: 30px 30px minmax(0, 1fr) minmax(160px, 280px) auto;
   align-items: center;
   gap: 10px;
   padding: 10px;
+}
+
+.taskExpandButton {
+  width: 30px;
+  min-height: 30px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.taskExpandButton:disabled {
+  visibility: hidden;
 }
 
 .taskRow.completed {
@@ -1005,40 +1018,59 @@ select:focus {
   background: var(--danger-soft);
 }
 
-.taskFileList {
-  max-height: 150px;
+.taskActionSpinner {
+  animation: spin 1s linear infinite;
+}
+
+.taskDetailViewport {
+  height: 240px;
   overflow: auto;
   border-top: 1px solid #f5e5ef;
   background: rgba(255, 250, 253, 0.62);
+  contain: strict;
 }
 
-.taskFileRow {
+.taskVirtualCanvas {
+  position: relative;
+  height: var(--task-virtual-size, 0px);
+}
+
+.taskVirtualRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 56px;
   min-width: 0;
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr) minmax(180px, 280px);
   align-items: center;
   gap: 10px;
   padding: 8px 12px;
+  border-bottom: 1px solid rgba(245, 229, 239, 0.76);
+  transform: translateY(var(--task-row-start, 0px));
 }
 
-.taskFileRow + .taskFileRow {
-  border-top: 1px solid rgba(245, 229, 239, 0.76);
-}
-
-.taskFileRow > svg {
+.taskVirtualRow > svg {
   width: 16px;
   height: 16px;
   color: var(--pink-strong);
 }
 
-.taskFileRow.completed > svg {
+.taskVirtualRow.completed > svg {
   color: #438260;
 }
 
-.taskFileRow.failed > svg,
-.taskFileRow.canceled > svg,
-.taskFileRow.skipped > svg {
+.taskVirtualRow.failed > svg,
+.taskVirtualRow.canceled > svg,
+.taskVirtualRow.skipped > svg {
   color: var(--danger);
+}
+
+.taskFileLoading {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .taskFileInfo,
@@ -1515,19 +1547,23 @@ select:focus {
   }
 
   .taskSummary {
-    grid-template-columns: 30px minmax(0, 1fr);
+    grid-template-columns: 30px 30px minmax(0, 1fr);
   }
 
   .taskProgress,
   .taskButtons {
-    grid-column: 2;
-  }
-
-  .taskFileRow {
-    grid-template-columns: 18px minmax(0, 1fr);
+    grid-column: 3;
   }
 
   .taskFileProgress {
+    grid-column: 2;
+  }
+
+  .taskVirtualRow {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+
+  .taskVirtualRow .taskFileProgress {
     grid-column: 2;
   }
 

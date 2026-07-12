@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  taskCompletionReloadsCatalog,
+  newCatalogMutationCompletions,
+  seedCatalogMutationCompletions,
   taskItemProgressPercent,
   taskItemStatusText,
   taskLabelText,
@@ -10,6 +11,20 @@ import {
   taskProgressText,
   taskStatusText
 } from "../src/taskPresentation.ts";
+import { taskActionsForTask } from "../src/features/tasks/taskPresentation.ts";
+
+test("task states expose only their real supported actions", () => {
+  assert.deepEqual(taskActionsForTask({ state: "Queued", can_retry: false }), ["pause", "cancel"]);
+  assert.deepEqual(taskActionsForTask({ state: "Preparing", can_retry: false }), ["pause", "cancel"]);
+  assert.deepEqual(taskActionsForTask({ state: "Running", can_retry: false }), ["pause", "cancel"]);
+  assert.deepEqual(taskActionsForTask({ state: "Retrying", can_retry: false }), ["pause", "cancel"]);
+  assert.deepEqual(taskActionsForTask({ state: "Paused", can_retry: false }), ["resume", "cancel"]);
+  assert.deepEqual(taskActionsForTask({ state: "Failed", can_retry: false }), ["clear"]);
+  assert.deepEqual(taskActionsForTask({ state: "Failed", can_retry: true }), ["retry", "clear"]);
+  assert.deepEqual(taskActionsForTask({ state: "Completed", can_retry: false }), ["clear"]);
+  assert.deepEqual(taskActionsForTask({ state: "Canceled", can_retry: false }), ["clear"]);
+  assert.deepEqual(taskActionsForTask({ state: "Committing", can_retry: false }), []);
+});
 
 test("task progress prefers byte progress and includes speed plus ETA", () => {
   const task = {
@@ -143,18 +158,80 @@ test("catalog rebuild statuses describe recovery work", () => {
   );
 });
 
-test("catalog rebuild uses a recovery label and reloads only on its completion transition", () => {
+test("catalog rebuild uses a recovery label", () => {
   assert.equal(taskLabelText("rebuild"), "目录恢复");
-  assert.equal(
-    taskCompletionReloadsCatalog("Running", { state: "Completed", label: "rebuild" }),
-    true
+});
+
+test("catalog mutation completions seed a baseline and report newly completed tasks once", () => {
+  const handled = new Set<string>();
+  const task = (
+    id: string,
+    state: "Running" | "Completed",
+    label: string,
+    space_id = "space-a"
+  ) => ({
+    id,
+    state,
+    label,
+    space_id
+  });
+
+  seedCatalogMutationCompletions(handled, [
+    task("old-upload", "Completed", "upload"),
+    task("pending-delete", "Running", "delete 2 items"),
+    task("old-download", "Completed", "download")
+  ]);
+
+  assert.deepEqual([...handled], ["old-upload"]);
+  assert.deepEqual(
+    newCatalogMutationCompletions(handled, [
+      task("old-upload", "Completed", "upload"),
+      task("pending-delete", "Completed", "delete 2 items"),
+      task("fast-upload", "Completed", "upload"),
+      task("recovery", "Completed", "rebuild"),
+      task("download", "Completed", "download")
+    ], "space-a"),
+    ["pending-delete", "fast-upload", "recovery"]
   );
-  assert.equal(
-    taskCompletionReloadsCatalog("Completed", { state: "Completed", label: "rebuild" }),
-    false
+  assert.deepEqual(
+    newCatalogMutationCompletions(handled, [
+      task("pending-delete", "Completed", "delete 2 items"),
+      task("fast-upload", "Completed", "upload"),
+      task("recovery", "Completed", "rebuild")
+    ], "space-a"),
+    []
   );
-  assert.equal(
-    taskCompletionReloadsCatalog(undefined, { state: "Completed", label: "rebuild" }),
-    false
+  assert.deepEqual(newCatalogMutationCompletions(handled, [], "space-a"), []);
+  assert.deepEqual(
+    newCatalogMutationCompletions(
+      handled,
+      [task("fast-upload", "Completed", "upload")],
+      "space-a"
+    ),
+    []
+  );
+});
+
+test("catalog mutation completions reload only the active task space", () => {
+  const handled = new Set<string>();
+  const completed = (id: string, space_id: string) => ({
+    id,
+    space_id,
+    state: "Completed" as const,
+    label: "upload"
+  });
+
+  seedCatalogMutationCompletions(handled, []);
+  assert.deepEqual(
+    newCatalogMutationCompletions(
+      handled,
+      [completed("space-a-task", "space-a"), completed("space-b-task", "space-b")],
+      "space-b"
+    ),
+    ["space-b-task"]
+  );
+  assert.deepEqual(
+    newCatalogMutationCompletions(handled, [completed("space-a-task", "space-a")], "space-a"),
+    []
   );
 });

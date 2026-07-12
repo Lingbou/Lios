@@ -2428,6 +2428,7 @@ dependencies = [
  "httpmock",
  "lios-core",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
