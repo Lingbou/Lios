@@ -404,7 +404,89 @@ fn task_store_can_delete_a_task_record() {
 }
 
 #[test]
-fn task_store_lists_summaries_in_stable_order_with_item_counts() {
+fn task_store_prunes_only_old_or_excess_terminal_history() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let mut store = TaskStore::open(&db_path).unwrap();
+    let active = TaskRecord::queued("active", 0);
+    let old = TaskRecord::queued("old terminal", 1);
+    store.insert(&active).unwrap();
+    store.insert(&old).unwrap();
+    store
+        .update_state(old.id, TaskState::Completed, None)
+        .unwrap();
+    let old_item = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: old.id,
+        name: "old.bin".to_string(),
+        relative_path: Some("old.bin".into()),
+        source_path: None,
+        source_modified_at_ns: None,
+        size: 1,
+        state: TaskItemState::Completed,
+        phase: None,
+        bytes_done: 1,
+        bytes_total: 1,
+        error: None,
+    };
+    store.upsert_item(&old_item).unwrap();
+    let old_checkpoint = TaskObjectCheckpoint {
+        task_id: old.id,
+        remote_path: "objects/files/old/manifest.enc".to_string(),
+        oid: "a".repeat(64),
+        size: 1,
+        state: CheckpointState::Pending,
+    };
+    store.upsert_checkpoint(&old_checkpoint).unwrap();
+
+    for index in 0..501 {
+        let task = TaskRecord::queued(format!("recent terminal {index}"), 0);
+        store.insert(&task).unwrap();
+        store
+            .update_state(task.id, TaskState::Completed, None)
+            .unwrap();
+    }
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET updated_at = '2999-01-01T00:00:00+00:00' WHERE state = 'Completed'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE tasks SET updated_at = '2000-01-01T00:00:00+00:00' WHERE id IN (?1, ?2)",
+            rusqlite::params![active.id.to_string(), old.id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let removed = store.prune_terminal_history().unwrap();
+
+    assert_eq!(removed.len(), 2);
+    assert!(removed.contains(&old.id));
+    assert!(store.get_summary(active.id).unwrap().is_some());
+    assert!(store.get_summary(old.id).unwrap().is_none());
+    assert!(store.list_items(old.id).unwrap().is_empty());
+    assert!(store.list_checkpoints(old.id).unwrap().is_empty());
+    let summaries = store.list_summaries().unwrap();
+    assert_eq!(
+        summaries
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.state,
+                    TaskState::Failed | TaskState::Completed | TaskState::Canceled
+                )
+            })
+            .count(),
+        500
+    );
+    assert_eq!(summaries[0].id, active.id);
+}
+
+#[test]
+fn task_store_lists_summaries_newest_first_with_item_counts() {
     let tmp = tempdir().unwrap();
     let store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
     let first = TaskRecord::queued("upload album", 2);
@@ -439,13 +521,13 @@ fn task_store_lists_summaries_in_stable_order_with_item_counts() {
 
     assert_eq!(
         summaries.iter().map(|task| task.id).collect::<Vec<_>>(),
-        vec![first.id, second.id]
+        vec![second.id, first.id]
     );
-    assert_eq!(summaries[0].item_count, 2);
-    assert_eq!(summaries[1].item_count, 1);
+    assert_eq!(summaries[0].item_count, 1);
+    assert_eq!(summaries[1].item_count, 2);
     assert_eq!(
         store.get_summary(first.id).unwrap(),
-        Some(summaries[0].clone())
+        Some(summaries[1].clone())
     );
     assert_eq!(store.get_summary(Uuid::new_v4()).unwrap(), None);
 }
@@ -550,6 +632,49 @@ fn task_store_summary_listing_does_not_decode_task_items() {
 }
 
 #[test]
+fn task_store_get_does_not_scan_unrelated_task_items() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let store = TaskStore::open(&db_path).unwrap();
+    let target = TaskRecord::queued("target", 0);
+    let unrelated = TaskRecord::queued("unrelated", 1);
+    let malformed_item = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: unrelated.id,
+        name: "broken.bin".to_string(),
+        relative_path: None,
+        source_path: Some(tmp.path().join("private-source.bin")),
+        source_modified_at_ns: None,
+        size: 1,
+        state: TaskItemState::Queued,
+        phase: None,
+        bytes_done: 0,
+        bytes_total: 1,
+        error: None,
+    };
+    store.insert(&target).unwrap();
+    store.insert(&unrelated).unwrap();
+    store.upsert_item(&malformed_item).unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection
+        .execute(
+            "UPDATE task_items SET state = 'FutureState' WHERE id = ?1",
+            rusqlite::params![malformed_item.id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = TaskStore::open(&db_path).unwrap();
+    assert_eq!(store.get(target.id).unwrap().unwrap().id, target.id);
+    assert!(matches!(
+        store.get(unrelated.id).unwrap_err(),
+        LiosError::DataCorruption(_)
+    ));
+}
+
+#[test]
 fn task_store_lists_queued_summaries_with_specs_without_decoding_items() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("lios.db");
@@ -604,10 +729,6 @@ fn task_store_lists_queued_summaries_with_specs_without_decoding_items() {
     assert_eq!(queued[0].0.id, task.id);
     assert_eq!(queued[0].1.account_id(), spec.account_id());
     assert_eq!(queued[0].1.space_id(), spec.space_id());
-    assert!(matches!(
-        store.list_queued_with_specs().unwrap_err(),
-        LiosError::DataCorruption(_)
-    ));
 }
 
 #[test]
@@ -739,12 +860,13 @@ fn task_store_pages_items_in_stable_order() {
             .unwrap();
     }
 
-    let first_page = store.list_items_page(task.id, 0, 2).unwrap();
-    let second_page = store.list_items_page(task.id, 2, 2).unwrap();
-    let final_page = store.list_items_page(task.id, 4, 2).unwrap();
+    let first_page = store.get_items_page(task.id, 0, 2).unwrap().unwrap();
+    let second_page = store.get_items_page(task.id, 2, 2).unwrap().unwrap();
+    let final_page = store.get_items_page(task.id, 4, 2).unwrap().unwrap();
 
     assert_eq!(
         first_page
+            .items
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>(),
@@ -752,6 +874,7 @@ fn task_store_pages_items_in_stable_order() {
     );
     assert_eq!(
         second_page
+            .items
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>(),
@@ -759,18 +882,24 @@ fn task_store_pages_items_in_stable_order() {
     );
     assert_eq!(
         final_page
+            .items
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>(),
         vec!["4.bin"]
     );
-    assert!(store.list_items_page(task.id, 5, 2).unwrap().is_empty());
     assert!(store
-        .list_items_page(Uuid::new_v4(), 0, 2)
+        .get_items_page(task.id, 5, 2)
         .unwrap()
+        .unwrap()
+        .items
         .is_empty());
+    assert!(store
+        .get_items_page(Uuid::new_v4(), 0, 2)
+        .unwrap()
+        .is_none());
     assert!(matches!(
-        store.list_items_page(task.id, u64::MAX, 1).unwrap_err(),
+        store.get_items_page(task.id, u64::MAX, 1).unwrap_err(),
         LiosError::DataCorruption(_)
     ));
 }
@@ -2034,7 +2163,7 @@ fn task_store_lists_valid_queued_specs_and_claims_each_task_once() {
         .unwrap();
     let legacy = TaskRecord::queued("legacy", 0);
     store.insert(&legacy).unwrap();
-    let runnable = store.list_queued_with_specs().unwrap();
+    let runnable = store.list_queued_summaries_with_specs().unwrap();
     assert_eq!(runnable.len(), 1);
     assert_eq!(runnable[0].0.id, queued.id);
     assert_eq!(runnable[0].1.space_id(), "novix/cold");

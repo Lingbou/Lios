@@ -56,19 +56,21 @@ test("setup refresh returns the backend-scoped configured space despite a stale 
   assert.match(body, new RegExp(`return ${scopedResult[1]};`));
 });
 
-test("catalog mutation baseline is seeded from current setup before task UI becomes interactive", async () => {
+test("catalog mutation baseline is seeded from the initial task query before completions are handled", async () => {
   const app = await readFile(new URL("src/App.tsx", root), "utf8");
-  const refreshSetup = app.match(/async function refreshSetup[\s\S]*?\n  async function run/)?.[0];
+  const completionEffect = app.match(
+    /useEffect\(\(\) => \{[\s\S]*?seedCatalogMutationCompletions\(catalogMutationCompletions\.current, tasks\)[\s\S]*?newCatalogMutationCompletions[\s\S]*?\}, \[tasks, tasksReady, activeSpace\?\.task_space_id\]\);/
+  )?.[0];
 
-  assert.ok(refreshSetup);
-  const seedIndex = refreshSetup.indexOf(
-    "seedCatalogMutationCompletions(catalogMutationCompletions.current, next.tasks)"
+  assert.ok(completionEffect);
+  const readyIndex = completionEffect.indexOf("if (!tasksReady) return");
+  const seedIndex = completionEffect.indexOf(
+    "seedCatalogMutationCompletions(catalogMutationCompletions.current, tasks)"
   );
-  const syncIndex = refreshSetup.indexOf("syncTasks(next.tasks)");
-  const publishSetupIndex = refreshSetup.indexOf("setSnapshot(next)");
-  assert.ok(seedIndex >= 0);
-  assert.ok(syncIndex > seedIndex);
-  assert.ok(publishSetupIndex > syncIndex);
+  const completionIndex = completionEffect.indexOf("newCatalogMutationCompletions");
+  assert.ok(readyIndex >= 0);
+  assert.ok(seedIndex > readyIndex);
+  assert.ok(completionIndex > seedIndex);
   assert.equal(app.match(/seedCatalogMutationCompletions\(/g)?.length, 1);
 });
 
