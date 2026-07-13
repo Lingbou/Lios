@@ -982,7 +982,9 @@ async fn pinned_commit_revision_is_used_for_read_requests() {
             .path("/api/v1/datasets/novix/cold/repo/tree")
             .query_param("Revision", "commit-123")
             .query_param("Recursive", "true")
-            .query_param("Root", "");
+            .query_param("Root", "")
+            .query_param("PageNumber", "1")
+            .query_param("PageSize", "200");
         then.status(200).json_body(json!({ "Data": [] }));
     });
     let download = server.mock(|when, then| {
@@ -1006,7 +1008,58 @@ async fn pinned_commit_revision_is_used_for_read_requests() {
 }
 
 #[tokio::test]
-async fn list_download_and_explicit_delete_commit_use_dataset_routes() {
+async fn list_objects_reads_all_pages_and_deduplicates_paths() {
+    let server = MockServer::start();
+    let first_page = (0..200)
+        .map(|index| {
+            json!({
+                "Path": format!("objects/files/{index:03}.enc"),
+                "Type": "blob",
+                "Size": index
+            })
+        })
+        .collect::<Vec<_>>();
+    let first = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v1/datasets/novix/cold/repo/tree")
+            .query_param("Revision", "master")
+            .query_param("Recursive", "true")
+            .query_param("Root", "")
+            .query_param("PageNumber", "1")
+            .query_param("PageSize", "200");
+        then.status(200).json_body(json!({ "Data": first_page }));
+    });
+    let second = server.mock(|when, then| {
+        when.method(GET)
+            .path("/api/v1/datasets/novix/cold/repo/tree")
+            .query_param("Revision", "master")
+            .query_param("Recursive", "true")
+            .query_param("Root", "")
+            .query_param("PageNumber", "2")
+            .query_param("PageSize", "200");
+        then.status(200).json_body(json!({
+            "Data": [
+                { "Path": "objects/files/000.enc", "Type": "blob", "Size": 0 },
+                { "Path": "objects/files/200.enc", "Type": "blob", "Size": 200 },
+                { "Path": "objects/files", "Type": "tree" }
+            ]
+        }));
+    });
+
+    let objects = ModelScopeAdapter::new(server.base_url(), "token")
+        .list_objects("novix", "cold", "")
+        .await
+        .unwrap();
+
+    assert_eq!(objects.len(), 201);
+    assert_eq!(objects.first().unwrap().path, "objects/files/000.enc");
+    assert_eq!(objects.last().unwrap().path, "objects/files/200.enc");
+    first.assert_hits(1);
+    second.assert_hits(1);
+}
+
+#[tokio::test]
+async fn list_download_filters_trees_and_modelscope_delete_is_rejected() {
     let server = MockServer::start();
     let tmp = tempdir().unwrap();
     let download_path = tmp.path().join("restore/chunk.lios");
@@ -1016,9 +1069,13 @@ async fn list_download_and_explicit_delete_commit_use_dataset_routes() {
             .path("/api/v1/datasets/novix/cold/repo/tree")
             .query_param("Revision", "master")
             .query_param("Recursive", "true")
-            .query_param("Root", "objects/file-a");
+            .query_param("Root", "objects/file-a")
+            .query_param("PageNumber", "1")
+            .query_param("PageSize", "200");
         then.status(200).json_body(json!({
             "Data": [
+                { "Path": "objects/file-a", "Type": "tree" },
+                { "Path": "objects/file-a/chunks", "Type": "tree" },
                 { "Path": "objects/file-a/chunk-000000.lios", "Size": 15, "Sha256": "abc" },
                 { "Path": "objects/file-a/manifest.enc", "Size": 8 }
             ]
@@ -1033,32 +1090,9 @@ async fn list_download_and_explicit_delete_commit_use_dataset_routes() {
     });
     let delete_commit = server.mock(|when, then| {
         when.method(POST)
-            .path("/api/v1/repos/datasets/novix/cold/commit/master")
-            .json_body(json!({
-                "commit_message": "Delete objects/file-a",
-                "actions": [
-                    {
-                        "action": "delete",
-                        "path": "objects/file-a/chunk-000000.lios",
-                        "type": "normal",
-                        "size": 0,
-                        "sha256": "",
-                        "content": "",
-                        "encoding": ""
-                    },
-                    {
-                        "action": "delete",
-                        "path": "objects/file-a/manifest.enc",
-                        "type": "normal",
-                        "size": 0,
-                        "sha256": "",
-                        "content": "",
-                        "encoding": ""
-                    }
-                ]
-            }));
+            .path("/api/v1/repos/datasets/novix/cold/commit/master");
         then.status(200)
-            .json_body(json!({ "Data": { "commit": "def" } }));
+            .json_body(json!({ "Data": { "commit": "unexpected" } }));
     });
 
     let adapter = ModelScopeAdapter::new(server.base_url(), "token");
@@ -1079,17 +1113,20 @@ async fn list_download_and_explicit_delete_commit_use_dataset_routes() {
         .iter()
         .map(|object| RemoteAction::delete(object.path.clone()))
         .collect::<Vec<_>>();
-    adapter
+    let error = adapter
         .commit_actions("novix", "cold", "Delete objects/file-a", &delete_actions)
         .await
-        .unwrap();
+        .unwrap_err();
 
     assert_eq!(objects.len(), 2);
     assert_eq!(objects[0].path, "objects/file-a/chunk-000000.lios");
     assert_eq!(fs::read(&download_path).unwrap(), b"encrypted chunk");
+    assert!(
+        matches!(error, LiosError::Unsupported(message) if message.contains("cannot physically delete"))
+    );
     list.assert_hits(1);
     download.assert();
-    delete_commit.assert();
+    delete_commit.assert_hits(0);
 }
 
 #[tokio::test]

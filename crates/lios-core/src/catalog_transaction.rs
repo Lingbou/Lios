@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::storage::{
     validate_catalog_sync_upload, BlobCheckpoint, BlobSpec, BlobValidation, CatalogSyncUpload,
-    CommitPlan, RemoteAction, RepoRevision, StorageAdapter, StorageObject,
+    CommitPlan, RemoteAction, RemoteDeleteCapability, RepoRevision, StorageAdapter, StorageObject,
 };
 use crate::{LiosError, RemoteError, RemoteErrorKind, Result};
 
@@ -84,8 +84,12 @@ where
         .iter()
         .find(|upload| upload.path == "catalog.enc")
         .map(|upload| upload.expected_sha256.clone());
-    let total_items =
-        (spec.uploads.len() + spec.delete_paths.len()) as u64 + u64::from(has_changes);
+    let remote_delete_capability = adapter.remote_delete_capability();
+    let cleanup_items = match remote_delete_capability {
+        RemoteDeleteCapability::Supported => spec.delete_paths.len(),
+        RemoteDeleteCapability::Unsupported { .. } => 0,
+    };
+    let total_items = (spec.uploads.len() + cleanup_items) as u64 + u64::from(has_changes);
     let mut blobs = Vec::with_capacity(spec.uploads.len());
     let mut actions = Vec::with_capacity(spec.uploads.len());
     for upload in &spec.uploads {
@@ -314,28 +318,39 @@ where
     }
     progress.blob_checkpoint = None;
 
-    progress.phase = CatalogTransactionPhase::Cleanup;
-    for batch in &plan.cleanup {
-        let cleanup = adapter
-            .commit_actions(
-                namespace,
-                dataset,
-                "Delete unreferenced encrypted catalog objects",
-                batch,
-            )
-            .await;
-        match cleanup {
-            Ok(()) => {
-                progress.completed_items +=
-                    batch.iter().filter(|action| action.is_delete()).count() as u64;
-                if let Err(error) = on_progress(progress.clone()) {
-                    warnings.push(format!("cleanup progress could not be recorded: {error}"));
+    if !plan.cleanup.is_empty() {
+        progress.phase = CatalogTransactionPhase::Cleanup;
+        match remote_delete_capability {
+            RemoteDeleteCapability::Supported => {
+                for batch in &plan.cleanup {
+                    let cleanup = adapter
+                        .commit_actions(
+                            namespace,
+                            dataset,
+                            "Delete unreferenced encrypted catalog objects",
+                            batch,
+                        )
+                        .await;
+                    match cleanup {
+                        Ok(()) => {
+                            progress.completed_items +=
+                                batch.iter().filter(|action| action.is_delete()).count() as u64;
+                            if let Err(error) = on_progress(progress.clone()) {
+                                warnings.push(format!(
+                                    "cleanup progress could not be recorded: {error}"
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            warnings.push(format!(
+                                "cleanup batch failed after catalog publication: {error}"
+                            ));
+                        }
+                    }
                 }
             }
-            Err(error) => {
-                warnings.push(format!(
-                    "cleanup batch failed after catalog publication: {error}"
-                ));
+            RemoteDeleteCapability::Unsupported { reason } => {
+                warnings.push(format!("remote storage cleanup skipped: {reason}"));
             }
         }
     }
@@ -454,6 +469,7 @@ mod tests {
         probe: ProbeResult,
         head_revision: RepoRevision,
         upload_required: bool,
+        remote_delete_capability: RemoteDeleteCapability,
         cleanup_failures_remaining: usize,
         publish_failures_remaining: usize,
     }
@@ -474,6 +490,7 @@ mod tests {
                         commit_id: Some("head".to_string()),
                     },
                     upload_required,
+                    remote_delete_capability: RemoteDeleteCapability::Supported,
                     cleanup_failures_remaining: 0,
                     publish_failures_remaining: 0,
                 })),
@@ -490,6 +507,11 @@ mod tests {
 
         fn fail_cleanup_times(&self, failures: usize) {
             self.state.lock().unwrap().cleanup_failures_remaining = failures;
+        }
+
+        fn disable_remote_delete(&self, reason: &'static str) {
+            self.state.lock().unwrap().remote_delete_capability =
+                RemoteDeleteCapability::Unsupported { reason };
         }
 
         fn fail_publish_times(&self, failures: usize) {
@@ -512,6 +534,10 @@ mod tests {
 
         async fn repo_exists(&self, _namespace: &str, _dataset: &str) -> Result<bool> {
             Ok(true)
+        }
+
+        fn remote_delete_capability(&self) -> RemoteDeleteCapability {
+            self.state.lock().unwrap().remote_delete_capability
         }
 
         async fn head_revision(&self, _namespace: &str, _dataset: &str) -> Result<RepoRevision> {
@@ -695,6 +721,18 @@ mod tests {
         }
     }
 
+    fn large_spec(root: &Path, base: Option<&[u8]>, delete_count: usize) -> CatalogTransactionSpec {
+        let mut transaction = spec(root, base, false, delete_count);
+        for index in 0..256 {
+            let local_path = root.join(format!("object-{index:03}.lios"));
+            fs::write(&local_path, format!("encrypted object {index}")).unwrap();
+            let remote_path = format!("objects/files/{index:03}/manifest.enc");
+            transaction.uploads.push(upload(&remote_path, local_path));
+            transaction.prepublish_safe_paths.insert(remote_path);
+        }
+        transaction
+    }
+
     fn assert_completed(outcome: CatalogTransactionOutcome) -> Vec<String> {
         let CatalogTransactionOutcome::Completed { warnings } = outcome else {
             panic!("expected completed transaction");
@@ -824,7 +862,7 @@ mod tests {
         let base = b"old encrypted catalog";
         let adapter = ScriptedAdapter::new(ProbeResult::Bytes(base.to_vec()), false);
 
-        let outcome = run(&adapter, spec(tmp.path(), Some(base), true, 255), || {
+        let outcome = run(&adapter, large_spec(tmp.path(), Some(base), 1), || {
             Ok(false)
         })
         .await
@@ -880,7 +918,7 @@ mod tests {
         let base = b"old encrypted catalog";
         let adapter = ScriptedAdapter::new(ProbeResult::Bytes(b"changed remotely".to_vec()), false);
 
-        let error = run(&adapter, spec(tmp.path(), Some(base), true, 255), || {
+        let error = run(&adapter, large_spec(tmp.path(), Some(base), 1), || {
             Ok(false)
         })
         .await
@@ -1009,11 +1047,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let adapter = ScriptedAdapter::new(ProbeResult::Bytes(base.to_vec()), false);
         let observed = adapter.clone();
-        let outcome = run(
-            &adapter,
-            spec(tmp.path(), Some(base), true, 255),
-            move || Ok(observed.events().iter().any(|event| event == "publish")),
-        )
+        let outcome = run(&adapter, spec(tmp.path(), Some(base), true, 1), move || {
+            Ok(observed.events().iter().any(|event| event == "publish"))
+        })
         .await
         .unwrap();
         assert!(assert_completed(outcome).is_empty());
@@ -1031,7 +1067,7 @@ mod tests {
             &adapter,
             NAMESPACE,
             DATASET,
-            spec(tmp.path(), Some(base), true, 255),
+            spec(tmp.path(), Some(base), true, 1),
             || Ok(false),
             move |progress| {
                 if progress.phase == CatalogTransactionPhase::Publish
@@ -1077,6 +1113,37 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_remote_delete_completes_with_a_warning_without_cleanup_requests() {
+        let tmp = tempdir().unwrap();
+        let base = b"old encrypted catalog";
+        let adapter = ScriptedAdapter::new(ProbeResult::Bytes(base.to_vec()), false);
+        adapter.disable_remote_delete("test backend cannot delete remote files");
+        let mut observed = Vec::new();
+
+        let outcome = execute_catalog_transaction(
+            &adapter,
+            NAMESPACE,
+            DATASET,
+            spec(tmp.path(), Some(base), false, 1),
+            || Ok(false),
+            |progress| {
+                observed.push(progress);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let warnings = assert_completed(outcome);
+
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("remote storage cleanup skipped")));
+        assert!(!adapter.events().iter().any(|event| event == "cleanup"));
+        let final_progress = observed.last().unwrap();
+        assert_eq!(final_progress.completed_items, final_progress.total_items);
     }
 
     #[tokio::test]
@@ -1138,7 +1205,7 @@ mod tests {
         );
         adapter.fail_publish_times(1);
 
-        let outcome = run(&adapter, spec(tmp.path(), Some(base), true, 255), || {
+        let outcome = run(&adapter, spec(tmp.path(), Some(base), true, 1), || {
             Ok(false)
         })
         .await

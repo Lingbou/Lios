@@ -40,6 +40,12 @@ pub struct RepoRevision {
     pub commit_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteDeleteCapability {
+    Supported,
+    Unsupported { reason: &'static str },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobSpec {
     pub local_path: PathBuf,
@@ -314,15 +320,14 @@ impl CommitPlan {
         }
 
         sort_upload_actions(&mut desired_uploads);
-        let total_actions = desired_uploads.len() + delete_paths.len();
-        if total_actions <= MODELSCOPE_COMMIT_ACTION_LIMIT {
-            let mut publish = desired_uploads;
-            publish.extend(delete_paths.into_iter().map(RemoteAction::delete));
+        if desired_uploads.len() <= MODELSCOPE_COMMIT_ACTION_LIMIT {
             return Ok(Self {
                 base_catalog_sha256,
                 prepublish: Vec::new(),
-                publish,
-                cleanup: Vec::new(),
+                publish: desired_uploads,
+                cleanup: chunk_actions(
+                    delete_paths.into_iter().map(RemoteAction::delete).collect(),
+                ),
             });
         }
 
@@ -635,6 +640,9 @@ fn sha256_file(path: &std::path::Path) -> Result<String> {
 pub trait StorageAdapter: Send + Sync {
     async fn create_repo(&self, namespace: &str, dataset: &str) -> Result<()>;
     async fn repo_exists(&self, namespace: &str, dataset: &str) -> Result<bool>;
+    fn remote_delete_capability(&self) -> RemoteDeleteCapability {
+        RemoteDeleteCapability::Supported
+    }
     async fn head_revision(&self, _namespace: &str, _dataset: &str) -> Result<RepoRevision> {
         Err(LiosError::Unsupported(
             "head revision lookup is not implemented by this storage adapter".to_string(),
