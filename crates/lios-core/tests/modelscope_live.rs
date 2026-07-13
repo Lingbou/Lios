@@ -9,7 +9,8 @@ use lios_core::{
     pack::{PackOptions, PackSource},
     restore::{RestoreConflictPolicy, RestoreOptions},
     storage::{
-        current_catalog_sha256, BlobSpec, BlobValidation, CommitPlan, RemoteAction, StorageAdapter,
+        current_catalog_sha256, BlobSpec, BlobValidation, CommitPlan, RemoteAction,
+        RemoteDeleteCapability, StorageAdapter,
     },
 };
 use sha2::{Digest, Sha256};
@@ -128,10 +129,15 @@ async fn commit_staged_snapshot(
     adapter
         .commit_actions(namespace, dataset, message, &plan.publish)
         .await?;
-    for batch in &plan.cleanup {
-        adapter
-            .commit_actions(namespace, dataset, "Clean live encrypted objects", batch)
-            .await?;
+    if matches!(
+        adapter.remote_delete_capability(),
+        RemoteDeleteCapability::Supported
+    ) {
+        for batch in &plan.cleanup {
+            adapter
+                .commit_actions(namespace, dataset, "Clean live encrypted objects", batch)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -244,6 +250,30 @@ async fn modelscope_private_dataset_roundtrip() {
             "Reset live encrypted snapshot",
         )
         .await?;
+        assert!(matches!(
+            adapter.remote_delete_capability(),
+            RemoteDeleteCapability::Unsupported { .. }
+        ));
+        let cleaned_remote_staging = tmp.path().join("cleaned-remote-staging");
+        adapter
+            .download_object(
+                &namespace,
+                &dataset,
+                CATALOG_FILE,
+                &cleaned_remote_staging.join(CATALOG_FILE),
+            )
+            .await?;
+        let cleaned_catalog = Catalog::from_staging(cleaned_remote_staging);
+        let cleaned_tree = cleaned_catalog.decrypt_tree(&key)?;
+        assert_eq!(cleaned_tree.name, "empty");
+        let cleaned_remote_files =
+            cleaned_catalog.remote_files_for_selection(&CatalogSelection::All, &key)?;
+        assert!(cleaned_remote_files
+            .iter()
+            .all(|file| file.path.starts_with("recovery/nodes/")));
+        assert!(!cleaned_remote_files
+            .iter()
+            .any(|file| file.path.starts_with("objects/files/")));
 
         Ok::<(), lios_core::LiosError>(())
     }

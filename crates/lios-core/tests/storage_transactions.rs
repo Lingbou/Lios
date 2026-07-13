@@ -72,7 +72,7 @@ fn remote_actions_serialize_as_modelscope_lfs_upsert_and_delete() {
 }
 
 #[test]
-fn at_most_256_actions_publish_atomically_with_catalog_last_among_uploads() {
+fn at_most_256_uploads_publish_before_cleanup_with_catalog_last() {
     let remote_inventory = vec![
         remote("catalog.enc", "old-catalog"),
         remote("objects/files/stale/manifest.enc", "stale"),
@@ -94,8 +94,7 @@ fn at_most_256_actions_publish_atomically_with_catalog_last_among_uploads() {
     .unwrap();
 
     assert!(plan.prepublish.is_empty());
-    assert!(plan.cleanup.is_empty());
-    assert_eq!(plan.publish.len(), 4);
+    assert_eq!(plan.publish.len(), 3);
     assert_eq!(
         plan.publish
             .iter()
@@ -104,18 +103,23 @@ fn at_most_256_actions_publish_atomically_with_catalog_last_among_uploads() {
         vec![
             "objects/files/new/manifest.enc",
             "recovery/nodes/root.enc",
-            "catalog.enc",
-            "objects/files/stale/manifest.enc"
+            "catalog.enc"
         ]
     );
-    assert!(plan.publish[..3].iter().all(RemoteAction::is_upload));
-    assert!(plan.publish[3].is_delete());
+    assert!(plan.publish.iter().all(RemoteAction::is_upload));
+    assert_eq!(plan.cleanup.len(), 1);
+    assert_eq!(plan.cleanup[0].len(), 1);
+    assert_eq!(
+        plan.cleanup[0][0].path(),
+        "objects/files/stale/manifest.enc"
+    );
+    assert!(plan.cleanup[0][0].is_delete());
     assert_eq!(plan.base_catalog_sha256.as_deref(), Some("old-catalog"));
 }
 
 #[test]
-fn two_hundred_fifty_seven_actions_use_bounded_phases_with_catalog_publish_before_cleanup() {
-    let mut uploads = (0..255)
+fn more_than_256_uploads_use_bounded_phases_with_catalog_publish_before_cleanup() {
+    let mut uploads = (0..256)
         .map(|index| upload(format!("objects/new/{index:03}.enc"), index + 1))
         .collect::<Vec<_>>();
     uploads.push(upload("catalog.enc", 999));
@@ -139,7 +143,7 @@ fn two_hundred_fifty_seven_actions_use_bounded_phases_with_catalog_publish_befor
     .unwrap();
 
     assert_eq!(plan.prepublish.len(), 1);
-    assert_eq!(plan.prepublish[0].len(), 255);
+    assert_eq!(plan.prepublish[0].len(), 256);
     assert!(plan.prepublish[0]
         .iter()
         .all(|action| action.is_upload() && action.path() != "catalog.enc"));

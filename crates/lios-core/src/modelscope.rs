@@ -14,8 +14,9 @@ use uuid::Uuid;
 
 use crate::storage::{
     validate_blob_oid, validate_remote_actions, BlobCheckpoint, BlobSpec, BlobValidation,
-    RemoteAction, RepoRevision, StorageAdapter, StorageObject, StorageTransactionError,
-    ValidatedBlobUpload, MODELSCOPE_COMMIT_ACTION_LIMIT, MODELSCOPE_LFS_BATCH_SIZE,
+    RemoteAction, RemoteDeleteCapability, RepoRevision, StorageAdapter, StorageObject,
+    StorageTransactionError, ValidatedBlobUpload, MODELSCOPE_COMMIT_ACTION_LIMIT,
+    MODELSCOPE_LFS_BATCH_SIZE,
 };
 use crate::{LiosError, RemoteError, RemoteErrorKind, Result};
 
@@ -23,7 +24,13 @@ const DATASET_SEGMENT: &str = "datasets";
 const DEFAULT_REVISION: &str = "master";
 const PRIVATE_VISIBILITY: &str = "1";
 const LIST_REPOS_PAGE_SIZE: u32 = 50;
+const LIST_OBJECTS_PAGE_SIZE: u32 = 200;
 const BLOB_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
+// ModelScope returns error 10020301011 for token-authenticated file deletion, while commit
+// delete actions can return a commit id without removing the file. Never report that no-op as
+// successful physical cleanup.
+const MODELSCOPE_DELETE_UNSUPPORTED_REASON: &str =
+    "ModelScope API tokens cannot physically delete repository files; remove or recreate the space in the ModelScope web console to reclaim remote storage";
 const USER_AGENT: &str = concat!(
     "lios/",
     env!("CARGO_PKG_VERSION"),
@@ -248,6 +255,14 @@ impl ModelScopeAdapter {
     }
 
     fn parse_storage_object(value: &Value) -> Option<StorageObject> {
+        if value
+            .get("Type")
+            .or_else(|| value.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("tree"))
+        {
+            return None;
+        }
         let path = value
             .get("Path")
             .or_else(|| value.get("path"))
@@ -480,6 +495,12 @@ impl StorageAdapter for ModelScopeAdapter {
         }
     }
 
+    fn remote_delete_capability(&self) -> RemoteDeleteCapability {
+        RemoteDeleteCapability::Unsupported {
+            reason: MODELSCOPE_DELETE_UNSUPPORTED_REASON,
+        }
+    }
+
     async fn head_revision(&self, namespace: &str, dataset: &str) -> Result<RepoRevision> {
         let response = self
             .auth(self.client.get(self.api_segments(&[
@@ -523,33 +544,65 @@ impl StorageAdapter for ModelScopeAdapter {
         dataset: &str,
         prefix: &str,
     ) -> Result<Vec<StorageObject>> {
-        let response = self
-            .auth(
-                self.client
-                    .get(self.api_segments(&[DATASET_SEGMENT, namespace, dataset, "repo", "tree"]))
-                    .query(&[
-                        ("Revision", self.revision.as_str()),
-                        ("Recursive", "true"),
-                        ("Root", prefix),
-                    ]),
-            )
-            .send()
-            .await
-            .map_err(Self::network_error)?;
-        let data = Self::json_data(response).await?;
-        let files = if let Some(files) = data.as_array() {
-            files.clone()
-        } else {
-            data.get("Files")
-                .or_else(|| data.get("files"))
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-        };
-        Ok(files
-            .iter()
-            .filter_map(Self::parse_storage_object)
-            .collect())
+        let mut page_number = 1u32;
+        let mut objects = Vec::new();
+        let mut seen_entries = HashSet::new();
+        let mut seen_objects = HashSet::new();
+        loop {
+            let params = [
+                ("Revision", self.revision.clone()),
+                ("Recursive", "true".to_string()),
+                ("Root", prefix.to_string()),
+                ("PageNumber", page_number.to_string()),
+                ("PageSize", LIST_OBJECTS_PAGE_SIZE.to_string()),
+            ];
+            let response = self
+                .auth(
+                    self.client
+                        .get(self.api_segments(&[
+                            DATASET_SEGMENT,
+                            namespace,
+                            dataset,
+                            "repo",
+                            "tree",
+                        ]))
+                        .query(&params),
+                )
+                .send()
+                .await
+                .map_err(Self::network_error)?;
+            let data = Self::json_data(response).await?;
+            let files = data
+                .as_array()
+                .or_else(|| {
+                    data.get("Files")
+                        .or_else(|| data.get("files"))
+                        .and_then(Value::as_array)
+                })
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let item_count = files.len();
+            let mut new_entries = 0usize;
+            for value in files {
+                let Some(path) = Self::value_string(value, &["Path", "path", "Name", "name"])
+                else {
+                    continue;
+                };
+                if seen_entries.insert(path.clone()) {
+                    new_entries += 1;
+                }
+                if let Some(object) = Self::parse_storage_object(value) {
+                    if seen_objects.insert(object.path.clone()) {
+                        objects.push(object);
+                    }
+                }
+            }
+            if item_count < LIST_OBJECTS_PAGE_SIZE as usize || new_entries == 0 {
+                break;
+            }
+            page_number += 1;
+        }
+        Ok(objects)
     }
 
     async fn validate_blobs(
@@ -785,6 +838,11 @@ impl StorageAdapter for ModelScopeAdapter {
         validate_remote_actions(actions)?;
         if actions.is_empty() {
             return Ok(());
+        }
+        if actions.iter().any(RemoteAction::is_delete) {
+            return Err(LiosError::Unsupported(
+                MODELSCOPE_DELETE_UNSUPPORTED_REASON.to_string(),
+            ));
         }
         let response = self
             .auth(self.client.post(self.api_segments(&[
