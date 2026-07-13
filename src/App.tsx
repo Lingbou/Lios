@@ -539,7 +539,9 @@ function App() {
 
   async function deleteSelected() {
     if (selectedIds.size === 0) return;
-    const ok = window.confirm(`直接删除 ${selectedIds.size} 个项目？此操作不会进入回收站。`);
+    const ok = window.confirm(
+      `从 Lios 目录中删除 ${selectedIds.size} 个项目？此操作不会进入回收站。\n\nModelScope 的令牌接口目前不支持物理删除远端文件；如需释放远端空间，请在 ModelScope 网页端删除或重建这个空间。`
+    );
     if (!ok) return;
     const nodeIds = [...selectedIds];
     await run("删除", async () => {
