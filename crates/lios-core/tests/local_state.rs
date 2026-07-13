@@ -14,7 +14,7 @@ use tempfile::tempdir;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
-struct EmittedV2KeyFile {
+struct EmittedV1KeyFile {
     version: u8,
     algorithm: String,
     kdf: String,
@@ -203,40 +203,27 @@ fn key_export_refuses_to_overwrite_existing_destination() {
 }
 
 #[test]
-fn current_v1_key_yaml_remains_loadable() {
-    let tmp = tempdir().unwrap();
-    let key_path = tmp.path().join("recovery.key");
-    std::fs::write(
-        &key_path,
-        "version: 1\nalgorithm: XChaCha20Poly1305-compatible-32-byte-key\nkey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
-    )
-    .unwrap();
-
-    KeyFile::load_from_path(&key_path).unwrap();
-}
-
-#[test]
-fn generated_and_exported_keys_switch_to_v2_with_full_v2_production_writes() {
+fn generated_and_exported_keys_use_the_only_supported_v1_schema() {
     let tmp = tempdir().unwrap();
     let generated_path = tmp.path().join("generated.key");
-    let v2_source_path = tmp.path().join("v2-source.key");
+    let v1_source_path = tmp.path().join("v1-source.key");
     let exported_path = tmp.path().join("exported.key");
 
     KeyFile::generate_to_path(&generated_path).unwrap();
     std::fs::write(
-        &v2_source_path,
-        "version: 2\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        &v1_source_path,
+        "version: 1\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
     )
     .unwrap();
-    KeyFile::load_from_path(&v2_source_path)
+    KeyFile::load_from_path(&v1_source_path)
         .unwrap()
         .save_to_path(&exported_path)
         .unwrap();
 
     for path in [&generated_path, &exported_path] {
-        let parsed: EmittedV2KeyFile =
+        let parsed: EmittedV1KeyFile =
             serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.version, 1);
         assert_eq!(parsed.kdf, "HKDF-SHA256");
         assert_eq!(parsed.algorithm, "XChaCha20-Poly1305");
         assert_eq!(
@@ -252,26 +239,26 @@ fn generated_and_exported_keys_switch_to_v2_with_full_v2_production_writes() {
 }
 
 #[test]
-fn v2_key_yaml_loads() {
+fn v1_key_yaml_loads() {
     let tmp = tempdir().unwrap();
-    let v2_path = tmp.path().join("v2.key");
+    let v1_path = tmp.path().join("v1.key");
     std::fs::write(
-        &v2_path,
-        "version: 2\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        &v1_path,
+        "version: 1\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
     )
     .unwrap();
 
-    KeyFile::load_from_path(&v2_path).unwrap();
+    KeyFile::load_from_path(&v1_path).unwrap();
 }
 
 #[test]
 fn unknown_key_versions_and_algorithms_are_rejected() {
     let tmp = tempdir().unwrap();
     let cases = [
-        "version: 9\nalgorithm: XChaCha20Poly1305-compatible-32-byte-key\nkey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
-        "version: 1\nalgorithm: unknown\nkey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
-        "version: 2\nkdf: HKDF-SHA256\nalgorithm: unknown\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
-        "version: 2\nkdf: unknown\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        "version: 9\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        "version: 1\nkdf: HKDF-SHA256\nalgorithm: unknown\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        "version: 1\nkdf: unknown\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        "version: 1\nalgorithm: XChaCha20Poly1305-compatible-32-byte-key\nkey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
     ];
 
     for (index, contents) in cases.into_iter().enumerate() {
@@ -1663,7 +1650,7 @@ fn task_store_serializes_concurrent_first_open_migrations() {
 }
 
 #[test]
-fn task_store_migrates_v2_items_with_a_nullable_relative_path() {
+fn task_store_migrates_v1_items_with_a_nullable_relative_path() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("lios.db");
     let task_id = Uuid::new_v4();

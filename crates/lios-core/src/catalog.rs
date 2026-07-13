@@ -10,12 +10,11 @@ use uuid::Uuid;
 
 use crate::atomic::{write_atomic, write_atomic_immutable, write_atomic_new, SiblingTempFile};
 use crate::crypto::KeyFile;
-use crate::format_v2::{
-    decrypt_compatible_v1_or_v2, decrypt_envelope_v2, encrypt_envelope_v2, envelope_encoded_len_v2,
-    EnvelopeKindV2,
+use crate::format_v1::{
+    decrypt_envelope_v1, encrypt_envelope_v1, envelope_encoded_len_v1, EnvelopeKindV1,
 };
-use crate::framed_v2::{
-    decode_chunk_stream_v2, encode_chunk_stream_v2, ChunkDecodeLimitsV2, ChunkIdV2,
+use crate::framed_v1::{
+    decode_chunk_stream_v1, encode_chunk_stream_v1, ChunkDecodeLimitsV1, ChunkIdV1,
 };
 use crate::pack::{PackOptions, PackProgress, PackSource};
 use crate::restore::{RestoreConflictPolicy, RestoreOptions};
@@ -30,7 +29,6 @@ const NODE_DESCRIPTORS_DIR: &str = "recovery/nodes";
 /// Recursive catalog consumers only run after validation. Capping the tree at
 /// 256 parent-child edges keeps their stack usage conservative and predictable.
 const MAX_CATALOG_DEPTH: usize = 256;
-const LEGACY_RESTORE_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PackablePathKind {
@@ -122,13 +120,6 @@ pub enum CatalogRebuildOutcome {
         report: CatalogRebuildReport,
     },
     Canceled,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LegacyContentOptimizationSummary {
-    pub object_id: String,
-    pub content_sha256: String,
-    pub original_size: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -314,34 +305,34 @@ fn map_missing_source_file(error: LiosError, path: &Path) -> LiosError {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CatalogV2 {
+pub struct CatalogV1 {
     pub version: u8,
     pub root_id: String,
-    pub nodes: BTreeMap<String, CatalogNodeV2>,
+    pub nodes: BTreeMap<String, CatalogNodeV1>,
     pub content_index: BTreeMap<String, String>,
     pub content_objects: BTreeMap<String, ContentObject>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CatalogNodeV2 {
-    pub descriptor: NodeDescriptorV2,
+pub struct CatalogNodeV1 {
+    pub descriptor: NodeDescriptorV1,
     pub descriptor_encrypted_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NodeDescriptorV2 {
+pub struct NodeDescriptorV1 {
     pub version: u8,
     pub node_id: String,
     pub parent_id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub updated_at: String,
-    pub kind: NodeDescriptorKindV2,
+    pub kind: NodeDescriptorKindV1,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
-pub enum NodeDescriptorKindV2 {
+pub enum NodeDescriptorKindV1 {
     Directory,
     File {
         object_id: String,
@@ -361,35 +352,18 @@ pub struct ContentObject {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "value")]
 pub enum StorageRef {
-    Legacy(LegacyStorageRef),
-    V2(V2StorageRef),
+    V1(V1StorageRef),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LegacyStorageRef {
-    pub manifest_path: String,
-    pub manifest_encrypted_sha256: Option<String>,
-    pub chunks: Vec<LegacyChunkRef>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LegacyChunkRef {
-    pub index: usize,
-    pub path: String,
-    pub original_size: u64,
-    pub original_sha256: String,
-    pub encrypted_sha256: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct V2StorageRef {
+pub struct V1StorageRef {
     pub manifest_path: String,
     pub manifest_encrypted_sha256: String,
-    pub chunks: Vec<V2ChunkRef>,
+    pub chunks: Vec<V1ChunkRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct V2ChunkRef {
+pub struct V1ChunkRef {
     pub index: usize,
     pub chunk_id: String,
     pub path: String,
@@ -401,67 +375,17 @@ pub struct V2ChunkRef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObjectManifestV2 {
+pub struct ObjectManifestV1 {
     pub version: u8,
     pub format_version: u8,
     pub object_id: String,
     pub content_sha256: String,
     pub original_size: u64,
-    pub chunks: Vec<V2ChunkRef>,
+    pub chunks: Vec<V1ChunkRef>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct ObjectManifestV1 {
-    version: u8,
-    object_id: String,
-    chunks: Vec<LegacyChunkRef>,
-}
-
-struct LoadedCatalogV2 {
-    catalog: CatalogV2,
-    migrated_from_v1: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CatalogV1 {
-    version: u8,
-    root: CatalogNodeV1,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CatalogNodeV1 {
-    id: String,
-    name: String,
-    #[serde(default)]
-    updated_at: String,
-    kind: CatalogNodeKindV1,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum CatalogNodeKindV1 {
-    Directory {
-        children: Vec<CatalogNodeV1>,
-    },
-    File {
-        original_size: u64,
-        sha256: String,
-        object_id: String,
-        chunks: Vec<ChunkRecordV1>,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChunkRecordV1 {
-    index: usize,
-    path: String,
-    original_size: u64,
-    original_sha256: String,
-    encrypted_sha256: String,
+struct LoadedCatalogV1 {
+    catalog: CatalogV1,
 }
 
 impl Catalog {
@@ -531,9 +455,9 @@ impl Catalog {
                 Some(expected_sha256),
                 Some(remote.size),
             )?;
-            let plaintext = decrypt_envelope_v2(key, EnvelopeKindV2::NodeDescriptor, &encrypted)?;
-            let descriptor: NodeDescriptorV2 = serde_json::from_slice(&plaintext)?;
-            let expected_size = envelope_encoded_len_v2(serde_json::to_vec(&descriptor)?.len())?;
+            let plaintext = decrypt_envelope_v1(key, EnvelopeKindV1::NodeDescriptor, &encrypted)?;
+            let descriptor: NodeDescriptorV1 = serde_json::from_slice(&plaintext)?;
+            let expected_size = envelope_encoded_len_v1(serde_json::to_vec(&descriptor)?.len())?;
             if remote.size != expected_size {
                 return Err(LiosError::DataCorruption(format!(
                     "node descriptor size mismatch: {}",
@@ -545,7 +469,7 @@ impl Catalog {
             if nodes
                 .insert(
                     path_node_id.clone(),
-                    CatalogNodeV2 {
+                    CatalogNodeV1 {
                         descriptor,
                         descriptor_encrypted_sha256: Some(descriptor_hash),
                     },
@@ -572,7 +496,7 @@ impl Catalog {
         let root_id = root_ids[0].clone();
         if !matches!(
             nodes[&root_id].descriptor.kind,
-            NodeDescriptorKindV2::Directory
+            NodeDescriptorKindV1::Directory
         ) {
             return Err(LiosError::DataCorruption(
                 "recovery root must be a directory".to_string(),
@@ -587,14 +511,14 @@ impl Catalog {
                 return Ok(CatalogRebuildOutcome::Canceled);
             }
             match &node.descriptor.kind {
-                NodeDescriptorKindV2::Directory => {
+                NodeDescriptorKindV1::Directory => {
                     directories_rebuilt = directories_rebuilt.checked_add(1).ok_or_else(|| {
                         LiosError::DataCorruption(
                             "recovered directory count overflowed".to_string(),
                         )
                     })?;
                 }
-                NodeDescriptorKindV2::File {
+                NodeDescriptorKindV1::File {
                     object_id,
                     content_sha256,
                     original_size,
@@ -641,9 +565,7 @@ impl Catalog {
             else {
                 return Ok(CatalogRebuildOutcome::Canceled);
             };
-            let StorageRef::V2(storage) = &object.storage else {
-                unreachable!("recovery only rebuilds native v2 storage references");
-            };
+            let StorageRef::V1(storage) = &object.storage;
             let object_chunks = u64::try_from(storage.chunks.len()).map_err(|_| {
                 LiosError::DataCorruption("recovered chunk count overflowed".to_string())
             })?;
@@ -662,15 +584,15 @@ impl Catalog {
             content_objects.insert(object_id, object);
         }
 
-        let mut plain = CatalogV2 {
-            version: 2,
+        let mut plain = CatalogV1 {
+            version: 1,
             root_id,
             nodes,
             content_index: BTreeMap::new(),
             content_objects,
         };
         rebuild_content_index(&mut plain);
-        validate_catalog_v2(&plain, true)?;
+        validate_catalog_v1(&plain, true)?;
         if should_cancel() {
             return Ok(CatalogRebuildOutcome::Canceled);
         }
@@ -696,7 +618,7 @@ impl Catalog {
 
         let catalog = Self::from_staging(staging_dir);
         let serialized = serde_json::to_vec(&plain)?;
-        let encrypted = encrypt_envelope_v2(key, EnvelopeKindV2::Catalog, &serialized)?;
+        let encrypted = encrypt_envelope_v1(key, EnvelopeKindV1::Catalog, &serialized)?;
         write_atomic_new(&catalog.encrypted_catalog_path, &encrypted)?;
 
         Ok(CatalogRebuildOutcome::Completed {
@@ -767,14 +689,14 @@ impl Catalog {
         fs::create_dir_all(options.staging_dir.join(FILES_DIR))?;
         let mut tracker = PackProgressTracker::new(on_progress);
         tracker.add_total(pack_stats(&source_path, options.chunk_size)?);
-        let mut plain = CatalogV2 {
-            version: 2,
+        let mut plain = CatalogV1 {
+            version: 1,
             root_id: String::new(),
             nodes: BTreeMap::new(),
             content_index: BTreeMap::new(),
             content_objects: BTreeMap::new(),
         };
-        let root_id = pack_path_v2(
+        let root_id = pack_path_v1(
             &mut plain,
             &source_path,
             name.clone(),
@@ -792,7 +714,7 @@ impl Catalog {
             encrypted_catalog_path,
             staging_dir: options.staging_dir,
         };
-        catalog.save_v2(&mut plain, key)?;
+        catalog.save_v1(&mut plain, key)?;
 
         Ok(PackOutcome::Packed { catalog, report })
     }
@@ -807,20 +729,20 @@ impl Catalog {
         let catalog = Self::from_staging(staging_dir);
         let name = normalize_name(&name.into())?;
         let root_id = random_id();
-        let descriptor = NodeDescriptorV2 {
-            version: 2,
+        let descriptor = NodeDescriptorV1 {
+            version: 1,
             node_id: root_id.clone(),
             parent_id: None,
             name,
             updated_at: timestamp(),
-            kind: NodeDescriptorKindV2::Directory,
+            kind: NodeDescriptorKindV1::Directory,
         };
-        let mut plain = CatalogV2 {
-            version: 2,
+        let mut plain = CatalogV1 {
+            version: 1,
             root_id: root_id.clone(),
             nodes: BTreeMap::from([(
                 root_id,
-                CatalogNodeV2 {
+                CatalogNodeV1 {
                     descriptor,
                     descriptor_encrypted_sha256: None,
                 },
@@ -828,7 +750,7 @@ impl Catalog {
             content_index: BTreeMap::new(),
             content_objects: BTreeMap::new(),
         };
-        catalog.save_v2(&mut plain, key)?;
+        catalog.save_v1(&mut plain, key)?;
         Ok(catalog)
     }
 
@@ -837,19 +759,19 @@ impl Catalog {
     }
 
     pub fn decrypt_tree(&self, key: &KeyFile) -> Result<CatalogTreeNode> {
-        let catalog = self.load_catalog_v2(key)?;
-        tree_node_v2(&catalog.catalog, &catalog.catalog.root_id)
+        let catalog = self.load_catalog_v1(key)?;
+        tree_node_v1(&catalog.catalog, &catalog.catalog.root_id)
     }
 
     pub fn list_children(&self, parent_id: &str, key: &KeyFile) -> Result<Vec<DriveItem>> {
-        let loaded = self.load_catalog_v2(key)?;
+        let loaded = self.load_catalog_v1(key)?;
         let parent = catalog_node(&loaded.catalog, parent_id)?;
         match parent.descriptor.kind {
-            NodeDescriptorKindV2::Directory => child_ids(&loaded.catalog, parent_id)
+            NodeDescriptorKindV1::Directory => child_ids(&loaded.catalog, parent_id)
                 .into_iter()
-                .map(|id| drive_item_v2(&loaded.catalog, id))
+                .map(|id| drive_item_v1(&loaded.catalog, id))
                 .collect(),
-            NodeDescriptorKindV2::File { .. } => Err(LiosError::Unsupported(
+            NodeDescriptorKindV1::File { .. } => Err(LiosError::Unsupported(
                 "cannot list children for a file".to_string(),
             )),
         }
@@ -860,9 +782,9 @@ impl Catalog {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let loaded = self.load_catalog_v2(key)?;
+        let loaded = self.load_catalog_v1(key)?;
         let mut matches = Vec::new();
-        collect_search_matches_v2(
+        collect_search_matches_v1(
             &loaded.catalog,
             &loaded.catalog.root_id,
             &query,
@@ -873,8 +795,8 @@ impl Catalog {
 
     pub fn create_folder(&self, parent_id: &str, name: &str, key: &KeyFile) -> Result<()> {
         let name = normalize_name(name)?;
-        let mut loaded = self.load_catalog_v2(key)?;
-        ensure_directory_v2(&loaded.catalog, parent_id)?;
+        let mut loaded = self.load_catalog_v1(key)?;
+        ensure_directory_v1(&loaded.catalog, parent_id)?;
         if child_ids(&loaded.catalog, parent_id)
             .into_iter()
             .any(|id| windows_names_equal(&loaded.catalog.nodes[id].descriptor.name, &name))
@@ -886,26 +808,26 @@ impl Catalog {
         let node_id = random_id();
         loaded.catalog.nodes.insert(
             node_id.clone(),
-            CatalogNodeV2 {
-                descriptor: NodeDescriptorV2 {
-                    version: 2,
+            CatalogNodeV1 {
+                descriptor: NodeDescriptorV1 {
+                    version: 1,
                     node_id,
                     parent_id: Some(parent_id.to_string()),
                     name,
                     updated_at: timestamp(),
-                    kind: NodeDescriptorKindV2::Directory,
+                    kind: NodeDescriptorKindV1::Directory,
                 },
                 descriptor_encrypted_sha256: None,
             },
         );
         mark_node_updated(&mut loaded.catalog, parent_id)?;
-        prepare_catalog_for_v2_write(&mut loaded)?;
-        self.save_v2(&mut loaded.catalog, key)
+        prepare_catalog_for_v1_write(&mut loaded)?;
+        self.save_v1(&mut loaded.catalog, key)
     }
 
     pub fn rename_node(&self, node_id: &str, new_name: &str, key: &KeyFile) -> Result<()> {
         let new_name = normalize_name(new_name)?;
-        let mut loaded = self.load_catalog_v2(key)?;
+        let mut loaded = self.load_catalog_v1(key)?;
         let parent_id = catalog_node(&loaded.catalog, node_id)?
             .descriptor
             .parent_id
@@ -930,12 +852,12 @@ impl Catalog {
         node.descriptor.name = new_name;
         node.descriptor.updated_at = timestamp();
         node.descriptor_encrypted_sha256 = None;
-        prepare_catalog_for_v2_write(&mut loaded)?;
-        self.save_v2(&mut loaded.catalog, key)
+        prepare_catalog_for_v1_write(&mut loaded)?;
+        self.save_v1(&mut loaded.catalog, key)
     }
 
     pub fn delete_nodes(&self, node_ids: &[String], key: &KeyFile) -> Result<()> {
-        let mut loaded = self.load_catalog_v2(key)?;
+        let mut loaded = self.load_catalog_v1(key)?;
         let ids = node_ids
             .iter()
             .filter(|id| id.as_str() != loaded.catalog.root_id)
@@ -947,8 +869,8 @@ impl Catalog {
         }
         loaded.catalog.nodes.retain(|id, _| !remove.contains(id));
         prune_unreferenced_content(&mut loaded.catalog);
-        prepare_catalog_for_v2_write(&mut loaded)?;
-        self.save_v2(&mut loaded.catalog, key)
+        prepare_catalog_for_v1_write(&mut loaded)?;
+        self.save_v1(&mut loaded.catalog, key)
     }
 
     pub fn preview_upload_conflicts(
@@ -957,8 +879,8 @@ impl Catalog {
         paths: &[PathBuf],
         key: &KeyFile,
     ) -> Result<Vec<UploadConflict>> {
-        let loaded = self.load_catalog_v2(key)?;
-        ensure_directory_v2(&loaded.catalog, parent_id)?;
+        let loaded = self.load_catalog_v1(key)?;
+        ensure_directory_v1(&loaded.catalog, parent_id)?;
         let mut conflicts = Vec::new();
         for path in paths {
             let target_name = file_name(path)?;
@@ -1123,8 +1045,8 @@ impl Catalog {
             ));
         }
         fs::create_dir_all(options.staging_dir.join(FILES_DIR))?;
-        let mut loaded = self.load_catalog_v2(key)?;
-        ensure_directory_v2(&loaded.catalog, parent_id)?;
+        let mut loaded = self.load_catalog_v1(key)?;
+        ensure_directory_v1(&loaded.catalog, parent_id)?;
         let mut tracker = PackProgressTracker::new(on_progress);
         let mut report = PackReport::default();
         let resolution_by_source = resolutions
@@ -1220,7 +1142,7 @@ impl Catalog {
                 None => {}
             }
 
-            pack_path_v2(
+            pack_path_v1(
                 &mut loaded.catalog,
                 path,
                 target_name,
@@ -1235,8 +1157,8 @@ impl Catalog {
             mark_node_updated(&mut loaded.catalog, parent_id)?;
         }
         prune_unreferenced_content(&mut loaded.catalog);
-        prepare_catalog_for_v2_write(&mut loaded)?;
-        self.save_v2(&mut loaded.catalog, key)?;
+        prepare_catalog_for_v1_write(&mut loaded)?;
+        self.save_v1(&mut loaded.catalog, key)?;
         Ok(report)
     }
 
@@ -1245,7 +1167,7 @@ impl Catalog {
         selection: &CatalogSelection,
         key: &KeyFile,
     ) -> Result<Vec<CatalogRemoteFile>> {
-        let loaded = self.load_catalog_v2(key)?;
+        let loaded = self.load_catalog_v1(key)?;
         let selected_ids = match selection {
             CatalogSelection::All => vec![loaded.catalog.root_id.clone()],
             CatalogSelection::Node(id) => {
@@ -1266,17 +1188,13 @@ impl Catalog {
             collect_descendant_ids(&loaded.catalog, &id, &mut node_ids);
         }
         for (id, node) in &loaded.catalog.nodes {
-            let sha256 = match &node.descriptor_encrypted_sha256 {
-                Some(sha256) => sha256,
-                None if loaded.migrated_from_v1 => continue,
-                None => {
-                    return Err(LiosError::DataCorruption(format!(
-                        "native v2 node descriptor hash is missing: {id}"
-                    )))
-                }
-            };
+            let sha256 = node.descriptor_encrypted_sha256.as_ref().ok_or_else(|| {
+                LiosError::DataCorruption(format!(
+                    "native v1 node descriptor hash is missing: {id}"
+                ))
+            })?;
             let expected_size =
-                envelope_encoded_len_v2(serde_json::to_vec(&node.descriptor)?.len())?;
+                envelope_encoded_len_v1(serde_json::to_vec(&node.descriptor)?.len())?;
             files.push(CatalogRemoteFile {
                 path: format!("{NODE_DESCRIPTORS_DIR}/{id}.enc"),
                 expected_size: Some(expected_size),
@@ -1285,7 +1203,7 @@ impl Catalog {
         }
         for id in &node_ids {
             let node = catalog_node(&loaded.catalog, id)?;
-            if let NodeDescriptorKindV2::File { object_id, .. } = &node.descriptor.kind {
+            if let NodeDescriptorKindV1::File { object_id, .. } = &node.descriptor.kind {
                 object_ids.insert(object_id.clone());
             }
         }
@@ -1297,7 +1215,7 @@ impl Catalog {
                 .ok_or_else(|| {
                     LiosError::DataCorruption(format!("missing content object: {object_id}"))
                 })?;
-            collect_content_remote_files(object, key, &mut files)?;
+            collect_content_remote_files(object, &mut files)?;
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         files.dedup_by(|a, b| a.path == b.path);
@@ -1431,21 +1349,17 @@ impl Catalog {
         key: &KeyFile,
         mut should_cancel: impl FnMut() -> bool,
     ) -> Result<CatalogIntegrityOutcome> {
-        let loaded = self.load_catalog_v2(key)?;
+        let loaded = self.load_catalog_v1(key)?;
         let mut report = CatalogIntegrityReport::default();
         for (node_id, node) in &loaded.catalog.nodes {
             if should_cancel() {
                 return Ok(CatalogIntegrityOutcome::Canceled(report));
             }
-            let expected_sha256 = match &node.descriptor_encrypted_sha256 {
-                Some(expected_sha256) => expected_sha256,
-                None if loaded.migrated_from_v1 => continue,
-                None => {
-                    return Err(LiosError::DataCorruption(format!(
-                        "native v2 node descriptor hash is missing: {node_id}"
-                    )))
-                }
-            };
+            let expected_sha256 = node.descriptor_encrypted_sha256.as_ref().ok_or_else(|| {
+                LiosError::DataCorruption(format!(
+                    "native v1 node descriptor hash is missing: {node_id}"
+                ))
+            })?;
             let relative_path = format!("{NODE_DESCRIPTORS_DIR}/{node_id}.enc");
             let encrypted = read_verified_encrypted_file(
                 &self.staging_dir,
@@ -1453,9 +1367,8 @@ impl Catalog {
                 Some(expected_sha256),
                 None,
             )?;
-            let plaintext =
-                decrypt_compatible_v1_or_v2(key, EnvelopeKindV2::NodeDescriptor, &encrypted)?;
-            let descriptor: NodeDescriptorV2 = serde_json::from_slice(&plaintext)?;
+            let plaintext = decrypt_envelope_v1(key, EnvelopeKindV1::NodeDescriptor, &encrypted)?;
+            let descriptor: NodeDescriptorV1 = serde_json::from_slice(&plaintext)?;
             if descriptor != node.descriptor {
                 return Err(LiosError::DataCorruption(format!(
                     "node descriptor mismatch: {node_id}"
@@ -1492,35 +1405,17 @@ impl Catalog {
         Ok(CatalogIntegrityOutcome::Completed(report))
     }
 
-    pub fn legacy_content_objects_needing_optimization(
-        &self,
-        key: &KeyFile,
-    ) -> Result<Vec<LegacyContentOptimizationSummary>> {
-        let loaded = self.load_catalog_v2(key)?;
-        Ok(loaded
-            .catalog
-            .content_objects
-            .values()
-            .filter(|object| matches!(object.storage, StorageRef::Legacy(_)))
-            .map(|object| LegacyContentOptimizationSummary {
-                object_id: object.object_id.clone(),
-                content_sha256: object.content_sha256.clone(),
-                original_size: object.original_size,
-            })
-            .collect())
-    }
-
     pub fn restore(
         &self,
         selection: CatalogSelection,
         key: &KeyFile,
         options: RestoreOptions,
     ) -> Result<()> {
-        let loaded = self.load_catalog_v2(key)?;
+        let loaded = self.load_catalog_v1(key)?;
         fs::create_dir_all(&options.output_dir)?;
         match selection {
             CatalogSelection::All => {
-                restore_node_v2(
+                restore_node_v1(
                     &loaded.catalog,
                     &loaded.catalog.root_id,
                     &options.output_dir,
@@ -1530,7 +1425,7 @@ impl Catalog {
                 )?;
             }
             CatalogSelection::Node(id) => {
-                restore_node_v2(
+                restore_node_v1(
                     &loaded.catalog,
                     &id,
                     &options.output_dir,
@@ -1541,7 +1436,7 @@ impl Catalog {
             }
             CatalogSelection::Nodes(ids) => {
                 for id in ids {
-                    restore_node_v2(
+                    restore_node_v1(
                         &loaded.catalog,
                         &id,
                         &options.output_dir,
@@ -1555,45 +1450,23 @@ impl Catalog {
         Ok(())
     }
 
-    fn load_catalog_v2(&self, key: &KeyFile) -> Result<LoadedCatalogV2> {
+    fn load_catalog_v1(&self, key: &KeyFile) -> Result<LoadedCatalogV1> {
         let encrypted = read_verified_encrypted_file(&self.staging_dir, CATALOG_FILE, None, None)?;
-        let decrypted = decrypt_compatible_v1_or_v2(key, EnvelopeKindV2::Catalog, &encrypted)?;
-        let value: serde_json::Value = serde_json::from_slice(&decrypted)?;
-        let version = value
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| LiosError::Unsupported("catalog version is missing".to_string()))?;
-        match version {
-            1 => {
-                let catalog: CatalogV1 = serde_json::from_value(value)?;
-                Ok(LoadedCatalogV2 {
-                    catalog: normalize_v1_catalog(catalog)?,
-                    migrated_from_v1: true,
-                })
-            }
-            2 => {
-                let catalog: CatalogV2 = serde_json::from_value(value)?;
-                validate_catalog_v2(&catalog, true)?;
-                Ok(LoadedCatalogV2 {
-                    catalog,
-                    migrated_from_v1: false,
-                })
-            }
-            _ => Err(LiosError::Unsupported(format!(
-                "unknown catalog version: {version}"
-            ))),
-        }
+        let decrypted = decrypt_envelope_v1(key, EnvelopeKindV1::Catalog, &encrypted)?;
+        let catalog: CatalogV1 = serde_json::from_slice(&decrypted)?;
+        validate_catalog_v1(&catalog, true)?;
+        Ok(LoadedCatalogV1 { catalog })
     }
 
-    fn save_v2(&self, catalog: &mut CatalogV2, key: &KeyFile) -> Result<()> {
-        validate_catalog_v2(catalog, true)?;
+    fn save_v1(&self, catalog: &mut CatalogV1, key: &KeyFile) -> Result<()> {
+        validate_catalog_v1(catalog, true)?;
         fs::create_dir_all(self.staging_dir.join(NODE_DESCRIPTORS_DIR))?;
         for node in catalog.nodes.values_mut() {
             if node.descriptor_encrypted_sha256.is_some() {
                 continue;
             }
             let plaintext = serde_json::to_vec(&node.descriptor)?;
-            let encrypted = encrypt_envelope_v2(key, EnvelopeKindV2::NodeDescriptor, &plaintext)?;
+            let encrypted = encrypt_envelope_v1(key, EnvelopeKindV1::NodeDescriptor, &plaintext)?;
             let path = self
                 .staging_dir
                 .join(NODE_DESCRIPTORS_DIR)
@@ -1602,7 +1475,7 @@ impl Catalog {
             node.descriptor_encrypted_sha256 = Some(sha256_hex(&encrypted));
         }
         let serialized = serde_json::to_vec(catalog)?;
-        let encrypted = encrypt_envelope_v2(key, EnvelopeKindV2::Catalog, &serialized)?;
+        let encrypted = encrypt_envelope_v1(key, EnvelopeKindV1::Catalog, &serialized)?;
         write_atomic(&self.encrypted_catalog_path, &encrypted)?;
         Ok(())
     }
@@ -1644,7 +1517,7 @@ fn recovery_node_id_from_path(path: &str) -> Result<Option<&str>> {
             "invalid recovery node descriptor path: {path}"
         )));
     }
-    validate_opaque_id_v2(node_id, "node")?;
+    validate_opaque_id_v1(node_id, "node")?;
     Ok(Some(node_id))
 }
 
@@ -1656,35 +1529,35 @@ fn required_remote_sha256<'a>(object: &'a StorageObject, kind: &str) -> Result<&
     Ok(sha256)
 }
 
-fn validate_recovered_descriptor(descriptor: &NodeDescriptorV2, path_node_id: &str) -> Result<()> {
-    if descriptor.version != 2 {
+fn validate_recovered_descriptor(descriptor: &NodeDescriptorV1, path_node_id: &str) -> Result<()> {
+    if descriptor.version != 1 {
         return Err(LiosError::Unsupported(format!(
             "unknown node descriptor version: {}",
             descriptor.version
         )));
     }
-    validate_opaque_id_v2(&descriptor.node_id, "node")?;
+    validate_opaque_id_v1(&descriptor.node_id, "node")?;
     if descriptor.node_id != path_node_id {
         return Err(LiosError::DataCorruption(format!(
             "node descriptor path/id mismatch: {path_node_id}"
         )));
     }
     if let Some(parent_id) = &descriptor.parent_id {
-        validate_opaque_id_v2(parent_id, "node")?;
+        validate_opaque_id_v1(parent_id, "node")?;
     }
     if !is_portable_logical_name(&descriptor.name) {
         return Err(LiosError::DataCorruption(format!(
-            "invalid native v2 item name: {}",
+            "invalid native v1 item name: {}",
             descriptor.name
         )));
     }
-    if let NodeDescriptorKindV2::File {
+    if let NodeDescriptorKindV1::File {
         object_id,
         content_sha256,
         ..
     } = &descriptor.kind
     {
-        validate_opaque_id_v2(object_id, "object")?;
+        validate_opaque_id_v1(object_id, "object")?;
         validate_lower_hex_id(content_sha256, 64, "content SHA-256")?;
     }
     Ok(())
@@ -1712,7 +1585,7 @@ fn rebuild_content_object_from_manifest(
     if should_cancel() {
         return Ok(None);
     }
-    validate_opaque_id_v2(object_id, "object")?;
+    validate_opaque_id_v1(object_id, "object")?;
     validate_lower_hex_id(content_sha256, 64, "content SHA-256")?;
     let manifest_path = format!("{FILES_DIR}/{object_id}/{FILE_MANIFEST}");
     let remote_manifest = remote_by_path
@@ -1731,10 +1604,10 @@ fn rebuild_content_object_from_manifest(
         Some(remote_manifest.size),
     )?;
     let manifest_plaintext =
-        decrypt_envelope_v2(key, EnvelopeKindV2::Manifest, &encrypted_manifest)?;
-    let manifest: ObjectManifestV2 = serde_json::from_slice(&manifest_plaintext)?;
+        decrypt_envelope_v1(key, EnvelopeKindV1::Manifest, &encrypted_manifest)?;
+    let manifest: ObjectManifestV1 = serde_json::from_slice(&manifest_plaintext)?;
     let manifest_sha256 = sha256_hex(&encrypted_manifest);
-    let storage = V2StorageRef {
+    let storage = V1StorageRef {
         manifest_path: manifest_path.clone(),
         manifest_encrypted_sha256: manifest_sha256,
         chunks: manifest.chunks.clone(),
@@ -1743,17 +1616,17 @@ fn rebuild_content_object_from_manifest(
         object_id: object_id.to_string(),
         content_sha256: content_sha256.to_string(),
         original_size,
-        storage: StorageRef::V2(storage.clone()),
+        storage: StorageRef::V1(storage.clone()),
     };
-    let expected_manifest = expected_v2_manifest(&object, &storage);
+    let expected_manifest = expected_v1_manifest(&object, &storage);
     let expected_manifest_size =
-        envelope_encoded_len_v2(serde_json::to_vec(&expected_manifest)?.len())?;
+        envelope_encoded_len_v1(serde_json::to_vec(&expected_manifest)?.len())?;
     if remote_manifest.size != expected_manifest_size {
         return Err(LiosError::DataCorruption(format!(
             "content manifest size mismatch: {object_id}"
         )));
     }
-    validate_v2_manifest_bytes(
+    validate_v1_manifest_bytes(
         &object,
         &storage,
         key,
@@ -1813,133 +1686,15 @@ fn rebuild_content_object_from_manifest(
     Ok(Some(object))
 }
 
-fn normalize_v1_catalog(catalog: CatalogV1) -> Result<CatalogV2> {
+fn validate_catalog_v1(catalog: &CatalogV1, require_canonical_node_ids: bool) -> Result<()> {
     if catalog.version != 1 {
         return Err(LiosError::Unsupported(format!(
             "unknown catalog version: {}",
             catalog.version
         )));
     }
-    let root_id = catalog.root.id.clone();
-    let mut normalized = CatalogV2 {
-        version: 2,
-        root_id,
-        nodes: BTreeMap::new(),
-        content_index: BTreeMap::new(),
-        content_objects: BTreeMap::new(),
-    };
-    normalize_v1_node(catalog.root, None, &mut normalized)?;
-    rebuild_content_index(&mut normalized);
-    validate_catalog_v2(&normalized, false)?;
-    Ok(normalized)
-}
-
-fn normalize_v1_node(
-    node: CatalogNodeV1,
-    parent_id: Option<String>,
-    catalog: &mut CatalogV2,
-) -> Result<()> {
-    let mut pending = vec![(node, parent_id, 0usize)];
-    while let Some((node, parent_id, depth)) = pending.pop() {
-        let CatalogNodeV1 {
-            id,
-            name,
-            updated_at,
-            kind,
-        } = node;
-        let descriptor_kind = match kind {
-            CatalogNodeKindV1::Directory { children } => {
-                if !children.is_empty() && depth >= MAX_CATALOG_DEPTH {
-                    return Err(catalog_depth_error());
-                }
-                let child_depth = depth.checked_add(1).ok_or_else(catalog_depth_error)?;
-                for child in children.into_iter().rev() {
-                    pending.push((child, Some(id.clone()), child_depth));
-                }
-                NodeDescriptorKindV2::Directory
-            }
-            CatalogNodeKindV1::File {
-                original_size,
-                sha256,
-                object_id,
-                chunks,
-            } => {
-                let storage = LegacyStorageRef {
-                    manifest_path: format!("{FILES_DIR}/{object_id}/{FILE_MANIFEST}"),
-                    manifest_encrypted_sha256: None,
-                    chunks: chunks
-                        .into_iter()
-                        .map(|chunk| LegacyChunkRef {
-                            index: chunk.index,
-                            path: chunk.path,
-                            original_size: chunk.original_size,
-                            original_sha256: chunk.original_sha256,
-                            encrypted_sha256: chunk.encrypted_sha256,
-                        })
-                        .collect(),
-                };
-                let content = ContentObject {
-                    object_id: object_id.clone(),
-                    content_sha256: sha256.clone(),
-                    original_size,
-                    storage: StorageRef::Legacy(storage),
-                };
-                if let Some(existing) = catalog.content_objects.get(&object_id) {
-                    if existing != &content {
-                        return Err(LiosError::DataCorruption(format!(
-                            "conflicting legacy content object: {object_id}"
-                        )));
-                    }
-                } else {
-                    catalog.content_objects.insert(object_id.clone(), content);
-                }
-                catalog
-                    .content_index
-                    .entry(sha256.clone())
-                    .or_insert_with(|| object_id.clone());
-                NodeDescriptorKindV2::File {
-                    object_id,
-                    content_sha256: sha256,
-                    original_size,
-                }
-            }
-        };
-        let descriptor = NodeDescriptorV2 {
-            version: 2,
-            node_id: id.clone(),
-            parent_id,
-            name,
-            updated_at,
-            kind: descriptor_kind,
-        };
-        if catalog
-            .nodes
-            .insert(
-                id.clone(),
-                CatalogNodeV2 {
-                    descriptor,
-                    descriptor_encrypted_sha256: None,
-                },
-            )
-            .is_some()
-        {
-            return Err(LiosError::DataCorruption(format!(
-                "duplicate catalog node id: {id}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_catalog_v2(catalog: &CatalogV2, require_canonical_node_ids: bool) -> Result<()> {
-    if catalog.version != 2 {
-        return Err(LiosError::Unsupported(format!(
-            "unknown catalog version: {}",
-            catalog.version
-        )));
-    }
     if require_canonical_node_ids {
-        validate_opaque_id_v2(&catalog.root_id, "node")?;
+        validate_opaque_id_v1(&catalog.root_id, "node")?;
     }
     let root = catalog
         .nodes
@@ -1954,9 +1709,9 @@ fn validate_catalog_v2(catalog: &CatalogV2, require_canonical_node_ids: bool) ->
     let mut sibling_names = HashMap::<&str, HashSet<String>>::new();
     for (id, node) in &catalog.nodes {
         if require_canonical_node_ids {
-            validate_opaque_id_v2(id, "node")?;
+            validate_opaque_id_v1(id, "node")?;
         }
-        if node.descriptor.version != 2 || node.descriptor.node_id != *id {
+        if node.descriptor.version != 1 || node.descriptor.node_id != *id {
             return Err(LiosError::DataCorruption(format!(
                 "invalid catalog node descriptor: {id}"
             )));
@@ -1968,7 +1723,7 @@ fn validate_catalog_v2(catalog: &CatalogV2, require_canonical_node_ids: bool) ->
             let parent = catalog.nodes.get(parent_id).ok_or_else(|| {
                 LiosError::DataCorruption(format!("missing catalog parent: {parent_id}"))
             })?;
-            if !matches!(parent.descriptor.kind, NodeDescriptorKindV2::Directory) {
+            if !matches!(parent.descriptor.kind, NodeDescriptorKindV1::Directory) {
                 return Err(LiosError::DataCorruption(format!(
                     "catalog parent is not a directory: {parent_id}"
                 )));
@@ -1985,7 +1740,7 @@ fn validate_catalog_v2(catalog: &CatalogV2, require_canonical_node_ids: bool) ->
                 .or_default()
                 .push(id.as_str());
         }
-        if let NodeDescriptorKindV2::File {
+        if let NodeDescriptorKindV1::File {
             object_id,
             content_sha256,
             original_size,
@@ -2062,68 +1817,47 @@ fn catalog_depth_error() -> LiosError {
 }
 
 fn validate_storage_ref(object: &ContentObject, remote_paths: &mut HashSet<String>) -> Result<()> {
-    match &object.storage {
-        StorageRef::Legacy(storage) => {
-            validate_legacy_object_path(&storage.manifest_path)?;
-            if !remote_paths.insert(windows_name_key(&storage.manifest_path)) {
-                return Err(LiosError::DataCorruption(format!(
-                    "duplicate legacy object path: {}",
-                    storage.manifest_path
-                )));
-            }
-            for chunk in &storage.chunks {
-                validate_legacy_object_path(&chunk.path)?;
-                if !remote_paths.insert(windows_name_key(&chunk.path)) {
-                    return Err(LiosError::DataCorruption(format!(
-                        "duplicate legacy object path: {}",
-                        chunk.path
-                    )));
-                }
-            }
+    let StorageRef::V1(storage) = &object.storage;
+    validate_opaque_id_v1(&object.object_id, "object")?;
+    let expected_manifest = format!("{FILES_DIR}/{}/{}", object.object_id, FILE_MANIFEST);
+    if storage.manifest_path != expected_manifest {
+        return Err(LiosError::DataCorruption(format!(
+            "invalid v1 manifest path: {}",
+            storage.manifest_path
+        )));
+    }
+    validate_remote_object_path(&storage.manifest_path)?;
+    if !remote_paths.insert(windows_name_key(&storage.manifest_path)) {
+        return Err(LiosError::DataCorruption(format!(
+            "duplicate v1 object path: {}",
+            storage.manifest_path
+        )));
+    }
+    for (index, chunk) in storage.chunks.iter().enumerate() {
+        validate_remote_object_path(&chunk.path)?;
+        if !remote_paths.insert(windows_name_key(&chunk.path)) {
+            return Err(LiosError::DataCorruption(format!(
+                "duplicate v1 object path: {}",
+                chunk.path
+            )));
         }
-        StorageRef::V2(storage) => {
-            validate_opaque_id_v2(&object.object_id, "object")?;
-            let expected_manifest = format!("{FILES_DIR}/{}/{}", object.object_id, FILE_MANIFEST);
-            if storage.manifest_path != expected_manifest {
-                return Err(LiosError::DataCorruption(format!(
-                    "invalid v2 manifest path: {}",
-                    storage.manifest_path
-                )));
-            }
-            validate_remote_object_path(&storage.manifest_path)?;
-            if !remote_paths.insert(windows_name_key(&storage.manifest_path)) {
-                return Err(LiosError::DataCorruption(format!(
-                    "duplicate v2 object path: {}",
-                    storage.manifest_path
-                )));
-            }
-            for (index, chunk) in storage.chunks.iter().enumerate() {
-                validate_remote_object_path(&chunk.path)?;
-                if !remote_paths.insert(windows_name_key(&chunk.path)) {
-                    return Err(LiosError::DataCorruption(format!(
-                        "duplicate v2 object path: {}",
-                        chunk.path
-                    )));
-                }
-                if chunk.index != index || chunk.format_version != 2 {
-                    return Err(LiosError::DataCorruption(format!(
-                        "invalid v2 chunk reference: {}",
-                        chunk.path
-                    )));
-                }
-                validate_lower_hex_id(&chunk.chunk_id, 64, "chunk")?;
-                parse_chunk_id_v2(&chunk.chunk_id)?;
-                let expected_path = format!(
-                    "{FILES_DIR}/{}/{FILE_CHUNKS_DIR}/{}.lios",
-                    object.object_id, chunk.chunk_id
-                );
-                if chunk.path != expected_path {
-                    return Err(LiosError::DataCorruption(format!(
-                        "invalid v2 chunk path: {}",
-                        chunk.path
-                    )));
-                }
-            }
+        if chunk.index != index || chunk.format_version != 1 {
+            return Err(LiosError::DataCorruption(format!(
+                "invalid v1 chunk reference: {}",
+                chunk.path
+            )));
+        }
+        validate_lower_hex_id(&chunk.chunk_id, 64, "chunk")?;
+        parse_chunk_id_v1(&chunk.chunk_id)?;
+        let expected_path = format!(
+            "{FILES_DIR}/{}/{FILE_CHUNKS_DIR}/{}.lios",
+            object.object_id, chunk.chunk_id
+        );
+        if chunk.path != expected_path {
+            return Err(LiosError::DataCorruption(format!(
+                "invalid v1 chunk path: {}",
+                chunk.path
+            )));
         }
     }
     Ok(())
@@ -2143,22 +1877,7 @@ fn validate_remote_object_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_legacy_object_path(path: &str) -> Result<()> {
-    validate_remote_object_path(path)?;
-    let mut components = Path::new(path).components();
-    let inside_objects = matches!(
-        components.next(),
-        Some(std::path::Component::Normal(component)) if component == "objects"
-    ) && components.next().is_some();
-    if !inside_objects {
-        return Err(LiosError::DataCorruption(format!(
-            "legacy path is outside the managed objects prefix: {path}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_opaque_id_v2(value: &str, kind: &'static str) -> Result<()> {
+fn validate_opaque_id_v1(value: &str, kind: &'static str) -> Result<()> {
     validate_lower_hex_id(value, 32, kind)
 }
 
@@ -2169,62 +1888,35 @@ fn validate_lower_hex_id(value: &str, expected_len: usize, kind: &'static str) -
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(LiosError::DataCorruption(format!(
-            "invalid v2 {kind} id: {value}"
+            "invalid v1 {kind} id: {value}"
         )));
     }
     Ok(())
 }
 
-fn prepare_catalog_for_v2_write(loaded: &mut LoadedCatalogV2) -> Result<()> {
-    loaded.catalog.version = 2;
+fn prepare_catalog_for_v1_write(loaded: &mut LoadedCatalogV1) -> Result<()> {
+    loaded.catalog.version = 1;
     rebuild_content_index(&mut loaded.catalog);
-    if !loaded.migrated_from_v1 {
-        validate_catalog_v2(&loaded.catalog, true)?;
-        return Ok(());
-    }
-
-    let id_map = loaded
-        .catalog
-        .nodes
-        .keys()
-        .map(|id| (id.clone(), random_id()))
-        .collect::<BTreeMap<_, _>>();
-    let old_root_id = loaded.catalog.root_id.clone();
-    let mut remapped = BTreeMap::new();
-    for (old_id, mut node) in std::mem::take(&mut loaded.catalog.nodes) {
-        let new_id = id_map[&old_id].clone();
-        node.descriptor.node_id = new_id.clone();
-        node.descriptor.parent_id = node
-            .descriptor
-            .parent_id
-            .as_ref()
-            .map(|parent_id| id_map[parent_id].clone());
-        node.descriptor_encrypted_sha256 = None;
-        remapped.insert(new_id, node);
-    }
-    loaded.catalog.root_id = id_map[&old_root_id].clone();
-    loaded.catalog.nodes = remapped;
-    loaded.migrated_from_v1 = false;
-    validate_catalog_v2(&loaded.catalog, true)
+    validate_catalog_v1(&loaded.catalog, true)
 }
 
-fn catalog_node<'a>(catalog: &'a CatalogV2, id: &str) -> Result<&'a CatalogNodeV2> {
+fn catalog_node<'a>(catalog: &'a CatalogV1, id: &str) -> Result<&'a CatalogNodeV1> {
     catalog
         .nodes
         .get(id)
         .ok_or_else(|| LiosError::Unsupported(format!("catalog node not found: {id}")))
 }
 
-fn ensure_directory_v2(catalog: &CatalogV2, id: &str) -> Result<()> {
+fn ensure_directory_v1(catalog: &CatalogV1, id: &str) -> Result<()> {
     match catalog_node(catalog, id)?.descriptor.kind {
-        NodeDescriptorKindV2::Directory => Ok(()),
-        NodeDescriptorKindV2::File { .. } => Err(LiosError::Unsupported(
+        NodeDescriptorKindV1::Directory => Ok(()),
+        NodeDescriptorKindV1::File { .. } => Err(LiosError::Unsupported(
             "catalog node is not a directory".to_string(),
         )),
     }
 }
 
-fn child_ids<'a>(catalog: &'a CatalogV2, parent_id: &str) -> Vec<&'a String> {
+fn child_ids<'a>(catalog: &'a CatalogV1, parent_id: &str) -> Vec<&'a String> {
     let mut children = catalog
         .nodes
         .iter()
@@ -2234,8 +1926,8 @@ fn child_ids<'a>(catalog: &'a CatalogV2, parent_id: &str) -> Vec<&'a String> {
     children.sort_by(|left, right| {
         let left = &catalog.nodes[*left].descriptor;
         let right = &catalog.nodes[*right].descriptor;
-        let left_dir = matches!(left.kind, NodeDescriptorKindV2::Directory);
-        let right_dir = matches!(right.kind, NodeDescriptorKindV2::Directory);
+        let left_dir = matches!(left.kind, NodeDescriptorKindV1::Directory);
+        let right_dir = matches!(right.kind, NodeDescriptorKindV1::Directory);
         right_dir
             .cmp(&left_dir)
             .then_with(|| sort_name_key(&left.name).cmp(&sort_name_key(&right.name)))
@@ -2243,16 +1935,16 @@ fn child_ids<'a>(catalog: &'a CatalogV2, parent_id: &str) -> Vec<&'a String> {
     children
 }
 
-fn tree_node_v2(catalog: &CatalogV2, node_id: &str) -> Result<CatalogTreeNode> {
+fn tree_node_v1(catalog: &CatalogV1, node_id: &str) -> Result<CatalogTreeNode> {
     let node = catalog_node(catalog, node_id)?;
     let kind = match &node.descriptor.kind {
-        NodeDescriptorKindV2::Directory => CatalogTreeNodeKind::Directory {
+        NodeDescriptorKindV1::Directory => CatalogTreeNodeKind::Directory {
             children: child_ids(catalog, node_id)
                 .into_iter()
-                .map(|child_id| tree_node_v2(catalog, child_id))
+                .map(|child_id| tree_node_v1(catalog, child_id))
                 .collect::<Result<Vec<_>>>()?,
         },
-        NodeDescriptorKindV2::File {
+        NodeDescriptorKindV1::File {
             original_size,
             content_sha256,
             object_id,
@@ -2276,10 +1968,10 @@ fn tree_node_v2(catalog: &CatalogV2, node_id: &str) -> Result<CatalogTreeNode> {
     })
 }
 
-fn drive_item_v2(catalog: &CatalogV2, node_id: &str) -> Result<DriveItem> {
+fn drive_item_v1(catalog: &CatalogV1, node_id: &str) -> Result<DriveItem> {
     let node = catalog_node(catalog, node_id)?;
     match &node.descriptor.kind {
-        NodeDescriptorKindV2::Directory => Ok(DriveItem {
+        NodeDescriptorKindV1::Directory => Ok(DriveItem {
             id: node_id.to_string(),
             name: node.descriptor.name.clone(),
             kind: DriveItemKind::Directory,
@@ -2287,7 +1979,7 @@ fn drive_item_v2(catalog: &CatalogV2, node_id: &str) -> Result<DriveItem> {
             updated_at: node.descriptor.updated_at.clone(),
             children_count: child_ids(catalog, node_id).len(),
         }),
-        NodeDescriptorKindV2::File { original_size, .. } => Ok(DriveItem {
+        NodeDescriptorKindV1::File { original_size, .. } => Ok(DriveItem {
             id: node_id.to_string(),
             name: node.descriptor.name.clone(),
             kind: DriveItemKind::File,
@@ -2298,23 +1990,23 @@ fn drive_item_v2(catalog: &CatalogV2, node_id: &str) -> Result<DriveItem> {
     }
 }
 
-fn collect_search_matches_v2(
-    catalog: &CatalogV2,
+fn collect_search_matches_v1(
+    catalog: &CatalogV1,
     node_id: &str,
     query: &str,
     matches: &mut Vec<DriveItem>,
 ) -> Result<()> {
     let node = catalog_node(catalog, node_id)?;
     if node.descriptor.name.to_lowercase().contains(query) {
-        matches.push(drive_item_v2(catalog, node_id)?);
+        matches.push(drive_item_v1(catalog, node_id)?);
     }
     for child_id in child_ids(catalog, node_id) {
-        collect_search_matches_v2(catalog, child_id, query, matches)?;
+        collect_search_matches_v1(catalog, child_id, query, matches)?;
     }
     Ok(())
 }
 
-fn mark_node_updated(catalog: &mut CatalogV2, node_id: &str) -> Result<()> {
+fn mark_node_updated(catalog: &mut CatalogV1, node_id: &str) -> Result<()> {
     let node = catalog
         .nodes
         .get_mut(node_id)
@@ -2324,7 +2016,7 @@ fn mark_node_updated(catalog: &mut CatalogV2, node_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn collect_descendant_ids(catalog: &CatalogV2, node_id: &str, ids: &mut HashSet<String>) {
+fn collect_descendant_ids(catalog: &CatalogV1, node_id: &str, ids: &mut HashSet<String>) {
     if !catalog.nodes.contains_key(node_id) || !ids.insert(node_id.to_string()) {
         return;
     }
@@ -2333,13 +2025,13 @@ fn collect_descendant_ids(catalog: &CatalogV2, node_id: &str, ids: &mut HashSet<
     }
 }
 
-fn prune_unreferenced_content(catalog: &mut CatalogV2) {
+fn prune_unreferenced_content(catalog: &mut CatalogV1) {
     let referenced = catalog
         .nodes
         .values()
         .filter_map(|node| match &node.descriptor.kind {
-            NodeDescriptorKindV2::File { object_id, .. } => Some(object_id.clone()),
-            NodeDescriptorKindV2::Directory => None,
+            NodeDescriptorKindV1::File { object_id, .. } => Some(object_id.clone()),
+            NodeDescriptorKindV1::Directory => None,
         })
         .collect::<HashSet<_>>();
     catalog
@@ -2348,7 +2040,7 @@ fn prune_unreferenced_content(catalog: &mut CatalogV2) {
     rebuild_content_index(catalog);
 }
 
-fn rebuild_content_index(catalog: &mut CatalogV2) {
+fn rebuild_content_index(catalog: &mut CatalogV1) {
     catalog.content_index.clear();
     for (object_id, object) in &catalog.content_objects {
         catalog
@@ -2359,62 +2051,29 @@ fn rebuild_content_index(catalog: &mut CatalogV2) {
 }
 
 fn storage_chunk_count(storage: &StorageRef) -> usize {
-    match storage {
-        StorageRef::Legacy(storage) => storage.chunks.len(),
-        StorageRef::V2(storage) => storage.chunks.len(),
-    }
+    let StorageRef::V1(storage) = storage;
+    storage.chunks.len()
 }
 
 fn collect_content_remote_files(
     object: &ContentObject,
-    key: &KeyFile,
     files: &mut Vec<CatalogRemoteFile>,
 ) -> Result<()> {
-    match &object.storage {
-        StorageRef::Legacy(storage) => {
-            let manifest_plaintext =
-                legacy_manifest_plaintext(object.object_id.as_str(), storage.chunks.as_slice())?;
-            let encrypted_manifest =
-                key.encrypt_deterministic("file-manifest", &manifest_plaintext)?;
-            files.push(CatalogRemoteFile {
-                path: storage.manifest_path.clone(),
-                expected_size: Some(u64::try_from(encrypted_manifest.len()).map_err(|_| {
-                    LiosError::DataCorruption("legacy manifest size overflowed".to_string())
-                })?),
-                sha256: Some(sha256_hex(&encrypted_manifest)),
-            });
-            files.extend(storage.chunks.iter().map(|chunk| CatalogRemoteFile {
-                path: chunk.path.clone(),
-                expected_size: None,
-                sha256: Some(chunk.encrypted_sha256.clone()),
-            }));
-        }
-        StorageRef::V2(storage) => {
-            let manifest = expected_v2_manifest(object, storage);
-            files.push(CatalogRemoteFile {
-                path: storage.manifest_path.clone(),
-                expected_size: Some(envelope_encoded_len_v2(
-                    serde_json::to_vec(&manifest)?.len(),
-                )?),
-                sha256: Some(storage.manifest_encrypted_sha256.clone()),
-            });
-            files.extend(storage.chunks.iter().map(|chunk| CatalogRemoteFile {
-                path: chunk.path.clone(),
-                expected_size: Some(chunk.encoded_size),
-                sha256: Some(chunk.encoded_sha256.clone()),
-            }));
-        }
-    }
+    let StorageRef::V1(storage) = &object.storage;
+    let manifest = expected_v1_manifest(object, storage);
+    files.push(CatalogRemoteFile {
+        path: storage.manifest_path.clone(),
+        expected_size: Some(envelope_encoded_len_v1(
+            serde_json::to_vec(&manifest)?.len(),
+        )?),
+        sha256: Some(storage.manifest_encrypted_sha256.clone()),
+    });
+    files.extend(storage.chunks.iter().map(|chunk| CatalogRemoteFile {
+        path: chunk.path.clone(),
+        expected_size: Some(chunk.encoded_size),
+        sha256: Some(chunk.encoded_sha256.clone()),
+    }));
     Ok(())
-}
-
-fn legacy_manifest_plaintext(object_id: &str, chunks: &[LegacyChunkRef]) -> Result<Vec<u8>> {
-    // v1 used json!, whose map ordering is part of the deterministic ciphertext format.
-    Ok(serde_json::to_vec(&serde_json::json!({
-        "version": 1,
-        "object_id": object_id,
-        "chunks": chunks,
-    }))?)
 }
 
 fn is_managed_integrity_path(path: &str) -> bool {
@@ -2510,8 +2169,8 @@ fn pack_stats(path: &Path, chunk_size: usize) -> Result<PackStats> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pack_path_v2(
-    catalog: &mut CatalogV2,
+fn pack_path_v1(
+    catalog: &mut CatalogV1,
     path: &Path,
     name: String,
     relative_path: PathBuf,
@@ -2532,14 +2191,14 @@ fn pack_path_v2(
             });
             catalog.nodes.insert(
                 node_id.clone(),
-                CatalogNodeV2 {
-                    descriptor: NodeDescriptorV2 {
-                        version: 2,
+                CatalogNodeV1 {
+                    descriptor: NodeDescriptorV1 {
+                        version: 1,
                         node_id: node_id.clone(),
                         parent_id,
                         name,
                         updated_at: timestamp(),
-                        kind: NodeDescriptorKindV2::Directory,
+                        kind: NodeDescriptorKindV1::Directory,
                     },
                     descriptor_encrypted_sha256: None,
                 },
@@ -2552,7 +2211,7 @@ fn pack_path_v2(
                     continue;
                 };
                 let child_name = file_name(&child_path)?;
-                pack_path_v2(
+                pack_path_v1(
                     catalog,
                     &child_path,
                     child_name.clone(),
@@ -2567,7 +2226,7 @@ fn pack_path_v2(
             }
         }
         PackablePathKind::File => {
-            let (object_id, source_snapshot) = pack_content_object_v2(
+            let (object_id, source_snapshot) = pack_content_object_v1(
                 catalog,
                 path,
                 &relative_path,
@@ -2582,14 +2241,14 @@ fn pack_path_v2(
             })?;
             catalog.nodes.insert(
                 node_id.clone(),
-                CatalogNodeV2 {
-                    descriptor: NodeDescriptorV2 {
-                        version: 2,
+                CatalogNodeV1 {
+                    descriptor: NodeDescriptorV1 {
+                        version: 1,
                         node_id: node_id.clone(),
                         parent_id,
                         name,
                         updated_at: timestamp(),
-                        kind: NodeDescriptorKindV2::File {
+                        kind: NodeDescriptorKindV1::File {
                             object_id,
                             content_sha256: object.content_sha256.clone(),
                             original_size: object.original_size,
@@ -2612,8 +2271,8 @@ fn ensure_packable_path(path: &Path) -> Result<PackablePathKind> {
     })
 }
 
-fn pack_content_object_v2(
-    catalog: &mut CatalogV2,
+fn pack_content_object_v1(
+    catalog: &mut CatalogV1,
     path: &Path,
     relative_path: &Path,
     key: &KeyFile,
@@ -2641,24 +2300,24 @@ fn pack_content_object_v2(
                 break;
             }
 
-            let chunk_id = ChunkIdV2::random();
+            let chunk_id = ChunkIdV1::random();
             let chunk_id_hex = hex::encode(chunk_id.as_bytes());
             let relative_path =
                 format!("{FILES_DIR}/{object_id}/{FILE_CHUNKS_DIR}/{chunk_id_hex}.lios");
             let chunk_path = options.staging_dir.join(&relative_path);
             let mut temp = SiblingTempFile::create(&chunk_path, ".lios-tmp")?;
             let stats = if at_eof {
-                encode_chunk_stream_v2(key, chunk_id, std::io::empty(), temp.file_mut())?
+                encode_chunk_stream_v1(key, chunk_id, std::io::empty(), temp.file_mut())?
             } else {
                 let limited = source.by_ref().take(options.chunk_size as u64);
                 let hashing = WholeFileHashingReader::new(limited, &mut file_hasher);
-                encode_chunk_stream_v2(key, chunk_id, hashing, temp.file_mut())?
+                encode_chunk_stream_v1(key, chunk_id, hashing, temp.file_mut())?
             };
             temp.persist_new(&chunk_path)?;
             total_size = total_size
                 .checked_add(stats.original_bytes)
                 .ok_or_else(|| LiosError::Unsupported("file is too large".to_string()))?;
-            chunks.push(V2ChunkRef {
+            chunks.push(V1ChunkRef {
                 index: chunks.len(),
                 chunk_id: chunk_id_hex,
                 path: relative_path,
@@ -2666,7 +2325,7 @@ fn pack_content_object_v2(
                 original_sha256: hex::encode(stats.original_sha256),
                 encoded_size: stats.encoded_bytes,
                 encoded_sha256: hex::encode(stats.encoded_sha256),
-                format_version: 2,
+                format_version: 1,
             });
             progress.complete_chunk(stats.original_bytes);
             if at_eof {
@@ -2704,9 +2363,9 @@ fn pack_content_object_v2(
             unavailable_object_ids.push(existing_object_id);
         }
 
-        let manifest = ObjectManifestV2 {
-            version: 2,
-            format_version: 2,
+        let manifest = ObjectManifestV1 {
+            version: 1,
+            format_version: 1,
             object_id: object_id.clone(),
             content_sha256: content_sha256.clone(),
             original_size: total_size,
@@ -2714,7 +2373,7 @@ fn pack_content_object_v2(
         };
         let manifest_plaintext = serde_json::to_vec(&manifest)?;
         let encrypted_manifest =
-            encrypt_envelope_v2(key, EnvelopeKindV2::Manifest, &manifest_plaintext)?;
+            encrypt_envelope_v1(key, EnvelopeKindV1::Manifest, &manifest_plaintext)?;
         let manifest_path = format!("{FILES_DIR}/{object_id}/{FILE_MANIFEST}");
         write_atomic_immutable(
             &options.staging_dir.join(&manifest_path),
@@ -2724,7 +2383,7 @@ fn pack_content_object_v2(
             object_id: object_id.clone(),
             content_sha256: content_sha256.clone(),
             original_size: total_size,
-            storage: StorageRef::V2(V2StorageRef {
+            storage: StorageRef::V1(V1StorageRef {
                 manifest_path,
                 manifest_encrypted_sha256: sha256_hex(&encrypted_manifest),
                 chunks,
@@ -2748,7 +2407,7 @@ fn pack_content_object_v2(
 }
 
 fn existing_content_is_locally_available(
-    catalog: &CatalogV2,
+    catalog: &CatalogV1,
     object_id: &str,
     key: &KeyFile,
     staging_dir: &Path,
@@ -2756,81 +2415,49 @@ fn existing_content_is_locally_available(
     let object = catalog.content_objects.get(object_id).ok_or_else(|| {
         LiosError::DataCorruption(format!("content index object is missing: {object_id}"))
     })?;
-    match &object.storage {
-        StorageRef::Legacy(storage) => {
-            for chunk in &storage.chunks {
-                let path = staging_dir.join(&chunk.path);
-                let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(false);
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                if is_link_or_junction(&path, &metadata)?
-                    || !metadata.is_file()
-                    || sha256_file(&path)? != chunk.encrypted_sha256
-                {
-                    return Ok(false);
-                }
-            }
-        }
-        StorageRef::V2(storage) => {
-            let expected_manifest = ObjectManifestV2 {
-                version: 2,
-                format_version: 2,
-                object_id: object.object_id.clone(),
-                content_sha256: object.content_sha256.clone(),
-                original_size: object.original_size,
-                chunks: storage.chunks.clone(),
-            };
-            let manifest_path = staging_dir.join(&storage.manifest_path);
-            let metadata = match fs::symlink_metadata(&manifest_path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(error) => return Err(error.into()),
-            };
-            if is_link_or_junction(&manifest_path, &metadata)? || !metadata.is_file() {
-                return Ok(false);
-            }
-            let encrypted = fs::read(&manifest_path)?;
-            if sha256_hex(&encrypted) != storage.manifest_encrypted_sha256 {
-                return Ok(false);
-            }
-            let Ok(plaintext) =
-                decrypt_compatible_v1_or_v2(key, EnvelopeKindV2::Manifest, &encrypted)
-            else {
-                return Ok(false);
-            };
-            let Ok(manifest) = serde_json::from_slice::<ObjectManifestV2>(&plaintext) else {
-                return Ok(false);
-            };
-            if manifest != expected_manifest {
-                return Ok(false);
-            }
-            for chunk in &storage.chunks {
-                let path = staging_dir.join(&chunk.path);
-                let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(false);
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                if is_link_or_junction(&path, &metadata)?
-                    || !metadata.is_file()
-                    || metadata.len() != chunk.encoded_size
-                    || sha256_file(&path)? != chunk.encoded_sha256
-                {
-                    return Ok(false);
-                }
-            }
+    let StorageRef::V1(storage) = &object.storage;
+    let expected_manifest = expected_v1_manifest(object, storage);
+    let manifest_path = staging_dir.join(&storage.manifest_path);
+    let metadata = match fs::symlink_metadata(&manifest_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if is_link_or_junction(&manifest_path, &metadata)? || !metadata.is_file() {
+        return Ok(false);
+    }
+    let encrypted = fs::read(&manifest_path)?;
+    if sha256_hex(&encrypted) != storage.manifest_encrypted_sha256 {
+        return Ok(false);
+    }
+    let Ok(plaintext) = decrypt_envelope_v1(key, EnvelopeKindV1::Manifest, &encrypted) else {
+        return Ok(false);
+    };
+    let Ok(manifest) = serde_json::from_slice::<ObjectManifestV1>(&plaintext) else {
+        return Ok(false);
+    };
+    if manifest != expected_manifest {
+        return Ok(false);
+    }
+    for chunk in &storage.chunks {
+        let path = staging_dir.join(&chunk.path);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if is_link_or_junction(&path, &metadata)?
+            || !metadata.is_file()
+            || metadata.len() != chunk.encoded_size
+            || sha256_file(&path)? != chunk.encoded_sha256
+        {
+            return Ok(false);
         }
     }
     Ok(true)
 }
 
-fn content_object_candidates(catalog: &CatalogV2, content_sha256: &str) -> Vec<String> {
+fn content_object_candidates(catalog: &CatalogV1, content_sha256: &str) -> Vec<String> {
     let mut candidates = Vec::new();
     if let Some(indexed) = catalog.content_index.get(content_sha256) {
         candidates.push(indexed.clone());
@@ -2847,49 +2474,25 @@ fn existing_content_is_remotely_available(
     object: &ContentObject,
     remote_objects: &[StorageObject],
 ) -> Result<bool> {
-    match &object.storage {
-        StorageRef::Legacy(storage) => Ok(storage.chunks.iter().all(|chunk| {
-            remote_object_hash_matches(remote_objects, &chunk.path, &chunk.encrypted_sha256)
-        })),
-        StorageRef::V2(storage) => {
-            let expected_manifest = ObjectManifestV2 {
-                version: 2,
-                format_version: 2,
-                object_id: object.object_id.clone(),
-                content_sha256: object.content_sha256.clone(),
-                original_size: object.original_size,
-                chunks: storage.chunks.clone(),
-            };
-            let manifest_size =
-                envelope_encoded_len_v2(serde_json::to_vec(&expected_manifest)?.len())?;
-            if !remote_object_matches(
-                remote_objects,
-                &storage.manifest_path,
-                manifest_size,
-                &storage.manifest_encrypted_sha256,
-            ) {
-                return Ok(false);
-            }
-            Ok(storage.chunks.iter().all(|chunk| {
-                remote_object_matches(
-                    remote_objects,
-                    &chunk.path,
-                    chunk.encoded_size,
-                    &chunk.encoded_sha256,
-                )
-            }))
-        }
+    let StorageRef::V1(storage) = &object.storage;
+    let expected_manifest = expected_v1_manifest(object, storage);
+    let manifest_size = envelope_encoded_len_v1(serde_json::to_vec(&expected_manifest)?.len())?;
+    if !remote_object_matches(
+        remote_objects,
+        &storage.manifest_path,
+        manifest_size,
+        &storage.manifest_encrypted_sha256,
+    ) {
+        return Ok(false);
     }
-}
-
-fn remote_object_hash_matches(
-    remote_objects: &[StorageObject],
-    path: &str,
-    expected_sha256: &str,
-) -> bool {
-    remote_objects
-        .iter()
-        .any(|object| object.path == path && object.sha256.as_deref() == Some(expected_sha256))
+    Ok(storage.chunks.iter().all(|chunk| {
+        remote_object_matches(
+            remote_objects,
+            &chunk.path,
+            chunk.encoded_size,
+            &chunk.encoded_sha256,
+        )
+    }))
 }
 
 fn remote_object_matches(
@@ -2906,14 +2509,10 @@ fn remote_object_matches(
 }
 
 fn clear_staged_content_files(object: &ContentObject, staging_dir: &Path) -> Result<bool> {
-    let paths = match &object.storage {
-        StorageRef::Legacy(storage) => std::iter::once(storage.manifest_path.as_str())
-            .chain(storage.chunks.iter().map(|chunk| chunk.path.as_str()))
-            .collect::<Vec<_>>(),
-        StorageRef::V2(storage) => std::iter::once(storage.manifest_path.as_str())
-            .chain(storage.chunks.iter().map(|chunk| chunk.path.as_str()))
-            .collect::<Vec<_>>(),
-    };
+    let StorageRef::V1(storage) = &object.storage;
+    let paths = std::iter::once(storage.manifest_path.as_str())
+        .chain(storage.chunks.iter().map(|chunk| chunk.path.as_str()))
+        .collect::<Vec<_>>();
     for relative_path in paths {
         let path = staging_dir.join(relative_path);
         let metadata = match fs::symlink_metadata(&path) {
@@ -2930,12 +2529,12 @@ fn clear_staged_content_files(object: &ContentObject, staging_dir: &Path) -> Res
 }
 
 fn replace_content_object_references(
-    catalog: &mut CatalogV2,
+    catalog: &mut CatalogV1,
     unavailable_object_id: &str,
     replacement_object_id: &str,
 ) {
     for node in catalog.nodes.values_mut() {
-        let NodeDescriptorKindV2::File { object_id, .. } = &mut node.descriptor.kind else {
+        let NodeDescriptorKindV1::File { object_id, .. } = &mut node.descriptor.kind else {
             continue;
         };
         if object_id == unavailable_object_id {
@@ -2964,8 +2563,8 @@ impl<R: Read> Read for WholeFileHashingReader<'_, R> {
     }
 }
 
-fn restore_node_v2(
-    catalog: &CatalogV2,
+fn restore_node_v1(
+    catalog: &CatalogV1,
     node_id: &str,
     parent: &Path,
     key: &KeyFile,
@@ -2973,19 +2572,19 @@ fn restore_node_v2(
     options: &RestoreOptions,
 ) -> Result<()> {
     let node = catalog_node(catalog, node_id)?;
-    let node_name = restore_local_name(&node.descriptor.name);
+    let node_name = node.descriptor.name.clone();
     let restore_root = &options.output_dir;
     match &node.descriptor.kind {
-        NodeDescriptorKindV2::Directory => {
+        NodeDescriptorKindV1::Directory => {
             let dir = parent.join(node_name);
             ensure_restore_descendants_safe(restore_root, &dir)?;
             fs::create_dir_all(&dir)?;
             ensure_restore_descendants_safe(restore_root, &dir)?;
             for child_id in child_ids(catalog, node_id) {
-                restore_node_v2(catalog, child_id, &dir, key, staging_dir, options)?;
+                restore_node_v1(catalog, child_id, &dir, key, staging_dir, options)?;
             }
         }
-        NodeDescriptorKindV2::File {
+        NodeDescriptorKindV1::File {
             object_id,
             content_sha256,
             original_size,
@@ -3010,71 +2609,46 @@ fn restore_node_v2(
             let mut output = SiblingTempFile::create(&output_path, ".lios-part")?;
             let mut file_hasher = Sha256::new();
             let mut restored_size = 0u64;
-            match &object.storage {
-                StorageRef::Legacy(storage) => {
-                    let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
-                    chunks.sort_by_key(|chunk| chunk.index);
-                    for chunk in chunks {
-                        let encrypted = fs::read(staging_dir.join(&chunk.path))?;
-                        if sha256_hex(&encrypted) != chunk.encrypted_sha256 {
-                            return Err(LiosError::Crypto);
-                        }
-                        let compressed = key.decrypt(&encrypted)?;
-                        restore_legacy_chunk(
-                            compressed.as_slice(),
-                            chunk,
-                            output.file_mut(),
-                            &mut file_hasher,
-                            &mut restored_size,
-                            *original_size,
-                        )?;
-                    }
+            let StorageRef::V1(storage) = &object.storage;
+            validate_v1_manifest(object, storage, key, staging_dir)?;
+            let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
+            chunks.sort_by_key(|chunk| chunk.index);
+            for chunk in chunks {
+                if chunk.format_version != 1 {
+                    return Err(LiosError::Unsupported(format!(
+                        "unknown chunk format version: {}",
+                        chunk.format_version
+                    )));
                 }
-                StorageRef::V2(storage) => {
-                    validate_v2_manifest(object, storage, key, staging_dir)?;
-                    let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
-                    chunks.sort_by_key(|chunk| chunk.index);
-                    for chunk in chunks {
-                        if chunk.format_version != 2 {
-                            return Err(LiosError::Unsupported(format!(
-                                "unknown chunk format version: {}",
-                                chunk.format_version
-                            )));
-                        }
-                        let chunk_path = staging_dir.join(&chunk.path);
-                        if fs::metadata(&chunk_path)?.len() != chunk.encoded_size
-                            || sha256_file(&chunk_path)? != chunk.encoded_sha256
-                        {
-                            return Err(LiosError::Crypto);
-                        }
-                        let chunk_id = parse_chunk_id_v2(&chunk.chunk_id)?;
-                        let input = fs::File::open(&chunk_path)?;
-                        let writer =
-                            WholeFileHashingWriter::new(output.file_mut(), &mut file_hasher);
-                        let stats = decode_chunk_stream_v2(
-                            key,
-                            chunk_id,
-                            input,
-                            writer,
-                            &ChunkDecodeLimitsV2::for_chunk(chunk.original_size),
-                        )?;
-                        if stats.original_bytes != chunk.original_size
-                            || hex::encode(stats.original_sha256) != chunk.original_sha256
-                            || stats.encoded_bytes != chunk.encoded_size
-                            || hex::encode(stats.encoded_sha256) != chunk.encoded_sha256
-                        {
-                            return Err(LiosError::Crypto);
-                        }
-                        restored_size = restored_size
-                            .checked_add(stats.original_bytes)
-                            .filter(|size| *size <= *original_size)
-                            .ok_or_else(|| {
-                                LiosError::DataCorruption(
-                                    "restored file exceeds declared size".to_string(),
-                                )
-                            })?;
-                    }
+                let chunk_path = staging_dir.join(&chunk.path);
+                if fs::metadata(&chunk_path)?.len() != chunk.encoded_size
+                    || sha256_file(&chunk_path)? != chunk.encoded_sha256
+                {
+                    return Err(LiosError::Crypto);
                 }
+                let chunk_id = parse_chunk_id_v1(&chunk.chunk_id)?;
+                let input = fs::File::open(&chunk_path)?;
+                let writer = WholeFileHashingWriter::new(output.file_mut(), &mut file_hasher);
+                let stats = decode_chunk_stream_v1(
+                    key,
+                    chunk_id,
+                    input,
+                    writer,
+                    &ChunkDecodeLimitsV1::for_chunk(chunk.original_size),
+                )?;
+                if stats.original_bytes != chunk.original_size
+                    || hex::encode(stats.original_sha256) != chunk.original_sha256
+                    || stats.encoded_bytes != chunk.encoded_size
+                    || hex::encode(stats.encoded_sha256) != chunk.encoded_sha256
+                {
+                    return Err(LiosError::Crypto);
+                }
+                restored_size = restored_size
+                    .checked_add(stats.original_bytes)
+                    .filter(|size| *size <= *original_size)
+                    .ok_or_else(|| {
+                        LiosError::DataCorruption("restored file exceeds declared size".to_string())
+                    })?;
             }
             if restored_size != *original_size
                 || hex::encode(file_hasher.finalize()) != *content_sha256
@@ -3084,52 +2658,6 @@ fn restore_node_v2(
             ensure_restore_descendants_safe(restore_root, &output_path)?;
             output.persist_new(&output_path)?;
         }
-    }
-    Ok(())
-}
-
-fn restore_legacy_chunk(
-    compressed: &[u8],
-    chunk: &LegacyChunkRef,
-    output: &mut impl Write,
-    file_hasher: &mut Sha256,
-    restored_size: &mut u64,
-    expected_file_size: u64,
-) -> Result<()> {
-    let mut decoder = zstd::stream::read::Decoder::new(compressed)?;
-    let mut chunk_hasher = Sha256::new();
-    let mut chunk_size = 0u64;
-    let mut buffer = [0u8; LEGACY_RESTORE_BUFFER_SIZE];
-    loop {
-        let read = decoder.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        let bytes = &buffer[..read];
-        let read = u64::try_from(read).map_err(|_| {
-            LiosError::DataCorruption("legacy chunk size cannot be represented".to_string())
-        })?;
-        let next_chunk_size = chunk_size
-            .checked_add(read)
-            .ok_or_else(|| LiosError::DataCorruption("legacy chunk size overflow".to_string()))?;
-        let next_file_size = restored_size.checked_add(read).ok_or_else(|| {
-            LiosError::DataCorruption("legacy restored size overflow".to_string())
-        })?;
-        if next_chunk_size > chunk.original_size || next_file_size > expected_file_size {
-            return Err(LiosError::DataCorruption(
-                "legacy chunk exceeds declared size".to_string(),
-            ));
-        }
-        chunk_hasher.update(bytes);
-        file_hasher.update(bytes);
-        output.write_all(bytes)?;
-        chunk_size = next_chunk_size;
-        *restored_size = next_file_size;
-    }
-    if chunk_size != chunk.original_size
-        || hex::encode(chunk_hasher.finalize()) != chunk.original_sha256
-    {
-        return Err(LiosError::Crypto);
     }
     Ok(())
 }
@@ -3338,126 +2866,69 @@ fn verify_content_object_integrity(
     if should_cancel() {
         return Ok(false);
     }
-    match &object.storage {
-        StorageRef::Legacy(storage) => {
-            let encrypted_manifest = read_verified_encrypted_file(
-                staging_dir,
-                &storage.manifest_path,
-                storage.manifest_encrypted_sha256.as_deref(),
-                None,
-            )?;
-            let manifest_plaintext =
-                decrypt_compatible_v1_or_v2(key, EnvelopeKindV2::Manifest, &encrypted_manifest)?;
-            let manifest: ObjectManifestV1 = serde_json::from_slice(&manifest_plaintext)?;
-            let expected_manifest = ObjectManifestV1 {
-                version: 1,
-                object_id: object.object_id.clone(),
-                chunks: storage.chunks.clone(),
-            };
-            if manifest != expected_manifest {
-                return Err(LiosError::DataCorruption(format!(
-                    "legacy content manifest mismatch: {}",
-                    object.object_id
-                )));
-            }
-            add_verified_encoded_bytes(report, encrypted_manifest.len())?;
-            let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
-            chunks.sort_by_key(|chunk| chunk.index);
-            for chunk in chunks {
-                if should_cancel() {
-                    return Ok(false);
-                }
-                let encrypted = read_verified_encrypted_file(
-                    staging_dir,
-                    &chunk.path,
-                    Some(&chunk.encrypted_sha256),
-                    None,
-                )?;
-                let compressed = key.decrypt(&encrypted)?;
-                let mut sink = std::io::sink();
-                restore_legacy_chunk(
-                    compressed.as_slice(),
-                    chunk,
-                    &mut sink,
-                    &mut file_hasher,
-                    &mut restored_size,
-                    object.original_size,
-                )?;
-                report.chunks_verified =
-                    report.chunks_verified.checked_add(1).ok_or_else(|| {
-                        LiosError::DataCorruption("verified chunk count overflowed".to_string())
-                    })?;
-                add_verified_encoded_bytes(report, encrypted.len())?;
-            }
+    let StorageRef::V1(storage) = &object.storage;
+    let expected_manifest = expected_v1_manifest(object, storage);
+    let expected_manifest_size =
+        envelope_encoded_len_v1(serde_json::to_vec(&expected_manifest)?.len())?;
+    let encrypted_manifest = read_verified_encrypted_file(
+        staging_dir,
+        &storage.manifest_path,
+        Some(&storage.manifest_encrypted_sha256),
+        Some(expected_manifest_size),
+    )?;
+    validate_v1_manifest_bytes(
+        object,
+        storage,
+        key,
+        &encrypted_manifest,
+        &expected_manifest,
+    )?;
+    add_verified_encoded_bytes(report, encrypted_manifest.len())?;
+    let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
+    chunks.sort_by_key(|chunk| chunk.index);
+    for chunk in chunks {
+        if should_cancel() {
+            return Ok(false);
         }
-        StorageRef::V2(storage) => {
-            let expected_manifest = expected_v2_manifest(object, storage);
-            let expected_manifest_size =
-                envelope_encoded_len_v2(serde_json::to_vec(&expected_manifest)?.len())?;
-            let encrypted_manifest = read_verified_encrypted_file(
-                staging_dir,
-                &storage.manifest_path,
-                Some(&storage.manifest_encrypted_sha256),
-                Some(expected_manifest_size),
-            )?;
-            validate_v2_manifest_bytes(
-                object,
-                storage,
-                key,
-                &encrypted_manifest,
-                &expected_manifest,
-            )?;
-            add_verified_encoded_bytes(report, encrypted_manifest.len())?;
-            let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
-            chunks.sort_by_key(|chunk| chunk.index);
-            for chunk in chunks {
-                if should_cancel() {
-                    return Ok(false);
-                }
-                if chunk.format_version != 2 {
-                    return Err(LiosError::Unsupported(format!(
-                        "unknown chunk format version: {}",
-                        chunk.format_version
-                    )));
-                }
-                let (input, _) =
-                    open_verified_staging_file(staging_dir, &chunk.path, Some(chunk.encoded_size))?;
-                let chunk_id = parse_chunk_id_v2(&chunk.chunk_id)?;
-                let writer = WholeFileHashingWriter::new(std::io::sink(), &mut file_hasher);
-                let stats = decode_chunk_stream_v2(
-                    key,
-                    chunk_id,
-                    input,
-                    writer,
-                    &ChunkDecodeLimitsV2::for_chunk(chunk.original_size),
-                )?;
-                if stats.original_bytes != chunk.original_size
-                    || hex::encode(stats.original_sha256) != chunk.original_sha256
-                    || stats.encoded_bytes != chunk.encoded_size
-                    || hex::encode(stats.encoded_sha256) != chunk.encoded_sha256
-                {
-                    return Err(LiosError::Crypto);
-                }
-                restored_size = restored_size
-                    .checked_add(stats.original_bytes)
-                    .filter(|size| *size <= object.original_size)
-                    .ok_or_else(|| {
-                        LiosError::DataCorruption("verified file exceeds declared size".to_string())
-                    })?;
-                report.chunks_verified =
-                    report.chunks_verified.checked_add(1).ok_or_else(|| {
-                        LiosError::DataCorruption("verified chunk count overflowed".to_string())
-                    })?;
-                report.encoded_bytes_verified = report
-                    .encoded_bytes_verified
-                    .checked_add(stats.encoded_bytes)
-                    .ok_or_else(|| {
-                        LiosError::DataCorruption(
-                            "verified encoded byte count overflowed".to_string(),
-                        )
-                    })?;
-            }
+        if chunk.format_version != 1 {
+            return Err(LiosError::Unsupported(format!(
+                "unknown chunk format version: {}",
+                chunk.format_version
+            )));
         }
+        let (input, _) =
+            open_verified_staging_file(staging_dir, &chunk.path, Some(chunk.encoded_size))?;
+        let chunk_id = parse_chunk_id_v1(&chunk.chunk_id)?;
+        let writer = WholeFileHashingWriter::new(std::io::sink(), &mut file_hasher);
+        let stats = decode_chunk_stream_v1(
+            key,
+            chunk_id,
+            input,
+            writer,
+            &ChunkDecodeLimitsV1::for_chunk(chunk.original_size),
+        )?;
+        if stats.original_bytes != chunk.original_size
+            || hex::encode(stats.original_sha256) != chunk.original_sha256
+            || stats.encoded_bytes != chunk.encoded_size
+            || hex::encode(stats.encoded_sha256) != chunk.encoded_sha256
+        {
+            return Err(LiosError::Crypto);
+        }
+        restored_size = restored_size
+            .checked_add(stats.original_bytes)
+            .filter(|size| *size <= object.original_size)
+            .ok_or_else(|| {
+                LiosError::DataCorruption("verified file exceeds declared size".to_string())
+            })?;
+        report.chunks_verified = report.chunks_verified.checked_add(1).ok_or_else(|| {
+            LiosError::DataCorruption("verified chunk count overflowed".to_string())
+        })?;
+        report.encoded_bytes_verified = report
+            .encoded_bytes_verified
+            .checked_add(stats.encoded_bytes)
+            .ok_or_else(|| {
+                LiosError::DataCorruption("verified encoded byte count overflowed".to_string())
+            })?;
     }
     if restored_size != object.original_size
         || hex::encode(file_hasher.finalize()) != object.content_sha256
@@ -3467,38 +2938,38 @@ fn verify_content_object_integrity(
     Ok(true)
 }
 
-fn validate_v2_manifest(
+fn validate_v1_manifest(
     object: &ContentObject,
-    storage: &V2StorageRef,
+    storage: &V1StorageRef,
     key: &KeyFile,
     staging_dir: &Path,
 ) -> Result<()> {
-    let expected = expected_v2_manifest(object, storage);
+    let expected = expected_v1_manifest(object, storage);
     let encrypted = read_verified_encrypted_file(
         staging_dir,
         &storage.manifest_path,
         Some(&storage.manifest_encrypted_sha256),
         None,
     )?;
-    validate_v2_manifest_bytes(object, storage, key, &encrypted, &expected)
+    validate_v1_manifest_bytes(object, storage, key, &encrypted, &expected)
 }
 
-fn validate_v2_manifest_bytes(
+fn validate_v1_manifest_bytes(
     object: &ContentObject,
-    storage: &V2StorageRef,
+    storage: &V1StorageRef,
     key: &KeyFile,
     encrypted: &[u8],
-    expected: &ObjectManifestV2,
+    expected: &ObjectManifestV1,
 ) -> Result<()> {
-    let plaintext = decrypt_compatible_v1_or_v2(key, EnvelopeKindV2::Manifest, encrypted)?;
-    let manifest: ObjectManifestV2 = serde_json::from_slice(&plaintext)?;
-    if manifest.version != 2 {
+    let plaintext = decrypt_envelope_v1(key, EnvelopeKindV1::Manifest, encrypted)?;
+    let manifest: ObjectManifestV1 = serde_json::from_slice(&plaintext)?;
+    if manifest.version != 1 {
         return Err(LiosError::Unsupported(format!(
             "unknown manifest version: {}",
             manifest.version
         )));
     }
-    if manifest.format_version != 2 {
+    if manifest.format_version != 1 {
         return Err(LiosError::Unsupported(format!(
             "unknown manifest format version: {}",
             manifest.format_version
@@ -3516,10 +2987,10 @@ fn validate_v2_manifest_bytes(
     Ok(())
 }
 
-fn expected_v2_manifest(object: &ContentObject, storage: &V2StorageRef) -> ObjectManifestV2 {
-    ObjectManifestV2 {
-        version: 2,
-        format_version: 2,
+fn expected_v1_manifest(object: &ContentObject, storage: &V1StorageRef) -> ObjectManifestV1 {
+    ObjectManifestV1 {
+        version: 1,
+        format_version: 1,
         object_id: object.object_id.clone(),
         content_sha256: object.content_sha256.clone(),
         original_size: object.original_size,
@@ -3527,13 +2998,13 @@ fn expected_v2_manifest(object: &ContentObject, storage: &V2StorageRef) -> Objec
     }
 }
 
-fn parse_chunk_id_v2(value: &str) -> Result<ChunkIdV2> {
+fn parse_chunk_id_v1(value: &str) -> Result<ChunkIdV1> {
     let bytes =
-        hex::decode(value).map_err(|_| LiosError::InvalidV2Format("invalid chunk id encoding"))?;
+        hex::decode(value).map_err(|_| LiosError::InvalidV1Format("invalid chunk id encoding"))?;
     let bytes: [u8; 32] = bytes
         .try_into()
-        .map_err(|_| LiosError::InvalidV2Format("invalid chunk id length"))?;
-    Ok(ChunkIdV2::from_bytes(bytes))
+        .map_err(|_| LiosError::InvalidV1Format("invalid chunk id length"))?;
+    Ok(ChunkIdV1::from_bytes(bytes))
 }
 
 struct WholeFileHashingWriter<'a, W> {
@@ -3634,32 +3105,6 @@ fn is_portable_logical_name(name: &str) -> bool {
         || name.ends_with(' ')
         || name.ends_with('.')
         || is_windows_reserved_name(name))
-}
-
-fn restore_local_name(name: &str) -> String {
-    if is_portable_logical_name(name) {
-        return name.to_string();
-    }
-    let mut base = name
-        .chars()
-        .map(|character| {
-            if character <= '\u{1f}' || "/\\:*?\"<>|".contains(character) {
-                '_'
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .trim_end_matches([' ', '.'])
-        .to_string();
-    if base.trim().is_empty() || base == "." || base == ".." {
-        base = "item".to_string();
-    }
-    if is_windows_reserved_name(&base) {
-        base.insert(0, '_');
-    }
-    let digest = sha256_hex(name.as_bytes());
-    format!("{base} (legacy {})", &digest[..8])
 }
 
 fn is_windows_reserved_name(name: &str) -> bool {
