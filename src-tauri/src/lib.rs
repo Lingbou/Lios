@@ -2,12 +2,14 @@ mod app_log;
 
 pub mod catalog_mutation_gate;
 pub mod catalog_probe;
+mod catalog_sync;
 pub mod command_error;
 pub mod command_surface;
 pub mod config_mutation_gate;
 pub mod download_service;
 pub mod production_config;
 pub mod recovery_key_service;
+mod task_center;
 pub mod task_manager;
 
 #[cfg(test)]
@@ -22,7 +24,13 @@ use std::path::{Component, Path, PathBuf};
 use app_log::AppLogger;
 use catalog_mutation_gate::CatalogMutationGate;
 use catalog_probe::{ensure_space_can_initialize, map_catalog_load_error};
-use command_error::{sanitize_persisted_message, CommandError, CommandErrorCode};
+#[cfg(test)]
+use catalog_sync::{catalog_baseline_from_downloaded_catalog, plan_catalog_sync_with_baseline};
+use catalog_sync::{
+    download_catalog_baseline, execute_sync_work, persist_sync_checkpoints, plan_catalog_sync,
+    sync_current_catalog, CatalogBaseline, SyncWork,
+};
+use command_error::{CommandError, CommandErrorCode};
 use command_surface::with_registered_commands;
 use config_mutation_gate::ConfigMutationGate;
 use download_service::prepare_download_task;
@@ -34,9 +42,8 @@ use lios_core::catalog::{
     UploadConflict, CATALOG_FILE,
 };
 use lios_core::catalog_transaction::{
-    execute_catalog_transaction, probe_catalog_sha256, CatalogBlobCheckpointState,
-    CatalogTransactionOutcome, CatalogTransactionPhase, CatalogTransactionProgress,
-    CatalogTransactionSpec,
+    probe_catalog_sha256, CatalogBlobCheckpointState, CatalogTransactionOutcome,
+    CatalogTransactionPhase, CatalogTransactionProgress,
 };
 use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
 use lios_core::credentials::{protect_to_file, unprotect_from_file};
@@ -44,13 +51,12 @@ use lios_core::crypto::KeyFile;
 use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUserSummary};
 use lios_core::pack::PackOptions;
 use lios_core::restore::{RestoreConflictPolicy, RestoreOptions};
-use lios_core::storage::{
-    plan_catalog_sync_changes, CatalogSyncFile, CatalogSyncUpload, RepoRevision, StorageAdapter,
-    StorageObject,
-};
+#[cfg(test)]
+use lios_core::storage::CatalogSyncFile;
+use lios_core::storage::{RepoRevision, StorageAdapter, StorageObject};
 use lios_core::tasks::{
-    CheckpointState, TaskCatalogCheckpoint, TaskItem, TaskItemState, TaskObjectCheckpoint,
-    TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary,
+    CheckpointState, TaskItemState, TaskObjectCheckpoint, TaskRecord, TaskSpec, TaskState,
+    TaskStore, TaskSummary,
 };
 use production_config::{
     configured_endpoint, persist_config, prepare_startup_config, validate_repo, SetupWarning,
@@ -61,12 +67,18 @@ use recovery_key_service::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use task_center::TaskUpdateEvent;
+use task_center::{
+    emit_removed_tasks, emit_task, list_task_items_for_paths, task_summaries_for_paths,
+    task_summary_for_paths, webview_safe_task_summary, TaskItemsPageDto,
+};
 use task_manager::{
     apply_pack_progress, next_retry_attempt, persist_submission, reconcile_catalog_hash,
     retry_backoff, snapshot_upload_sources, validate_task_sources, CatalogReconcileDecision,
     TaskExecutionPermit, TaskManager, TaskScope, TransferMetrics,
 };
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -128,52 +140,6 @@ struct SetupSnapshot {
     warning: Option<SetupWarning>,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum TaskUpdateEvent {
-    Upsert { task: Box<TaskSummary> },
-    Remove { task_ids: Vec<Uuid> },
-}
-
-#[derive(Debug, Serialize)]
-struct TaskItemDto {
-    id: Uuid,
-    task_id: Uuid,
-    name: String,
-    relative_path: Option<PathBuf>,
-    size: u64,
-    state: TaskItemState,
-    phase: Option<String>,
-    bytes_done: u64,
-    bytes_total: u64,
-    error: Option<String>,
-}
-
-impl From<TaskItem> for TaskItemDto {
-    fn from(item: TaskItem) -> Self {
-        Self {
-            id: item.id,
-            task_id: item.task_id,
-            name: item.name,
-            relative_path: item.relative_path,
-            size: item.size,
-            state: item.state,
-            phase: item.phase,
-            bytes_done: item.bytes_done,
-            bytes_total: item.bytes_total,
-            error: item.error.map(sanitize_persisted_message),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct TaskItemsPageDto {
-    task_id: Uuid,
-    offset: u64,
-    total: u64,
-    items: Vec<TaskItemDto>,
-}
-
 #[derive(Serialize)]
 struct CatalogLoadResult {
     local_path: String,
@@ -227,22 +193,6 @@ impl From<DatasetRepoSummary> for DatasetRepoSummaryDto {
     }
 }
 
-struct SyncWork {
-    upload: Vec<CatalogSyncUpload>,
-    delete: Vec<String>,
-    initial_remote_inventory: Vec<StorageObject>,
-    prepublish_safe_paths: HashSet<String>,
-    base_catalog_sha256: Option<String>,
-    expected_revision: Option<RepoRevision>,
-    probe_directory: PathBuf,
-}
-
-struct CatalogBaseline {
-    catalog_sha256: Option<String>,
-    referenced_paths: HashSet<String>,
-    remote_objects: Vec<StorageObject>,
-}
-
 fn to_err<E>(error: E) -> CommandError
 where
     CommandError: From<E>,
@@ -285,77 +235,6 @@ struct TaskTransferUpdate {
     bytes_total: u64,
     speed_bps: u64,
     eta_seconds: Option<u64>,
-}
-
-fn webview_safe_task_summary(mut task: TaskSummary) -> TaskSummary {
-    task.error = task.error.map(sanitize_persisted_message);
-    task
-}
-
-fn webview_safe_task_summaries(tasks: Vec<TaskSummary>) -> Vec<TaskSummary> {
-    tasks.into_iter().map(webview_safe_task_summary).collect()
-}
-
-fn task_summaries_for_paths(paths: &LiosPaths) -> CommandResult<Vec<TaskSummary>> {
-    task_store(paths)?
-        .list_summaries()
-        .map(webview_safe_task_summaries)
-        .map_err(to_err)
-}
-
-fn task_summary_for_paths(paths: &LiosPaths, task_id: Uuid) -> CommandResult<Option<TaskSummary>> {
-    task_store(paths)?
-        .get_summary(task_id)
-        .map(|task| task.map(webview_safe_task_summary))
-        .map_err(to_err)
-}
-
-fn emit_task(app: &tauri::AppHandle, paths: &LiosPaths, task_id: Uuid) {
-    if let Ok(Some(task)) = task_summary_for_paths(paths, task_id) {
-        let _ = app.emit(
-            "lios-task-updated",
-            TaskUpdateEvent::Upsert {
-                task: Box::new(task),
-            },
-        );
-    }
-}
-
-fn emit_removed_tasks(app: &tauri::AppHandle, task_ids: Vec<Uuid>) {
-    if !task_ids.is_empty() {
-        let _ = app.emit("lios-task-updated", TaskUpdateEvent::Remove { task_ids });
-    }
-}
-
-fn list_task_items_for_paths(
-    paths: &LiosPaths,
-    task_id: Uuid,
-    offset: u64,
-    limit: u64,
-) -> CommandResult<TaskItemsPageDto> {
-    const JAVASCRIPT_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-
-    if !(1..=200).contains(&limit) {
-        return Err(CommandError::invalid_input(
-            "task item page limit must be between 1 and 200",
-        ));
-    }
-    if offset > JAVASCRIPT_MAX_SAFE_INTEGER || i64::try_from(offset).is_err() {
-        return Err(CommandError::invalid_input(
-            "task item page offset exceeds the supported range",
-        ));
-    }
-    let store = task_store(paths)?;
-    let page = store
-        .get_items_page(task_id, offset, limit)
-        .map_err(to_err)?
-        .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
-    Ok(TaskItemsPageDto {
-        task_id,
-        offset,
-        total: page.total,
-        items: page.items.into_iter().map(TaskItemDto::from).collect(),
-    })
 }
 
 fn task_interrupt_core(paths: &LiosPaths, id: Uuid) -> lios_core::Result<Option<TaskState>> {
@@ -3613,239 +3492,6 @@ async fn run_rebuild_catalog_worker(
         }
         CatalogTransactionOutcome::Canceled => Ok(TaskWorkerOutcome::Interrupted(
             interrupted_state.unwrap_or(TaskState::Canceled),
-        )),
-    }
-}
-
-fn desired_catalog_objects(
-    paths: &LiosPaths,
-    catalog: &Catalog,
-    key: &KeyFile,
-) -> CommandResult<Vec<CatalogSyncFile>> {
-    let mut desired = Vec::new();
-    let catalog_path = paths.staging.join(CATALOG_FILE);
-    desired.push(CatalogSyncFile {
-        path: CATALOG_FILE.to_string(),
-        local_path: Some(catalog_path.clone()),
-        expected_sha256: Some(sha256_hex_file(&catalog_path)?),
-        expected_size: Some(fs::metadata(&catalog_path).map_err(to_err)?.len()),
-    });
-    for file in catalog
-        .remote_files_for_selection(&CatalogSelection::All, key)
-        .map_err(to_err)?
-    {
-        let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
-        desired.push(CatalogSyncFile {
-            path: file.path,
-            local_path: local_path.exists().then_some(local_path),
-            expected_sha256: file.sha256,
-            expected_size: file.expected_size,
-        });
-    }
-    desired.sort_by(|a, b| {
-        let a_catalog = a.path == CATALOG_FILE;
-        let b_catalog = b.path == CATALOG_FILE;
-        a_catalog.cmp(&b_catalog).then_with(|| a.path.cmp(&b.path))
-    });
-    desired.dedup_by(|a, b| a.path == b.path);
-    Ok(desired)
-}
-
-fn catalog_reference_paths(catalog: &Catalog, key: &KeyFile) -> CommandResult<HashSet<String>> {
-    let mut referenced = HashSet::from([CATALOG_FILE.to_string()]);
-    referenced.extend(
-        catalog
-            .remote_files_for_selection(&CatalogSelection::All, key)
-            .map_err(to_err)?
-            .into_iter()
-            .map(|file| file.path),
-    );
-    Ok(referenced)
-}
-
-fn catalog_baseline_from_downloaded_catalog(
-    paths: &LiosPaths,
-    catalog: &Catalog,
-    key: &KeyFile,
-    remote_objects: Vec<StorageObject>,
-) -> CommandResult<CatalogBaseline> {
-    Ok(CatalogBaseline {
-        catalog_sha256: Some(sha256_hex_file(&paths.staging.join(CATALOG_FILE))?),
-        referenced_paths: catalog_reference_paths(catalog, key)?,
-        remote_objects,
-    })
-}
-
-async fn download_catalog_baseline(
-    paths: &LiosPaths,
-    key: &KeyFile,
-    adapter: &ModelScopeAdapter,
-    repo: &RepoConfig,
-) -> CommandResult<(Catalog, CatalogBaseline)> {
-    let catalog_path = paths.staging.join(CATALOG_FILE);
-    adapter
-        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
-        .await
-        .map_err(to_err)?;
-    let catalog = Catalog::from_staging(paths.staging.clone());
-    let remote_objects = adapter
-        .list_objects(&repo.namespace, &repo.dataset, "")
-        .await
-        .map_err(to_err)?;
-    let baseline = catalog_baseline_from_downloaded_catalog(paths, &catalog, key, remote_objects)?;
-    Ok((catalog, baseline))
-}
-
-fn plan_catalog_sync_with_baseline(
-    desired: Vec<CatalogSyncFile>,
-    baseline: CatalogBaseline,
-    probe_directory: PathBuf,
-) -> CommandResult<SyncWork> {
-    let plan =
-        plan_catalog_sync_changes(desired, baseline.remote_objects.clone()).map_err(to_err)?;
-    let remote_paths = baseline
-        .remote_objects
-        .iter()
-        .map(|object| object.path.as_str())
-        .collect::<HashSet<_>>();
-    let prepublish_safe_paths = plan
-        .upload
-        .iter()
-        .filter(|upload| {
-            upload.path != CATALOG_FILE
-                && !baseline.referenced_paths.contains(&upload.path)
-                && !remote_paths.contains(upload.path.as_str())
-        })
-        .map(|upload| upload.path.clone())
-        .collect();
-    Ok(SyncWork {
-        upload: plan.upload,
-        delete: plan.delete,
-        initial_remote_inventory: baseline.remote_objects,
-        prepublish_safe_paths,
-        base_catalog_sha256: baseline.catalog_sha256,
-        expected_revision: None,
-        probe_directory,
-    })
-}
-
-fn plan_catalog_sync(
-    paths: &LiosPaths,
-    catalog: &Catalog,
-    key: &KeyFile,
-    baseline: CatalogBaseline,
-) -> CommandResult<SyncWork> {
-    let desired = desired_catalog_objects(paths, catalog, key)?;
-    plan_catalog_sync_with_baseline(desired, baseline, paths.staging.clone())
-}
-
-fn persist_sync_checkpoints(
-    paths: &LiosPaths,
-    task_id: Uuid,
-    work: &SyncWork,
-) -> CommandResult<()> {
-    if work.upload.is_empty() && work.delete.is_empty() {
-        return Ok(());
-    }
-    let catalog = work
-        .upload
-        .iter()
-        .find(|upload| upload.path == CATALOG_FILE)
-        .ok_or_else(|| {
-            CommandError::new(
-                CommandErrorCode::CorruptedData,
-                "catalog transaction has no target catalog checkpoint",
-                false,
-                None,
-            )
-        })?;
-    let objects = work
-        .upload
-        .iter()
-        .map(|upload| {
-            let size = fs::metadata(&upload.local_path).map_err(to_err)?.len();
-            if upload
-                .expected_size
-                .is_some_and(|expected| expected != size)
-            {
-                return Err(CommandError::new(
-                    CommandErrorCode::CorruptedData,
-                    format!(
-                        "catalog transaction object changed before checkpointing: {}",
-                        upload.path
-                    ),
-                    false,
-                    None,
-                ));
-            }
-            Ok(TaskObjectCheckpoint {
-                task_id,
-                remote_path: upload.path.clone(),
-                oid: upload.expected_sha256.clone(),
-                size,
-                state: CheckpointState::Pending,
-            })
-        })
-        .collect::<CommandResult<Vec<_>>>()?;
-    let checkpoint = TaskCatalogCheckpoint {
-        task_id,
-        base_catalog_sha256: work.base_catalog_sha256.clone(),
-        target_catalog_sha256: catalog.expected_sha256.clone(),
-    };
-    TaskStore::open(&paths.database)
-        .map_err(to_err)?
-        .replace_transaction_checkpoints(&checkpoint, &objects)
-        .map_err(to_err)
-}
-
-async fn execute_sync_work<A, C, P>(
-    adapter: &A,
-    repo: &RepoConfig,
-    work: SyncWork,
-    should_cancel: C,
-    on_progress: P,
-) -> CommandResult<CatalogTransactionOutcome>
-where
-    A: StorageAdapter + ?Sized,
-    C: FnMut() -> lios_core::Result<bool>,
-    P: FnMut(CatalogTransactionProgress) -> lios_core::Result<()>,
-{
-    execute_catalog_transaction(
-        adapter,
-        &repo.namespace,
-        &repo.dataset,
-        CatalogTransactionSpec {
-            uploads: work.upload,
-            delete_paths: work.delete,
-            initial_remote_inventory: work.initial_remote_inventory,
-            prepublish_safe_paths: work.prepublish_safe_paths,
-            base_catalog_sha256: work.base_catalog_sha256,
-            expected_revision: work.expected_revision,
-            probe_directory: work.probe_directory,
-        },
-        should_cancel,
-        on_progress,
-    )
-    .await
-    .map_err(to_err)
-}
-
-async fn sync_current_catalog(
-    paths: &LiosPaths,
-    catalog: &Catalog,
-    key: &KeyFile,
-    adapter: &ModelScopeAdapter,
-    repo: &RepoConfig,
-    baseline: CatalogBaseline,
-) -> CommandResult<Vec<String>> {
-    let work = plan_catalog_sync(paths, catalog, key, baseline)?;
-    match execute_sync_work(adapter, repo, work, || Ok(false), |_progress| Ok(())).await? {
-        CatalogTransactionOutcome::Completed { warnings } => Ok(warnings),
-        CatalogTransactionOutcome::Canceled => Err(CommandError::new(
-            CommandErrorCode::Internal,
-            "catalog transaction was unexpectedly canceled",
-            false,
-            None,
         )),
     }
 }
