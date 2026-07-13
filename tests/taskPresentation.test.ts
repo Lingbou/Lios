@@ -9,9 +9,9 @@ import {
   taskLabelText,
   taskProgressPercent,
   taskProgressText,
-  taskStatusText
-} from "../src/taskPresentation.ts";
-import { taskActionsForTask } from "../src/features/tasks/taskPresentation.ts";
+  taskStatusText,
+  taskActionsForTask
+} from "../src/features/tasks/taskPresentation.ts";
 
 test("task states expose only their real supported actions", () => {
   assert.deepEqual(taskActionsForTask({ state: "Queued", can_retry: false }), ["pause", "cancel"]);

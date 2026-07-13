@@ -14,6 +14,8 @@ use crate::{LiosError, Result};
 const TASK_SCHEMA_VERSION: i64 = 4;
 const INVALID_TASK_SPEC_MESSAGE: &str = "persisted task specification is invalid";
 const DEFAULT_TASK_CHUNK_SIZE: usize = 128 * 1024 * 1024;
+const TERMINAL_TASK_RETENTION_DAYS: i64 = 30;
+const MAX_TERMINAL_TASKS: usize = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskState {
@@ -933,20 +935,6 @@ impl TaskStore {
             .transpose()
     }
 
-    pub fn list_queued_with_specs(&self) -> Result<Vec<(TaskRecord, TaskSpec)>> {
-        let mut queued = Vec::new();
-        for task in self
-            .list()?
-            .into_iter()
-            .filter(|task| task.state == TaskState::Queued)
-        {
-            if let Some(spec) = self.load_spec(task.id)? {
-                queued.push((task, spec));
-            }
-        }
-        Ok(queued)
-    }
-
     pub fn list_queued_summaries_with_specs(&self) -> Result<Vec<(TaskSummary, TaskSpec)>> {
         self.query_summaries_with_specs(TaskState::Queued, None)
     }
@@ -1080,15 +1068,6 @@ impl TaskStore {
 
     pub fn list_items(&self, task_id: Uuid) -> Result<Vec<TaskItem>> {
         list_items_window_on(&self.connection, task_id, 0, -1)
-    }
-
-    pub fn list_items_page(&self, task_id: Uuid, offset: u64, limit: u64) -> Result<Vec<TaskItem>> {
-        list_items_window_on(
-            &self.connection,
-            task_id,
-            sqlite_integer(offset, "task item page offset")?,
-            sqlite_integer(limit, "task item page limit")?,
-        )
     }
 
     pub fn get_items_page(
@@ -1451,6 +1430,51 @@ impl TaskStore {
         Ok(())
     }
 
+    pub fn prune_terminal_history(&mut self) -> Result<Vec<Uuid>> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(TERMINAL_TASK_RETENTION_DAYS))
+            .to_rfc3339();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let candidates = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT id, updated_at
+                FROM tasks
+                WHERE state IN (?1, ?2, ?3)
+                ORDER BY updated_at DESC, rowid DESC
+                "#,
+            )?;
+            let rows = statement.query_map(
+                rusqlite::params![
+                    TaskState::Failed.as_str(),
+                    TaskState::Completed.as_str(),
+                    TaskState::Canceled.as_str(),
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            let mut candidates = Vec::new();
+            for row in rows {
+                candidates.push(row?);
+            }
+            candidates
+        };
+        let mut removed = Vec::new();
+        for (index, (id, updated_at)) in candidates.into_iter().enumerate() {
+            if index < MAX_TERMINAL_TASKS && updated_at >= cutoff {
+                continue;
+            }
+            let id = Uuid::parse_str(&id)?;
+            transaction.execute(
+                "DELETE FROM tasks WHERE id = ?1",
+                rusqlite::params![id.to_string()],
+            )?;
+            removed.push(id);
+        }
+        transaction.commit()?;
+        Ok(removed)
+    }
+
     pub fn list(&self) -> Result<Vec<TaskRecord>> {
         let mut tasks = Vec::new();
         for summary in self.list_summaries()? {
@@ -1486,7 +1510,13 @@ impl TaskStore {
                    (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id),
                    CASE WHEN tasks.state = 'Failed' THEN spec_json ELSE NULL END
             FROM tasks
-            ORDER BY tasks.rowid ASC
+            ORDER BY
+                CASE
+                    WHEN tasks.state IN ('Failed', 'Completed', 'Canceled') THEN 1
+                    ELSE 0
+                END ASC,
+                tasks.updated_at DESC,
+                tasks.rowid DESC
             "#,
         )?;
         let rows = statement.query_map([], raw_task_summary)?;
@@ -1518,7 +1548,28 @@ impl TaskStore {
     }
 
     pub fn get(&self, id: Uuid) -> Result<Option<TaskRecord>> {
-        Ok(self.list()?.into_iter().find(|task| task.id == id))
+        let Some(summary) = self.get_summary(id)? else {
+            return Ok(None);
+        };
+        Ok(Some(TaskRecord {
+            id: summary.id,
+            account_id: summary.account_id,
+            space_id: summary.space_id,
+            state: summary.state,
+            label: summary.label,
+            phase: summary.phase,
+            progress_total: summary.progress_total,
+            progress_done: summary.progress_done,
+            bytes_total: summary.bytes_total,
+            bytes_done: summary.bytes_done,
+            speed_bps: summary.speed_bps,
+            eta_seconds: summary.eta_seconds,
+            attempt: summary.attempt,
+            created_at: summary.created_at,
+            updated_at: summary.updated_at,
+            error: summary.error,
+            items: self.list_items(id)?,
+        }))
     }
 }
 

@@ -60,13 +60,14 @@ export type TaskItemsPage = {
   items: TaskItem[];
 };
 
-export type TaskUpdateEvent = {
-  tasks: TaskSummary[];
-};
+export type TaskUpdateEvent =
+  | { kind: "upsert"; task: TaskSummary }
+  | { kind: "remove"; task_ids: string[] };
 
 export type TaskApi = {
   listTasks: () => Promise<TaskSummary[]>;
+  getTask: (taskId: string) => Promise<TaskSummary | null>;
   listTaskItems: (taskId: string, offset: number, limit: number) => Promise<TaskItemsPage>;
-  runAction: (action: TaskAction, taskId: string) => Promise<TaskSummary[]>;
-  subscribe: (listener: (tasks: TaskSummary[]) => void) => Promise<() => void>;
+  runAction: (action: TaskAction, taskId: string) => Promise<void>;
+  subscribe: (listener: (event: TaskUpdateEvent) => void) => Promise<() => void>;
 };
