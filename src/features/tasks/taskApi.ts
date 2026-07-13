@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { TaskAction, TaskApi, TaskItemsPage, TaskSummary, TaskUpdateEvent } from "./taskTypes.ts";
 
 type InvokeTask = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
-type SubscribeTasks = (listener: (tasks: TaskSummary[]) => void) => Promise<() => void>;
+type SubscribeTasks = (listener: (event: TaskUpdateEvent) => void) => Promise<() => void>;
 
 const actionCommands: Record<TaskAction, string> = {
   pause: "pause_task",
@@ -13,8 +13,8 @@ const actionCommands: Record<TaskAction, string> = {
   clear: "clear_task"
 };
 
-async function subscribeToTauriTasks(listener: (tasks: TaskSummary[]) => void) {
-  return listen<TaskUpdateEvent>("lios-tasks-updated", (event) => listener(event.payload.tasks));
+async function subscribeToTauriTasks(listener: (event: TaskUpdateEvent) => void) {
+  return listen<TaskUpdateEvent>("lios-task-updated", (event) => listener(event.payload));
 }
 
 export function createTaskApi(
@@ -23,10 +23,10 @@ export function createTaskApi(
 ): TaskApi {
   return {
     listTasks: () => invokeTask<TaskSummary[]>("list_tasks"),
+    getTask: (taskId) => invokeTask<TaskSummary | null>("get_task", { taskId }),
     listTaskItems: (taskId, offset, limit) =>
       invokeTask<TaskItemsPage>("list_task_items", { taskId, offset, limit }),
-    runAction: (action, taskId) =>
-      invokeTask<TaskSummary[]>(actionCommands[action], { taskId }),
+    runAction: (action, taskId) => invokeTask<void>(actionCommands[action], { taskId }),
     subscribe: subscribeTasks
   };
 }

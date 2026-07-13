@@ -162,7 +162,6 @@ type Snapshot = {
   recovery_key: RecoveryKeyStatus;
   has_token: boolean;
   active_task_space_id: string | null;
-  tasks: TaskSummary[];
   warning: SetupWarning | null;
 };
 
@@ -202,7 +201,6 @@ function previewSnapshot(): Snapshot {
     },
     has_token: false,
     active_task_space_id: null,
-    tasks: [],
     warning: null
   };
 }
@@ -291,16 +289,6 @@ function findNode(node: CatalogTreeNode | null, id: string | null): CatalogTreeN
   return null;
 }
 
-function findParentId(node: CatalogTreeNode | null, targetId: string): string | null {
-  if (!node || node.kind.type !== "Directory") return null;
-  for (const child of node.kind.children) {
-    if (child.id === targetId) return node.id;
-    const nested = findParentId(child, targetId);
-    if (nested) return nested;
-  }
-  return null;
-}
-
 function breadcrumb(node: CatalogTreeNode | null, targetId: string | null): CatalogTreeNode[] {
   if (!node) return [];
   if (!targetId || node.id === targetId) return [node];
@@ -382,7 +370,6 @@ function App() {
     onAction: runTaskAction,
     listTaskItems,
     refreshTasks,
-    syncTasks,
     upsertTask
   } = useTasks({ api: taskApi, onError: handleTaskError });
   const [pendingUpload, setPendingUpload] = useState<string[]>([]);
@@ -396,7 +383,6 @@ function App() {
   const catalogMutationCompletionBaselineReady = useRef(false);
   const rebuildPreviewRequest = useRef(0);
 
-  const configured = Boolean(snapshot?.has_token && snapshot.config.key_file_path);
   const currentFolder = findNode(catalogTree, currentFolderId);
   const children =
     currentFolder?.kind.type === "Directory" ? currentFolder.kind.children.map(treeToDriveItem) : [];
@@ -463,11 +449,6 @@ function App() {
 
   async function refreshSetup(loadSpaces = true) {
     const next = await appInvoke<Snapshot>("current_setup");
-    if (!catalogMutationCompletionBaselineReady.current) {
-      seedCatalogMutationCompletions(catalogMutationCompletions.current, next.tasks);
-      catalogMutationCompletionBaselineReady.current = true;
-      syncTasks(next.tasks);
-    }
     setSnapshot(next);
     const warning = setupWarningMessage(next.warning);
     if (warning) setMessage(warning);
@@ -528,7 +509,6 @@ function App() {
     try {
       await action();
       await refreshSetup(false);
-      await refreshTasks().catch(() => undefined);
     } catch (error) {
       setMessage(errorText(error));
       await refreshSetup(false).catch(() => undefined);
@@ -543,7 +523,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!tasksReady || !catalogMutationCompletionBaselineReady.current) return;
+    if (!tasksReady) return;
+    if (!catalogMutationCompletionBaselineReady.current) {
+      seedCatalogMutationCompletions(catalogMutationCompletions.current, tasks);
+      catalogMutationCompletionBaselineReady.current = true;
+      return;
+    }
     if (!activeSpace?.task_space_id) return;
 
     const completedMutations = newCatalogMutationCompletions(
@@ -618,7 +603,6 @@ function App() {
       await refreshSetup(false);
     } catch (error) {
       setMessage(errorText(error));
-      await refreshTasks().catch(() => undefined);
     } finally {
       setBusy(null);
     }
@@ -1001,7 +985,6 @@ function App() {
 
     upsertTask(task);
     setRebuildDialog(null);
-    await refreshTasks().catch(() => undefined);
   }
 
   async function selectAccount() {

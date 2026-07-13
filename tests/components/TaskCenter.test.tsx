@@ -110,12 +110,13 @@ test("task details load lazily only after expansion", async () => {
 });
 
 test("a pending action disables only that task controls", async () => {
-  let resolveAction: ((tasks: TaskSummary[]) => void) | undefined;
-  const actionPromise = new Promise<TaskSummary[]>((resolve) => {
+  let resolveAction: (() => void) | undefined;
+  const actionPromise = new Promise<void>((resolve) => {
     resolveAction = resolve;
   });
   const api: TaskApi = {
     listTasks: async () => [summary(), summary({ id: "task-b" })],
+    getTask: async (taskId) => summary({ id: taskId }),
     listTaskItems: async (taskId, offset) => ({ task_id: taskId, offset, total: 0, items: [] }),
     runAction: async () => actionPromise,
     subscribe: async () => () => undefined
@@ -125,7 +126,7 @@ test("a pending action disables only that task controls", async () => {
     const tasks = useTasks({
       api,
       initialTasks: [summary(), summary({ id: "task-b" })],
-      pollingIntervalMs: 0,
+      fallbackAfterMs: 0,
       onError: () => undefined
     });
     return <TaskCenter {...tasks} />;
@@ -142,7 +143,7 @@ test("a pending action disables only that task controls", async () => {
   expect(within(rows[1]).getByRole("button", { name: "暂停任务" })).toBeEnabled();
   expect(within(rows[1]).getByRole("button", { name: "取消任务" })).toBeEnabled();
 
-  resolveAction?.([summary(), summary({ id: "task-b" })]);
+  resolveAction?.();
   await waitFor(() =>
     expect(within(rows[0]).getByRole("button", { name: "暂停任务" })).toBeEnabled()
   );

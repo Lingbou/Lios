@@ -125,13 +125,14 @@ struct SetupSnapshot {
     recovery_key: RecoveryKeyStatus,
     has_token: bool,
     active_task_space_id: Option<String>,
-    tasks: Vec<TaskSummary>,
     warning: Option<SetupWarning>,
 }
 
 #[derive(Clone, Serialize)]
-struct TaskUpdateEvent {
-    tasks: Vec<TaskSummary>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TaskUpdateEvent {
+    Upsert { task: Box<TaskSummary> },
+    Remove { task_ids: Vec<Uuid> },
 }
 
 #[derive(Debug, Serialize)]
@@ -302,9 +303,27 @@ fn task_summaries_for_paths(paths: &LiosPaths) -> CommandResult<Vec<TaskSummary>
         .map_err(to_err)
 }
 
-fn emit_tasks(app: &tauri::AppHandle, paths: &LiosPaths) {
-    if let Ok(tasks) = task_summaries_for_paths(paths) {
-        let _ = app.emit("lios-tasks-updated", TaskUpdateEvent { tasks });
+fn task_summary_for_paths(paths: &LiosPaths, task_id: Uuid) -> CommandResult<Option<TaskSummary>> {
+    task_store(paths)?
+        .get_summary(task_id)
+        .map(|task| task.map(webview_safe_task_summary))
+        .map_err(to_err)
+}
+
+fn emit_task(app: &tauri::AppHandle, paths: &LiosPaths, task_id: Uuid) {
+    if let Ok(Some(task)) = task_summary_for_paths(paths, task_id) {
+        let _ = app.emit(
+            "lios-task-updated",
+            TaskUpdateEvent::Upsert {
+                task: Box::new(task),
+            },
+        );
+    }
+}
+
+fn emit_removed_tasks(app: &tauri::AppHandle, task_ids: Vec<Uuid>) {
+    if !task_ids.is_empty() {
+        let _ = app.emit("lios-task-updated", TaskUpdateEvent::Remove { task_ids });
     }
 }
 
@@ -468,7 +487,7 @@ fn persist_transaction_progress(
     )?;
     store.update_eta(task.id, task.eta_seconds)?;
     if let Some(app) = app {
-        emit_tasks(app, paths);
+        emit_task(app, paths, task.id);
     }
     Ok(())
 }
@@ -1113,8 +1132,8 @@ fn cleanup_terminal_task_staging_and_record(
     Ok(())
 }
 
-fn cleanup_terminal_task_staging_after_restart(paths: &LiosPaths) -> lios_core::Result<()> {
-    let store = TaskStore::open(&paths.database)?;
+fn cleanup_terminal_task_staging_after_restart(paths: &LiosPaths) -> lios_core::Result<Vec<Uuid>> {
+    let mut store = TaskStore::open(&paths.database)?;
     for task in store.list_summaries()? {
         if task_state_is_active(&task.state) {
             continue;
@@ -1129,12 +1148,12 @@ fn cleanup_terminal_task_staging_after_restart(paths: &LiosPaths) -> lios_core::
         cleanup_terminal_task_staging_and_record(&task_paths, &spec, task.id)
             .map_err(|error| lios_core::LiosError::Storage(error.message))?;
     }
-    Ok(())
+    store.prune_terminal_history()
 }
 
 async fn cleanup_terminal_task_staging_after_restart_async(
     paths: LiosPaths,
-) -> lios_core::Result<()> {
+) -> lios_core::Result<Vec<Uuid>> {
     tokio::task::spawn_blocking(move || cleanup_terminal_task_staging_after_restart(&paths))
         .await
         .map_err(|error| {
@@ -1148,8 +1167,9 @@ fn start_terminal_task_staging_cleanup(app: &tauri::AppHandle, paths: &LiosPaths
     let app = app.clone();
     let paths = paths.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = cleanup_terminal_task_staging_after_restart_async(paths.clone()).await;
-        emit_tasks(&app, &paths);
+        if let Ok(removed) = cleanup_terminal_task_staging_after_restart_async(paths).await {
+            emit_removed_tasks(&app, removed);
+        }
     });
 }
 
@@ -1227,7 +1247,7 @@ fn submit_and_spawn(
 ) -> CommandResult<TaskSummary> {
     let task = persist_submission(&state.paths, &spec, source_files).map_err(to_err)?;
     let summary = submission_summary(&task)?;
-    emit_tasks(app, &state.paths);
+    emit_task(app, &state.paths, task.id);
     spawn_persisted_task(app.clone(), task.id);
     Ok(summary)
 }
@@ -1366,7 +1386,7 @@ async fn reconcile_catalog_checkpoint_loop(
             .map_err(to_err)
     })
     .await?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task_id);
 
     let mut attempt = starting_attempt.max(1);
     loop {
@@ -1415,7 +1435,7 @@ async fn reconcile_catalog_checkpoint_loop(
                         .map_err(to_err)
                 })
                 .await?;
-                emit_tasks(app, paths);
+                emit_task(app, paths, task_id);
                 tokio::time::sleep(retry_backoff(attempt)).await;
                 attempt = attempt.saturating_add(1);
             }
@@ -1610,7 +1630,7 @@ async fn run_catalog_reconciliation_locked(
             log_persisted_task_outcome(&app, &paths, task_id, error);
         }
     }
-    emit_tasks(&app, &paths);
+    emit_task(&app, &paths, task_id);
     result
 }
 
@@ -1674,7 +1694,7 @@ async fn run_startup_space_work(
                     task_id,
                     Some((error.code, error.retryable)),
                 );
-                emit_tasks(&app, &state.paths);
+                emit_task(&app, &state.paths, task_id);
                 return;
             }
         }
@@ -1739,7 +1759,7 @@ async fn run_startup_space_work(
                         task_id,
                         Some((reconcile_error.code, reconcile_error.retryable)),
                     );
-                    emit_tasks(&app, &state.paths);
+                    emit_task(&app, &state.paths, task_id);
                     return;
                 }
             }
@@ -1768,7 +1788,7 @@ async fn run_startup_space_work(
             .await
             .active_workers
             .remove(&task_id);
-        emit_tasks(&app, &state.paths);
+        emit_task(&app, &state.paths, task_id);
         return;
     }
 }
@@ -1813,7 +1833,7 @@ fn spawn_persisted_task(app: tauri::AppHandle, task_id: Uuid) {
                 .await
                 .active_workers
                 .remove(&task_id);
-            emit_tasks(&app, &state.paths);
+            emit_task(&app, &state.paths, task_id);
         }
     });
 }
@@ -1892,7 +1912,7 @@ async fn run_persisted_task_locked(
             .insert(task_id);
     }
     let control = manager.register(task_id).await;
-    emit_tasks(&app, &paths);
+    emit_task(&app, &paths, task_id);
     let mut terminal_error = None;
     let finalization = async {
         loop {
@@ -2036,7 +2056,7 @@ async fn run_persisted_task_locked(
                         task = store.get(task_id).map_err(to_err)?.ok_or_else(|| {
                             CommandError::invalid_input("reconciled task disappeared before replay")
                         })?;
-                        emit_tasks(&app, &paths);
+                        emit_task(&app, &paths, task_id);
                         continue;
                     }
                     let applied =
@@ -2071,7 +2091,11 @@ async fn run_persisted_task_locked(
     .await;
     manager.remove(&control).await;
     let staging_cleanup = cleanup_terminal_task_staging_and_record(&task_paths, &spec, task_id);
-    emit_tasks(&app, &paths);
+    let removed = task_store(&paths)
+        .and_then(|mut store| store.prune_terminal_history().map_err(to_err))
+        .unwrap_or_default();
+    emit_task(&app, &paths, task_id);
+    emit_removed_tasks(&app, removed);
     let result = match finalization {
         Ok(()) => staging_cleanup,
         Err(error) => Err(error),
@@ -2109,7 +2133,7 @@ async fn execute_task_with_retries(
                             &error.message,
                         )
                         .map_err(to_err)?;
-                    emit_tasks(app, paths);
+                    emit_task(app, paths, task.id);
                     return Ok(TaskWorkerOutcome::NeedsReconciliation);
                 }
                 drop(store);
@@ -2159,7 +2183,7 @@ async fn execute_task_with_retries(
                         false,
                     )
                     .map_err(to_err)?;
-                emit_tasks(app, paths);
+                emit_task(app, paths, task.id);
                 drop(store);
                 tokio::select! {
                     _ = tokio::time::sleep(retry_backoff(next_attempt)) => {}
@@ -2187,7 +2211,7 @@ async fn execute_task_with_retries(
                     item.error = None;
                     store.upsert_item(item).map_err(to_err)?;
                 }
-                emit_tasks(app, paths);
+                emit_task(app, paths, task.id);
             }
         }
     }
@@ -2290,7 +2314,7 @@ async fn run_upload_worker(
     let (catalog, baseline) = download_catalog_baseline(paths, &key, &adapter, &repo).await?;
     validate_task_sources(&source_paths, &source_snapshot, &task.items).map_err(to_err)?;
     update_task_phase(paths, task.id, Some("preparing".to_string()))?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task.id);
     let mut preparing_metrics = TransferMetrics::new();
     let item_store = TaskStore::open(&paths.database).map_err(to_err)?;
     let mut item_progress_error = None;
@@ -2343,7 +2367,7 @@ async fn run_upload_worker(
                             eta_seconds: observation.eta_seconds,
                         },
                     );
-                    emit_tasks(app, paths);
+                    emit_task(app, paths, task.id);
                 }
             },
         )
@@ -2539,7 +2563,7 @@ async fn run_download_worker(
             eta_seconds: initial_observation.eta_seconds,
         },
     )?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task.id);
     for (index, (file, local_path, was_cached)) in download_plan.iter().enumerate() {
         if let Some(interrupted) =
             observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
@@ -2570,7 +2594,7 @@ async fn run_download_worker(
                                 eta_seconds: observation.eta_seconds,
                             },
                         );
-                        emit_tasks(app, paths);
+                        emit_task(app, paths, task.id);
                     }
                 },
             );
@@ -2624,7 +2648,7 @@ async fn run_download_worker(
                 eta_seconds: observation.eta_seconds,
             },
         )?;
-        emit_tasks(app, paths);
+        emit_task(app, paths, task.id);
     }
     if let Some(interrupted) =
         observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
@@ -2632,7 +2656,7 @@ async fn run_download_worker(
         return Ok(TaskWorkerOutcome::Interrupted(interrupted));
     }
     update_task_phase(paths, task.id, Some("restoring".to_string()))?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task.id);
     catalog
         .restore(
             selection,
@@ -2657,7 +2681,7 @@ async fn run_download_worker(
             eta_seconds: observation.eta_seconds,
         },
     )?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task.id);
     Ok(TaskWorkerOutcome::Completed)
 }
 
@@ -3074,7 +3098,7 @@ async fn run_verify_space_worker(
             eta_seconds: None,
         },
     )?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task.id);
 
     let catalog_path = paths.staging.join(CATALOG_FILE);
     let mut catalog_metrics = TransferMetrics::new();
@@ -3098,7 +3122,7 @@ async fn run_verify_space_worker(
                         eta_seconds: observation.eta_seconds,
                     },
                 );
-                emit_tasks(app, paths);
+                emit_task(app, paths, task.id);
             }
         },
     );
@@ -3133,7 +3157,7 @@ async fn run_verify_space_worker(
                 eta_seconds: None,
             },
         )?;
-        emit_tasks(app, paths);
+        emit_task(app, paths, task.id);
         if !ensure_verification_snapshot_is_current(
             &branch_adapter,
             &repo,
@@ -3229,7 +3253,7 @@ async fn run_verify_space_worker(
             eta_seconds: None,
         },
     )?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task.id);
 
     let mut download_metrics = TransferMetrics::new();
     let _ = download_metrics.observe(task.bytes_done, download_total_bytes, true);
@@ -3263,7 +3287,7 @@ async fn run_verify_space_worker(
                                 eta_seconds: observation.eta_seconds,
                             },
                         );
-                        emit_tasks(app, paths);
+                        emit_task(app, paths, task.id);
                     }
                 },
             );
@@ -3328,7 +3352,7 @@ async fn run_verify_space_worker(
                 eta_seconds: observation.eta_seconds,
             },
         )?;
-        emit_tasks(app, paths);
+        emit_task(app, paths, task.id);
     }
 
     update_task_phase(paths, task.id, Some("verifying_content".to_string()))?;
@@ -3344,7 +3368,7 @@ async fn run_verify_space_worker(
             eta_seconds: None,
         },
     )?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task.id);
     let verify_catalog = catalog.clone();
     let verify_key = key.clone();
     let verify_cancellation = cancellation.clone();
@@ -3386,7 +3410,7 @@ async fn run_verify_space_worker(
             eta_seconds: None,
         },
     )?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task.id);
     if !ensure_verification_snapshot_is_current(
         &branch_adapter,
         &repo,
@@ -3490,7 +3514,7 @@ async fn run_rebuild_catalog_worker(
                         eta_seconds: observation.eta_seconds,
                     },
                 )?;
-                emit_tasks(app, paths);
+                emit_task(app, paths, task.id);
             }
             task.progress_done = done;
             task.progress_total = total_steps;
@@ -3521,7 +3545,7 @@ async fn run_rebuild_catalog_worker(
             eta_seconds: None,
         },
     )?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task.id);
     let Some((catalog, report)) =
         rebuild_staged_catalog(&key, paths, remote_objects.clone(), cancellation).await?
     else {
@@ -3543,7 +3567,7 @@ async fn run_rebuild_catalog_worker(
             eta_seconds: None,
         },
     )?;
-    emit_tasks(app, paths);
+    emit_task(app, paths, task.id);
     if !ensure_verification_snapshot_is_current(
         &branch_adapter,
         &repo,
@@ -3839,14 +3863,12 @@ fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnap
         .active_repo
         .as_ref()
         .map(|repo| TaskScope::from_repo(repo).space_id);
-    let tasks = task_summaries_for_paths(&state.paths)?;
     Ok(SetupSnapshot {
         paths: paths_dto(&state.paths),
         recovery_key: recovery_key_status(&config),
         config,
         has_token: state.paths.credentials.exists(),
         active_task_space_id,
-        tasks,
         warning,
     })
 }
@@ -3883,36 +3905,6 @@ async fn create_dataset_repo(
 }
 
 #[tauri::command]
-async fn connect_dataset_repo(
-    state: tauri::State<'_, AppContext>,
-    namespace: String,
-    dataset: String,
-    endpoint: String,
-) -> CommandResult<()> {
-    state.paths.ensure_dirs().map_err(to_err)?;
-    let repo = validate_repo(RepoConfig {
-        namespace,
-        dataset,
-        endpoint,
-    })?;
-    let token = read_token(&state.paths)?;
-    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
-    if !adapter
-        .repo_exists(&repo.namespace, &repo.dataset)
-        .await
-        .map_err(to_err)?
-    {
-        return Err(CommandError::invalid_input(
-            "dataset repo was not found or is not visible",
-        ));
-    }
-    let _config_guard = state.config_mutation_gate.lock()?;
-    let mut config = load_config(&state.paths)?;
-    config.active_repo = Some(repo);
-    persist_config(&state.paths, &mut config)
-}
-
-#[tauri::command]
 async fn list_dataset_repos(
     state: tauri::State<'_, AppContext>,
     endpoint: Option<String>,
@@ -3931,15 +3923,6 @@ async fn list_dataset_repos(
         .map(DatasetRepoSummaryDto::from)
         .collect();
     Ok(DatasetRepoListResult { user, repositories })
-}
-
-#[tauri::command]
-fn select_dataset_repo(state: tauri::State<'_, AppContext>, repo: RepoConfig) -> CommandResult<()> {
-    let repo = validate_repo(repo)?;
-    let _config_guard = state.config_mutation_gate.lock()?;
-    let mut config = load_config(&state.paths)?;
-    config.active_repo = Some(repo);
-    persist_config(&state.paths, &mut config)
 }
 
 #[tauri::command]
@@ -4444,6 +4427,14 @@ fn list_tasks(state: tauri::State<'_, AppContext>) -> CommandResult<Vec<TaskSumm
 }
 
 #[tauri::command]
+fn get_task(
+    state: tauri::State<'_, AppContext>,
+    task_id: Uuid,
+) -> CommandResult<Option<TaskSummary>> {
+    task_summary_for_paths(&state.paths, task_id)
+}
+
+#[tauri::command]
 fn list_task_items(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
@@ -4475,7 +4466,7 @@ async fn pause_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
-) -> CommandResult<Vec<TaskSummary>> {
+) -> CommandResult<()> {
     interrupt_task_state(
         &state.paths,
         &state.task_lifecycle_gate,
@@ -4484,12 +4475,8 @@ async fn pause_task(
     )
     .await?;
     state.task_manager.cancel(task_id).await;
-    let store = task_store(&state.paths)?;
-    emit_tasks(&app, &state.paths);
-    store
-        .list_summaries()
-        .map(webview_safe_task_summaries)
-        .map_err(to_err)
+    emit_task(&app, &state.paths, task_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -4497,24 +4484,11 @@ async fn resume_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
-) -> CommandResult<Vec<TaskSummary>> {
+) -> CommandResult<()> {
     if state.task_manager.is_running(task_id).await {
-        let app_handle = app.clone();
-        let paths = state.paths.clone();
-        let manager = state.task_manager.clone();
-        tauri::async_runtime::spawn(async move {
-            manager.wait_until_stopped(task_id).await;
-            if TaskStore::open(&paths.database)
-                .and_then(|store| {
-                    store.transition_state(task_id, TaskState::Paused, TaskState::Queued)
-                })
-                .unwrap_or(false)
-            {
-                emit_tasks(&app_handle, &paths);
-                spawn_persisted_task(app_handle, task_id);
-            }
-        });
-    } else if task_store(&state.paths)?
+        state.task_manager.wait_until_stopped(task_id).await;
+    }
+    if task_store(&state.paths)?
         .transition_state(task_id, TaskState::Paused, TaskState::Queued)
         .map_err(to_err)?
     {
@@ -4522,12 +4496,8 @@ async fn resume_task(
     } else {
         return Err(CommandError::invalid_input("only paused tasks can resume"));
     }
-    let store = task_store(&state.paths)?;
-    emit_tasks(&app, &state.paths);
-    store
-        .list_summaries()
-        .map(webview_safe_task_summaries)
-        .map_err(to_err)
+    emit_task(&app, &state.paths, task_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -4535,7 +4505,7 @@ async fn retry_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
-) -> CommandResult<Vec<TaskSummary>> {
+) -> CommandResult<()> {
     if state.task_manager.is_running(task_id).await {
         return Err(CommandError::invalid_input(
             "task worker must stop before retrying",
@@ -4547,12 +4517,9 @@ async fn retry_task(
             "only failed tasks with a saved specification can retry",
         ));
     }
-    emit_tasks(&app, &state.paths);
+    emit_task(&app, &state.paths, task_id);
     spawn_persisted_task(app.clone(), task_id);
-    store
-        .list_summaries()
-        .map(webview_safe_task_summaries)
-        .map_err(to_err)
+    Ok(())
 }
 
 #[tauri::command]
@@ -4560,7 +4527,7 @@ async fn cancel_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
-) -> CommandResult<Vec<TaskSummary>> {
+) -> CommandResult<()> {
     interrupt_task_state(
         &state.paths,
         &state.task_lifecycle_gate,
@@ -4569,12 +4536,8 @@ async fn cancel_task(
     )
     .await?;
     state.task_manager.cancel(task_id).await;
-    let store = task_store(&state.paths)?;
-    emit_tasks(&app, &state.paths);
-    store
-        .list_summaries()
-        .map(webview_safe_task_summaries)
-        .map_err(to_err)
+    emit_task(&app, &state.paths, task_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -4582,14 +4545,10 @@ async fn clear_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
-) -> CommandResult<Vec<TaskSummary>> {
+) -> CommandResult<()> {
     clear_task_record(&state.paths, &state.task_lifecycle_gate, task_id).await?;
-    let store = task_store(&state.paths)?;
-    emit_tasks(&app, &state.paths);
-    store
-        .list_summaries()
-        .map(webview_safe_task_summaries)
-        .map_err(to_err)
+    emit_removed_tasks(&app, vec![task_id]);
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -4619,7 +4578,6 @@ pub fn run() {
                 }),
             );
             start_terminal_task_staging_cleanup(&handle, &paths);
-            emit_tasks(&handle, &paths);
             start_startup_tasks(&handle, &paths, recovery)?;
             Ok(())
         })
@@ -4718,7 +4676,7 @@ mod task_center_backend_tests {
     }
 
     #[test]
-    fn setup_and_task_events_serialize_summaries_without_item_details() {
+    fn setup_omits_tasks_and_targeted_events_serialize_safe_summaries() {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         let config = LiosConfig::default();
@@ -4729,13 +4687,14 @@ mod task_center_backend_tests {
             config,
             has_token: false,
             active_task_space_id: None,
-            tasks: vec![task.clone()],
             warning: None,
         };
-        let event = TaskUpdateEvent { tasks: vec![task] };
+        let event = TaskUpdateEvent::Upsert {
+            task: Box::new(task),
+        };
 
-        assert_summary_json(&serde_json::to_value(setup).unwrap()["tasks"][0]);
-        assert_summary_json(&serde_json::to_value(event).unwrap()["tasks"][0]);
+        assert!(serde_json::to_value(setup).unwrap().get("tasks").is_none());
+        assert_summary_json(&serde_json::to_value(event).unwrap()["task"]);
     }
 
     #[tokio::test]
@@ -4769,8 +4728,8 @@ mod task_center_backend_tests {
             .get_summary(task.id)
             .unwrap()
             .unwrap();
-        let event = serde_json::to_string(&TaskUpdateEvent {
-            tasks: vec![summary.clone()],
+        let event = serde_json::to_string(&TaskUpdateEvent::Upsert {
+            task: Box::new(summary.clone()),
         })
         .unwrap();
 
