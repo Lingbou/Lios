@@ -220,7 +220,7 @@ impl From<LiosError> for CommandError {
                 false,
                 None,
             ),
-            LiosError::InvalidV2Format(_) | LiosError::UnexpectedV2Kind { .. } => Self::new(
+            LiosError::InvalidV1Format(_) | LiosError::UnexpectedV1Kind { .. } => Self::new(
                 CommandErrorCode::CorruptedData,
                 "encrypted data has an invalid format",
                 false,
@@ -400,11 +400,11 @@ mod tests {
             CommandErrorCode::CorruptedData
         );
         assert_eq!(
-            CommandError::from(LiosError::InvalidV2Format("truncated envelope")).code,
+            CommandError::from(LiosError::InvalidV1Format("truncated envelope")).code,
             CommandErrorCode::CorruptedData
         );
         assert_eq!(
-            CommandError::from(LiosError::UnexpectedV2Kind {
+            CommandError::from(LiosError::UnexpectedV1Kind {
                 expected: 1,
                 actual: 2,
             })

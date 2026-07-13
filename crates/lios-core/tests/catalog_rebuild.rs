@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use lios_core::{
     catalog::{
         Catalog, CatalogRebuildOutcome, CatalogRebuildReport, CatalogSelection, CatalogTreeNode,
-        CatalogTreeNodeKind, NodeDescriptorV2, ObjectManifestV2,
+        CatalogTreeNodeKind, NodeDescriptorV1, ObjectManifestV1,
     },
     crypto::KeyFile,
-    format_v2::{decrypt_envelope_v2, encrypt_envelope_v2, parse_envelope_v2, EnvelopeKindV2},
+    format_v1::{decrypt_envelope_v1, encrypt_envelope_v1, parse_envelope_v1, EnvelopeKindV1},
     pack::{PackOptions, PackSource},
     storage::StorageObject,
 };
@@ -108,9 +108,9 @@ fn descriptor_path_named(fixture: &RecoveryFixture, name: &str) -> String {
         .find(|path| {
             let encrypted = fs::read(fixture.staging.join(path)).unwrap();
             let plaintext =
-                decrypt_envelope_v2(&fixture.key, EnvelopeKindV2::NodeDescriptor, &encrypted)
+                decrypt_envelope_v1(&fixture.key, EnvelopeKindV1::NodeDescriptor, &encrypted)
                     .unwrap();
-            serde_json::from_slice::<NodeDescriptorV2>(&plaintext)
+            serde_json::from_slice::<NodeDescriptorV1>(&plaintext)
                 .unwrap()
                 .name
                 == name
@@ -132,16 +132,16 @@ fn refresh_remote_object(fixture: &mut RecoveryFixture, path: &str) {
 fn rewrite_descriptor(
     fixture: &mut RecoveryFixture,
     path: &str,
-    mutate: impl FnOnce(&mut NodeDescriptorV2),
+    mutate: impl FnOnce(&mut NodeDescriptorV1),
 ) {
     let encrypted = fs::read(fixture.staging.join(path)).unwrap();
     let plaintext =
-        decrypt_envelope_v2(&fixture.key, EnvelopeKindV2::NodeDescriptor, &encrypted).unwrap();
-    let mut descriptor: NodeDescriptorV2 = serde_json::from_slice(&plaintext).unwrap();
+        decrypt_envelope_v1(&fixture.key, EnvelopeKindV1::NodeDescriptor, &encrypted).unwrap();
+    let mut descriptor: NodeDescriptorV1 = serde_json::from_slice(&plaintext).unwrap();
     mutate(&mut descriptor);
-    let encrypted = encrypt_envelope_v2(
+    let encrypted = encrypt_envelope_v1(
         &fixture.key,
-        EnvelopeKindV2::NodeDescriptor,
+        EnvelopeKindV1::NodeDescriptor,
         &serde_json::to_vec(&descriptor).unwrap(),
     )
     .unwrap();
@@ -152,16 +152,16 @@ fn rewrite_descriptor(
 fn rewrite_manifest(
     fixture: &mut RecoveryFixture,
     path: &str,
-    mutate: impl FnOnce(&mut ObjectManifestV2),
+    mutate: impl FnOnce(&mut ObjectManifestV1),
 ) {
     let encrypted = fs::read(fixture.staging.join(path)).unwrap();
     let plaintext =
-        decrypt_envelope_v2(&fixture.key, EnvelopeKindV2::Manifest, &encrypted).unwrap();
-    let mut manifest: ObjectManifestV2 = serde_json::from_slice(&plaintext).unwrap();
+        decrypt_envelope_v1(&fixture.key, EnvelopeKindV1::Manifest, &encrypted).unwrap();
+    let mut manifest: ObjectManifestV1 = serde_json::from_slice(&plaintext).unwrap();
     mutate(&mut manifest);
-    let encrypted = encrypt_envelope_v2(
+    let encrypted = encrypt_envelope_v1(
         &fixture.key,
-        EnvelopeKindV2::Manifest,
+        EnvelopeKindV1::Manifest,
         &serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
@@ -231,8 +231,8 @@ fn rebuilds_nested_catalog_reports_counts_and_preserves_recovered_metadata() {
 
     let encrypted_catalog = fs::read(catalog.encrypted_catalog_path()).unwrap();
     assert_eq!(
-        parse_envelope_v2(&encrypted_catalog).unwrap().kind,
-        EnvelopeKindV2::Catalog
+        parse_envelope_v1(&encrypted_catalog).unwrap().kind,
+        EnvelopeKindV1::Catalog
     );
     let ciphertext = String::from_utf8_lossy(&encrypted_catalog);
     for name in ["Secret Root", "Nested Secret", "Empty Secret", "hidden.txt"] {
@@ -332,9 +332,9 @@ fn rejects_invalid_descriptor_path_id_hash_size_envelope_and_version() {
     let path = fixture.descriptor_paths[0].clone();
     let encrypted = fs::read(fixture.staging.join(&path)).unwrap();
     let plaintext =
-        decrypt_envelope_v2(&fixture.key, EnvelopeKindV2::NodeDescriptor, &encrypted).unwrap();
+        decrypt_envelope_v1(&fixture.key, EnvelopeKindV1::NodeDescriptor, &encrypted).unwrap();
     let wrong_envelope =
-        encrypt_envelope_v2(&fixture.key, EnvelopeKindV2::Manifest, &plaintext).unwrap();
+        encrypt_envelope_v1(&fixture.key, EnvelopeKindV1::Manifest, &plaintext).unwrap();
     fs::write(fixture.staging.join(&path), wrong_envelope).unwrap();
     refresh_remote_object(&mut fixture, &path);
     assert!(
@@ -343,7 +343,7 @@ fn rejects_invalid_descriptor_path_id_hash_size_envelope_and_version() {
 
     let mut fixture = recovery_fixture();
     let path = fixture.descriptor_paths[0].clone();
-    rewrite_descriptor(&mut fixture, &path, |descriptor| descriptor.version = 1);
+    rewrite_descriptor(&mut fixture, &path, |descriptor| descriptor.version = 2);
     assert!(
         Catalog::rebuild_from_recovery(&fixture.key, &fixture.staging, &fixture.remote).is_err()
     );

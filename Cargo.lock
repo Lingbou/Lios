@@ -2400,7 +2400,6 @@ dependencies = [
  "futures-util",
  "hex",
  "hkdf",
- "hmac",
  "httpmock",
  "rand",
  "reqwest 0.12.28",
