@@ -268,7 +268,7 @@ fn snapshot_plan_manages_node_descriptors_and_publishes_catalog_last() {
     let local = vec![
         LocalStorageObject {
             path: "catalog.enc".to_string(),
-            sha256: "catalog-v2".to_string(),
+            sha256: "catalog-v1".to_string(),
         },
         LocalStorageObject {
             path: "recovery/nodes/live.enc".to_string(),
@@ -300,52 +300,4 @@ fn snapshot_plan_manages_node_descriptors_and_publishes_catalog_last() {
         .iter()
         .any(|object| object.path == "recovery/nodes/live.enc"));
     assert_eq!(plan.delete, vec!["recovery/nodes/stale.enc"]);
-}
-
-#[test]
-fn metadata_only_v1_migration_keeps_all_legacy_object_paths_untouched() {
-    let local = vec![
-        LocalStorageObject {
-            path: "objects/files/legacy-object/chunks/golden.lios".to_string(),
-            sha256: "legacy-chunk".to_string(),
-        },
-        LocalStorageObject {
-            path: "recovery/nodes/root.enc".to_string(),
-            sha256: "root-descriptor".to_string(),
-        },
-        LocalStorageObject {
-            path: "recovery/nodes/file.enc".to_string(),
-            sha256: "file-descriptor".to_string(),
-        },
-        LocalStorageObject {
-            path: "catalog.enc".to_string(),
-            sha256: "catalog-v2".to_string(),
-        },
-    ];
-    let remote = vec![
-        StorageObject {
-            path: "objects/files/legacy-object/manifest.enc".to_string(),
-            size: 10,
-            sha256: None,
-        },
-        StorageObject {
-            path: "objects/files/legacy-object/chunks/golden.lios".to_string(),
-            size: 10,
-            sha256: Some("legacy-chunk".to_string()),
-        },
-        StorageObject {
-            path: "catalog.enc".to_string(),
-            size: 10,
-            sha256: Some("catalog-v1".to_string()),
-        },
-    ];
-
-    let plan = plan_current_snapshot_changes(local, remote);
-
-    assert!(plan
-        .upload
-        .iter()
-        .all(|object| !object.path.starts_with("objects/")));
-    assert!(plan.delete.iter().all(|path| !path.starts_with("objects/")));
-    assert_eq!(plan.upload.last().unwrap().path, "catalog.enc");
 }

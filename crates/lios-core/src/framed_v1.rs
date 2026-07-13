@@ -11,15 +11,15 @@ use sha2::{Digest, Sha256};
 use zstd::stream::raw::{Operation, OutBuffer};
 
 use crate::atomic::SiblingTempFile;
-use crate::crypto::{KeyDomainV2, KeyFile};
+use crate::crypto::{KeyDomainV1, KeyFile};
 use crate::{LiosError, Result};
 
-pub const MAX_FRAME_PLAINTEXT_V2: usize = 1024 * 1024;
-pub const CHUNK_STREAM_HEADER_LEN_V2: usize = 8 + 3 + 4 + 32;
-pub const CHUNK_FRAME_HEADER_LEN_V2: usize = 8 + 1 + 4 + 24;
+pub const MAX_FRAME_PLAINTEXT_V1: usize = 1024 * 1024;
+pub const CHUNK_STREAM_HEADER_LEN_V1: usize = 8 + 3 + 4 + 32;
+pub const CHUNK_FRAME_HEADER_LEN_V1: usize = 8 + 1 + 4 + 24;
 
-const CHUNK_STREAM_MAGIC_V2: [u8; 8] = *b"LIOSCHK2";
-const CHUNK_STREAM_VERSION_V2: u8 = 2;
+const CHUNK_STREAM_MAGIC_V1: [u8; 8] = *b"LIOSCHK1";
+const CHUNK_STREAM_VERSION_V1: u8 = 1;
 const XCHACHA20_POLY1305_ID: u8 = 1;
 const ZSTD_ID: u8 = 1;
 const FINAL_FRAME_FLAG: u8 = 1;
@@ -27,9 +27,9 @@ const AEAD_TAG_LEN: usize = 16;
 const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChunkIdV2([u8; 32]);
+pub struct ChunkIdV1([u8; 32]);
 
-impl ChunkIdV2 {
+impl ChunkIdV1 {
     pub fn random() -> Self {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -46,7 +46,7 @@ impl ChunkIdV2 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkStreamStatsV2 {
+pub struct ChunkStreamStatsV1 {
     pub original_bytes: u64,
     pub compressed_bytes: u64,
     pub encoded_bytes: u64,
@@ -56,36 +56,36 @@ pub struct ChunkStreamStatsV2 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkDecodeLimitsV2 {
+pub struct ChunkDecodeLimitsV1 {
     pub expected_original_bytes: u64,
     pub max_encoded_bytes: u64,
     pub max_frames: u64,
     pub max_zstd_window_log: u32,
 }
 
-impl ChunkDecodeLimitsV2 {
+impl ChunkDecodeLimitsV1 {
     pub fn for_chunk(expected_original_bytes: u64) -> Self {
         let max_encoded_bytes = expected_original_bytes.saturating_add(4 * 1024 * 1024);
         Self {
             expected_original_bytes,
             max_encoded_bytes,
-            max_frames: max_encoded_bytes.div_ceil(MAX_FRAME_PLAINTEXT_V2 as u64) + 1,
+            max_frames: max_encoded_bytes.div_ceil(MAX_FRAME_PLAINTEXT_V1 as u64) + 1,
             max_zstd_window_log: 27,
         }
     }
 }
 
-pub fn encode_chunk_stream_v2<R: Read, W: Write>(
+pub fn encode_chunk_stream_v1<R: Read, W: Write>(
     key_file: &KeyFile,
-    chunk_id: ChunkIdV2,
+    chunk_id: ChunkIdV1,
     input: R,
     mut output: W,
-) -> Result<ChunkStreamStatsV2> {
+) -> Result<ChunkStreamStatsV1> {
     let stream_header = chunk_stream_header(chunk_id);
     let mut encoded_writer = HashingWriter::new(&mut output);
     encoded_writer.write_all(&stream_header)?;
 
-    let key = key_file.derive_key_v2(KeyDomainV2::Chunk)?;
+    let key = key_file.derive_key_v1(KeyDomainV1::Chunk)?;
     let frame_writer = FrameEncryptWriter::new(encoded_writer, key, stream_header);
     let mut encoder = zstd::stream::write::Encoder::new(frame_writer, ZSTD_LEVEL)?;
     let mut hashing_reader = HashingReader::new(input);
@@ -95,7 +95,7 @@ pub fn encode_chunk_stream_v2<R: Read, W: Write>(
     let (original_bytes, original_sha256) = hashing_reader.finish();
     let (encoded_bytes, encoded_sha256) = encoded_writer.finish();
 
-    Ok(ChunkStreamStatsV2 {
+    Ok(ChunkStreamStatsV1 {
         original_bytes,
         compressed_bytes: frame_stats.compressed_bytes,
         encoded_bytes,
@@ -106,24 +106,24 @@ pub fn encode_chunk_stream_v2<R: Read, W: Write>(
 }
 
 /// Internal streaming decoder for temporary files; errors may leave partial plaintext in `output`.
-pub(crate) fn decode_chunk_stream_v2<R: Read, W: Write>(
+pub(crate) fn decode_chunk_stream_v1<R: Read, W: Write>(
     key_file: &KeyFile,
-    expected_chunk_id: ChunkIdV2,
+    expected_chunk_id: ChunkIdV1,
     input: R,
     output: W,
-    limits: &ChunkDecodeLimitsV2,
-) -> Result<ChunkStreamStatsV2> {
-    ensure_encoded_budget(0, CHUNK_STREAM_HEADER_LEN_V2, limits.max_encoded_bytes)?;
+    limits: &ChunkDecodeLimitsV1,
+) -> Result<ChunkStreamStatsV1> {
+    ensure_encoded_budget(0, CHUNK_STREAM_HEADER_LEN_V1, limits.max_encoded_bytes)?;
     let mut encoded_reader = HashingReader::new(input);
-    let mut stream_header = [0u8; CHUNK_STREAM_HEADER_LEN_V2];
-    read_exact_v2(
+    let mut stream_header = [0u8; CHUNK_STREAM_HEADER_LEN_V1];
+    read_exact_v1(
         &mut encoded_reader,
         &mut stream_header,
         "truncated chunk stream header",
     )?;
     parse_chunk_stream_header(&stream_header, expected_chunk_id)?;
 
-    let key = key_file.derive_key_v2(KeyDomainV2::Chunk)?;
+    let key = key_file.derive_key_v1(KeyDomainV1::Chunk)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
     let hashing_writer = HashingWriter::new(output);
     let mut decoder = CompletingZstdDecoder::new(
@@ -143,18 +143,18 @@ pub(crate) fn decode_chunk_stream_v2<R: Read, W: Write>(
         }
         ensure_encoded_budget(
             encoded_reader.bytes_read(),
-            CHUNK_FRAME_HEADER_LEN_V2,
+            CHUNK_FRAME_HEADER_LEN_V1,
             limits.max_encoded_bytes,
         )?;
-        let mut frame_header = [0u8; CHUNK_FRAME_HEADER_LEN_V2];
-        read_exact_v2(
+        let mut frame_header = [0u8; CHUNK_FRAME_HEADER_LEN_V1];
+        read_exact_v1(
             &mut encoded_reader,
             &mut frame_header,
             "missing final chunk frame",
         )?;
         let frame = parse_frame_header(&frame_header)?;
         if frame.index != expected_index {
-            return Err(LiosError::InvalidV2Format(
+            return Err(LiosError::InvalidV1Format(
                 "chunk frame index is out of order",
             ));
         }
@@ -162,14 +162,14 @@ pub(crate) fn decode_chunk_stream_v2<R: Read, W: Write>(
         let ciphertext_len = frame
             .plaintext_len
             .checked_add(AEAD_TAG_LEN)
-            .ok_or(LiosError::InvalidV2Format("chunk frame length overflow"))?;
+            .ok_or(LiosError::InvalidV1Format("chunk frame length overflow"))?;
         ensure_encoded_budget(
             encoded_reader.bytes_read(),
             ciphertext_len,
             limits.max_encoded_bytes,
         )?;
         let mut ciphertext = vec![0u8; ciphertext_len];
-        read_exact_v2(
+        read_exact_v1(
             &mut encoded_reader,
             &mut ciphertext,
             "truncated chunk frame",
@@ -185,13 +185,13 @@ pub(crate) fn decode_chunk_stream_v2<R: Read, W: Write>(
             )
             .map_err(|_| LiosError::Crypto)?;
         if compressed.len() != frame.plaintext_len {
-            return Err(LiosError::InvalidV2Format(
+            return Err(LiosError::InvalidV1Format(
                 "invalid chunk frame plaintext length",
             ));
         }
         decoder.write_compressed(&compressed)?;
         if decoder.is_complete() && !frame.final_frame {
-            return Err(LiosError::InvalidV2Format(
+            return Err(LiosError::InvalidV1Format(
                 "zstd stream ended before final chunk frame",
             ));
         }
@@ -200,7 +200,7 @@ pub(crate) fn decode_chunk_stream_v2<R: Read, W: Write>(
         frames += 1;
         expected_index = expected_index
             .checked_add(1)
-            .ok_or(LiosError::InvalidV2Format("too many chunk frames"))?;
+            .ok_or(LiosError::InvalidV1Format("too many chunk frames"))?;
 
         if frame.final_frame {
             let mut trailing = [0u8; 1];
@@ -210,7 +210,7 @@ pub(crate) fn decode_chunk_stream_v2<R: Read, W: Write>(
                         "encoded chunk byte limit exceeded".to_string(),
                     ));
                 }
-                return Err(LiosError::InvalidV2Format("trailing chunk frames or bytes"));
+                return Err(LiosError::InvalidV1Format("trailing chunk frames or bytes"));
             }
             break;
         }
@@ -224,7 +224,7 @@ pub(crate) fn decode_chunk_stream_v2<R: Read, W: Write>(
         ));
     }
     let (encoded_bytes, encoded_sha256) = encoded_reader.finish();
-    Ok(ChunkStreamStatsV2 {
+    Ok(ChunkStreamStatsV1 {
         original_bytes,
         compressed_bytes,
         encoded_bytes,
@@ -234,13 +234,13 @@ pub(crate) fn decode_chunk_stream_v2<R: Read, W: Write>(
     })
 }
 
-pub fn decode_chunk_stream_v2_to_path<R: Read>(
+pub fn decode_chunk_stream_v1_to_path<R: Read>(
     key_file: &KeyFile,
-    expected_chunk_id: ChunkIdV2,
+    expected_chunk_id: ChunkIdV1,
     input: R,
     destination: impl AsRef<Path>,
-    limits: ChunkDecodeLimitsV2,
-) -> Result<ChunkStreamStatsV2> {
+    limits: ChunkDecodeLimitsV1,
+) -> Result<ChunkStreamStatsV1> {
     let destination = destination.as_ref();
     if destination.exists() {
         return Err(io::Error::new(
@@ -252,7 +252,7 @@ pub fn decode_chunk_stream_v2_to_path<R: Read>(
 
     let mut temp = SiblingTempFile::create(destination, ".lios-part")?;
     let stats =
-        decode_chunk_stream_v2(key_file, expected_chunk_id, input, temp.file_mut(), &limits)?;
+        decode_chunk_stream_v1(key_file, expected_chunk_id, input, temp.file_mut(), &limits)?;
     temp.persist_new(destination)?;
     Ok(stats)
 }
@@ -363,41 +363,41 @@ fn ensure_encoded_budget(consumed: u64, additional: usize, maximum: u64) -> Resu
     Ok(())
 }
 
-fn chunk_stream_header(chunk_id: ChunkIdV2) -> [u8; CHUNK_STREAM_HEADER_LEN_V2] {
-    let mut header = [0u8; CHUNK_STREAM_HEADER_LEN_V2];
-    header[..8].copy_from_slice(&CHUNK_STREAM_MAGIC_V2);
-    header[8] = CHUNK_STREAM_VERSION_V2;
+fn chunk_stream_header(chunk_id: ChunkIdV1) -> [u8; CHUNK_STREAM_HEADER_LEN_V1] {
+    let mut header = [0u8; CHUNK_STREAM_HEADER_LEN_V1];
+    header[..8].copy_from_slice(&CHUNK_STREAM_MAGIC_V1);
+    header[8] = CHUNK_STREAM_VERSION_V1;
     header[9] = XCHACHA20_POLY1305_ID;
     header[10] = ZSTD_ID;
-    header[11..15].copy_from_slice(&(MAX_FRAME_PLAINTEXT_V2 as u32).to_le_bytes());
+    header[11..15].copy_from_slice(&(MAX_FRAME_PLAINTEXT_V1 as u32).to_le_bytes());
     header[15..].copy_from_slice(chunk_id.as_bytes());
     header
 }
 
 fn parse_chunk_stream_header(
-    header: &[u8; CHUNK_STREAM_HEADER_LEN_V2],
-    expected_chunk_id: ChunkIdV2,
+    header: &[u8; CHUNK_STREAM_HEADER_LEN_V1],
+    expected_chunk_id: ChunkIdV1,
 ) -> Result<()> {
-    if header[..8] != CHUNK_STREAM_MAGIC_V2 {
-        return Err(LiosError::InvalidV2Format("invalid chunk stream magic"));
+    if header[..8] != CHUNK_STREAM_MAGIC_V1 {
+        return Err(LiosError::InvalidV1Format("invalid chunk stream magic"));
     }
-    if header[8] != CHUNK_STREAM_VERSION_V2 {
-        return Err(LiosError::InvalidV2Format("unknown chunk stream version"));
+    if header[8] != CHUNK_STREAM_VERSION_V1 {
+        return Err(LiosError::InvalidV1Format("unknown chunk stream version"));
     }
     if header[9] != XCHACHA20_POLY1305_ID {
-        return Err(LiosError::InvalidV2Format("unknown chunk stream algorithm"));
+        return Err(LiosError::InvalidV1Format("unknown chunk stream algorithm"));
     }
     if header[10] != ZSTD_ID {
-        return Err(LiosError::InvalidV2Format(
+        return Err(LiosError::InvalidV1Format(
             "unknown chunk stream compression",
         ));
     }
     let frame_limit = u32::from_le_bytes(header[11..15].try_into().unwrap()) as usize;
-    if frame_limit != MAX_FRAME_PLAINTEXT_V2 {
-        return Err(LiosError::InvalidV2Format("unsupported chunk frame limit"));
+    if frame_limit != MAX_FRAME_PLAINTEXT_V1 {
+        return Err(LiosError::InvalidV1Format("unsupported chunk frame limit"));
     }
     if header[15..] != expected_chunk_id.0 {
-        return Err(LiosError::InvalidV2Format("unexpected chunk id"));
+        return Err(LiosError::InvalidV1Format("unexpected chunk id"));
     }
     Ok(())
 }
@@ -409,16 +409,16 @@ struct ParsedFrameHeader {
     nonce: [u8; 24],
 }
 
-fn parse_frame_header(header: &[u8; CHUNK_FRAME_HEADER_LEN_V2]) -> Result<ParsedFrameHeader> {
+fn parse_frame_header(header: &[u8; CHUNK_FRAME_HEADER_LEN_V1]) -> Result<ParsedFrameHeader> {
     let index = u64::from_le_bytes(header[..8].try_into().unwrap());
     let final_frame = match header[8] {
         0 => false,
         FINAL_FRAME_FLAG => true,
-        _ => return Err(LiosError::InvalidV2Format("unknown chunk frame flags")),
+        _ => return Err(LiosError::InvalidV1Format("unknown chunk frame flags")),
     };
     let plaintext_len = u32::from_le_bytes(header[9..13].try_into().unwrap()) as usize;
-    if plaintext_len > MAX_FRAME_PLAINTEXT_V2 {
-        return Err(LiosError::InvalidV2Format(
+    if plaintext_len > MAX_FRAME_PLAINTEXT_V1 {
+        return Err(LiosError::InvalidV1Format(
             "chunk frame exceeds maximum size",
         ));
     }
@@ -432,20 +432,20 @@ fn parse_frame_header(header: &[u8; CHUNK_FRAME_HEADER_LEN_V2]) -> Result<Parsed
 }
 
 fn frame_aad(
-    stream_header: &[u8; CHUNK_STREAM_HEADER_LEN_V2],
-    frame_header: &[u8; CHUNK_FRAME_HEADER_LEN_V2],
-) -> [u8; CHUNK_STREAM_HEADER_LEN_V2 + CHUNK_FRAME_HEADER_LEN_V2] {
-    let mut aad = [0u8; CHUNK_STREAM_HEADER_LEN_V2 + CHUNK_FRAME_HEADER_LEN_V2];
-    aad[..CHUNK_STREAM_HEADER_LEN_V2].copy_from_slice(stream_header);
-    aad[CHUNK_STREAM_HEADER_LEN_V2..].copy_from_slice(frame_header);
+    stream_header: &[u8; CHUNK_STREAM_HEADER_LEN_V1],
+    frame_header: &[u8; CHUNK_FRAME_HEADER_LEN_V1],
+) -> [u8; CHUNK_STREAM_HEADER_LEN_V1 + CHUNK_FRAME_HEADER_LEN_V1] {
+    let mut aad = [0u8; CHUNK_STREAM_HEADER_LEN_V1 + CHUNK_FRAME_HEADER_LEN_V1];
+    aad[..CHUNK_STREAM_HEADER_LEN_V1].copy_from_slice(stream_header);
+    aad[CHUNK_STREAM_HEADER_LEN_V1..].copy_from_slice(frame_header);
     aad
 }
 
-fn read_exact_v2<R: Read>(reader: &mut R, buffer: &mut [u8], message: &'static str) -> Result<()> {
+fn read_exact_v1<R: Read>(reader: &mut R, buffer: &mut [u8], message: &'static str) -> Result<()> {
     match reader.read_exact(buffer) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-            Err(LiosError::InvalidV2Format(message))
+            Err(LiosError::InvalidV1Format(message))
         }
         Err(error) => Err(error.into()),
     }
@@ -454,7 +454,7 @@ fn read_exact_v2<R: Read>(reader: &mut R, buffer: &mut [u8], message: &'static s
 struct FrameEncryptWriter<W> {
     output: W,
     cipher: XChaCha20Poly1305,
-    stream_header: [u8; CHUNK_STREAM_HEADER_LEN_V2],
+    stream_header: [u8; CHUNK_STREAM_HEADER_LEN_V1],
     buffer: Vec<u8>,
     next_index: u64,
     compressed_bytes: u64,
@@ -467,12 +467,12 @@ struct FrameWriteStats {
 }
 
 impl<W: Write> FrameEncryptWriter<W> {
-    fn new(output: W, key: [u8; 32], stream_header: [u8; CHUNK_STREAM_HEADER_LEN_V2]) -> Self {
+    fn new(output: W, key: [u8; 32], stream_header: [u8; CHUNK_STREAM_HEADER_LEN_V1]) -> Self {
         Self {
             output,
             cipher: XChaCha20Poly1305::new(Key::from_slice(&key)),
             stream_header,
-            buffer: Vec::with_capacity(MAX_FRAME_PLAINTEXT_V2),
+            buffer: Vec::with_capacity(MAX_FRAME_PLAINTEXT_V1),
             next_index: 0,
             compressed_bytes: 0,
             frames: 0,
@@ -492,9 +492,9 @@ impl<W: Write> FrameEncryptWriter<W> {
     fn write_frame(&mut self, final_frame: bool) -> Result<()> {
         let plaintext_len = self.buffer.len();
         let plaintext_len_u32 = u32::try_from(plaintext_len)
-            .map_err(|_| LiosError::InvalidV2Format("chunk frame exceeds maximum size"))?;
+            .map_err(|_| LiosError::InvalidV1Format("chunk frame exceeds maximum size"))?;
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let mut header = [0u8; CHUNK_FRAME_HEADER_LEN_V2];
+        let mut header = [0u8; CHUNK_FRAME_HEADER_LEN_V1];
         header[..8].copy_from_slice(&self.next_index.to_le_bytes());
         header[8] = u8::from(final_frame);
         header[9..13].copy_from_slice(&plaintext_len_u32.to_le_bytes());
@@ -518,7 +518,7 @@ impl<W: Write> FrameEncryptWriter<W> {
         self.next_index = self
             .next_index
             .checked_add(1)
-            .ok_or(LiosError::InvalidV2Format("too many chunk frames"))?;
+            .ok_or(LiosError::InvalidV1Format("too many chunk frames"))?;
         self.buffer.clear();
         Ok(())
     }
@@ -528,10 +528,10 @@ impl<W: Write> Write for FrameEncryptWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let mut consumed = 0;
         while consumed < bytes.len() {
-            if self.buffer.len() == MAX_FRAME_PLAINTEXT_V2 {
+            if self.buffer.len() == MAX_FRAME_PLAINTEXT_V1 {
                 self.write_frame(false).map_err(io::Error::other)?;
             }
-            let available = MAX_FRAME_PLAINTEXT_V2 - self.buffer.len();
+            let available = MAX_FRAME_PLAINTEXT_V1 - self.buffer.len();
             let take = cmp::min(available, bytes.len() - consumed);
             self.buffer
                 .extend_from_slice(&bytes[consumed..consumed + take]);

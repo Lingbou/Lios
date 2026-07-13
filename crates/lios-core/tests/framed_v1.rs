@@ -9,10 +9,10 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use lios_core::{
     crypto::KeyFile,
-    framed_v2::{
-        decode_chunk_stream_v2_to_path, encode_chunk_stream_v2, ChunkDecodeLimitsV2, ChunkIdV2,
-        ChunkStreamStatsV2, CHUNK_FRAME_HEADER_LEN_V2, CHUNK_STREAM_HEADER_LEN_V2,
-        MAX_FRAME_PLAINTEXT_V2,
+    framed_v1::{
+        decode_chunk_stream_v1_to_path, encode_chunk_stream_v1, ChunkDecodeLimitsV1, ChunkIdV1,
+        ChunkStreamStatsV1, CHUNK_FRAME_HEADER_LEN_V1, CHUNK_STREAM_HEADER_LEN_V1,
+        MAX_FRAME_PLAINTEXT_V1,
     },
     LiosError,
 };
@@ -23,7 +23,7 @@ const TAG_LEN: usize = 16;
 
 fn authenticated_single_frame_stream(
     master_key_byte: u8,
-    chunk_id: ChunkIdV2,
+    chunk_id: ChunkIdV1,
     compressed: &[u8],
 ) -> Vec<u8> {
     authenticated_stream(master_key_byte, chunk_id, &[(compressed.to_vec(), true)])
@@ -31,27 +31,27 @@ fn authenticated_single_frame_stream(
 
 fn authenticated_stream(
     master_key_byte: u8,
-    chunk_id: ChunkIdV2,
+    chunk_id: ChunkIdV1,
     frames: &[(Vec<u8>, bool)],
 ) -> Vec<u8> {
-    let mut stream_header = [0u8; CHUNK_STREAM_HEADER_LEN_V2];
-    stream_header[..8].copy_from_slice(b"LIOSCHK2");
-    stream_header[8] = 2;
+    let mut stream_header = [0u8; CHUNK_STREAM_HEADER_LEN_V1];
+    stream_header[..8].copy_from_slice(b"LIOSCHK1");
+    stream_header[8] = 1;
     stream_header[9] = 1;
     stream_header[10] = 1;
-    stream_header[11..15].copy_from_slice(&(MAX_FRAME_PLAINTEXT_V2 as u32).to_le_bytes());
+    stream_header[11..15].copy_from_slice(&(MAX_FRAME_PLAINTEXT_V1 as u32).to_le_bytes());
     stream_header[15..].copy_from_slice(chunk_id.as_bytes());
 
     let mut derived_key = [0u8; 32];
     Hkdf::<Sha256>::new(None, &[master_key_byte; 32])
-        .expand(b"lios/v2/chunk", &mut derived_key)
+        .expand(b"lios/v1/chunk", &mut derived_key)
         .unwrap();
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived_key));
     let mut encoded = Vec::new();
     encoded.extend_from_slice(&stream_header);
     for (index, (compressed, final_frame)) in frames.iter().enumerate() {
         let nonce = [0x5a ^ index as u8; 24];
-        let mut frame_header = [0u8; CHUNK_FRAME_HEADER_LEN_V2];
+        let mut frame_header = [0u8; CHUNK_FRAME_HEADER_LEN_V1];
         frame_header[..8].copy_from_slice(&(index as u64).to_le_bytes());
         frame_header[8] = u8::from(*final_frame);
         frame_header[9..13].copy_from_slice(&(compressed.len() as u32).to_le_bytes());
@@ -79,7 +79,7 @@ fn fixed_key(path: &Path, byte: u8) -> KeyFile {
     std::fs::write(
         path,
         format!(
-            "version: 2\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: {encoded}\n"
+            "version: 1\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: {encoded}\n"
         ),
     )
     .unwrap();
@@ -100,7 +100,7 @@ fn incompressible(len: usize) -> Vec<u8> {
 
 fn frame_ranges(encoded: &[u8]) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
-    let mut offset = CHUNK_STREAM_HEADER_LEN_V2;
+    let mut offset = CHUNK_STREAM_HEADER_LEN_V1;
     while offset < encoded.len() {
         let length_offset = offset + 9;
         let plaintext_len = u32::from_le_bytes(
@@ -108,7 +108,7 @@ fn frame_ranges(encoded: &[u8]) -> Vec<Range<usize>> {
                 .try_into()
                 .unwrap(),
         ) as usize;
-        let end = offset + CHUNK_FRAME_HEADER_LEN_V2 + plaintext_len + TAG_LEN;
+        let end = offset + CHUNK_FRAME_HEADER_LEN_V1 + plaintext_len + TAG_LEN;
         ranges.push(offset..end);
         offset = end;
     }
@@ -128,26 +128,26 @@ fn assert_no_transactional_output(directory: &Path, destination: &Path) {
 
 fn decode_transactionally(
     key: &KeyFile,
-    chunk_id: ChunkIdV2,
+    chunk_id: ChunkIdV1,
     encoded: &[u8],
     expected_original_bytes: u64,
-) -> std::result::Result<(ChunkStreamStatsV2, Vec<u8>), LiosError> {
+) -> std::result::Result<(ChunkStreamStatsV1, Vec<u8>), LiosError> {
     let tmp = tempdir().unwrap();
     let destination = tmp.path().join("decoded.bin");
-    let stats = decode_chunk_stream_v2_to_path(
+    let stats = decode_chunk_stream_v1_to_path(
         key,
         chunk_id,
         Cursor::new(encoded),
         &destination,
-        ChunkDecodeLimitsV2::for_chunk(expected_original_bytes),
+        ChunkDecodeLimitsV1::for_chunk(expected_original_bytes),
     )?;
     Ok((stats, std::fs::read(destination).unwrap()))
 }
 
-fn roundtrip(key: &KeyFile, chunk_id: ChunkIdV2, input: &[u8]) -> (Vec<u8>, Vec<u8>) {
+fn roundtrip(key: &KeyFile, chunk_id: ChunkIdV1, input: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut encoded = Vec::new();
     let encode_stats =
-        encode_chunk_stream_v2(key, chunk_id, Cursor::new(input), &mut encoded).unwrap();
+        encode_chunk_stream_v1(key, chunk_id, Cursor::new(input), &mut encoded).unwrap();
     let (decode_stats, decoded) =
         decode_transactionally(key, chunk_id, &encoded, input.len() as u64).unwrap();
     let expected_hash: [u8; 32] = Sha256::digest(input).into();
@@ -171,7 +171,7 @@ fn roundtrip(key: &KeyFile, chunk_id: ChunkIdV2, input: &[u8]) -> (Vec<u8>, Vec<
 fn chunk_stream_roundtrips_empty_and_small_inputs() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 21);
-    let chunk_id = ChunkIdV2::from_bytes([3; 32]);
+    let chunk_id = ChunkIdV1::from_bytes([3; 32]);
 
     roundtrip(&key, chunk_id, b"");
     roundtrip(&key, chunk_id, b"small chunk payload");
@@ -181,8 +181,8 @@ fn chunk_stream_roundtrips_empty_and_small_inputs() {
 fn chunk_stream_roundtrips_multiframe_incompressible_input_with_exact_hash() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 22);
-    let input = incompressible(MAX_FRAME_PLAINTEXT_V2 * 2 + 321_123);
-    let chunk_id = ChunkIdV2::from_bytes([4; 32]);
+    let input = incompressible(MAX_FRAME_PLAINTEXT_V1 * 2 + 321_123);
+    let chunk_id = ChunkIdV1::from_bytes([4; 32]);
     let (encoded, _) = roundtrip(&key, chunk_id, &input);
     let ranges = frame_ranges(&encoded);
 
@@ -202,7 +202,7 @@ fn chunk_stream_roundtrips_multiframe_incompressible_input_with_exact_hash() {
                 .try_into()
                 .unwrap(),
         ) as usize;
-        len <= MAX_FRAME_PLAINTEXT_V2
+        len <= MAX_FRAME_PLAINTEXT_V1
     }));
 }
 
@@ -232,15 +232,15 @@ impl Write for RejectOversizedWrites {
 fn chunk_stream_never_writes_an_oversized_encrypted_frame_payload() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 23);
-    let input = incompressible(MAX_FRAME_PLAINTEXT_V2 * 2 + 99);
+    let input = incompressible(MAX_FRAME_PLAINTEXT_V1 * 2 + 99);
     let mut writer = RejectOversizedWrites {
         bytes: Vec::new(),
-        max: MAX_FRAME_PLAINTEXT_V2 + TAG_LEN,
+        max: MAX_FRAME_PLAINTEXT_V1 + TAG_LEN,
     };
 
-    let stats = encode_chunk_stream_v2(
+    let stats = encode_chunk_stream_v1(
         &key,
-        ChunkIdV2::from_bytes([5; 32]),
+        ChunkIdV1::from_bytes([5; 32]),
         Cursor::new(input),
         &mut writer,
     )
@@ -253,13 +253,13 @@ fn chunk_stream_never_writes_an_oversized_encrypted_frame_payload() {
 fn chunk_stream_ciphertext_differs_across_runs() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 24);
-    let chunk_id = ChunkIdV2::from_bytes([6; 32]);
+    let chunk_id = ChunkIdV1::from_bytes([6; 32]);
     let input = b"same chunk payload";
     let mut first = Vec::new();
     let mut second = Vec::new();
 
-    encode_chunk_stream_v2(&key, chunk_id, Cursor::new(input), &mut first).unwrap();
-    encode_chunk_stream_v2(&key, chunk_id, Cursor::new(input), &mut second).unwrap();
+    encode_chunk_stream_v1(&key, chunk_id, Cursor::new(input), &mut first).unwrap();
+    encode_chunk_stream_v1(&key, chunk_id, Cursor::new(input), &mut second).unwrap();
 
     assert_ne!(first, second);
 }
@@ -269,9 +269,9 @@ fn chunk_stream_rejects_tampering_and_context_transplant() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 25);
     let wrong_key = fixed_key(&tmp.path().join("wrong-key"), 27);
-    let chunk_id = ChunkIdV2::from_bytes([7; 32]);
+    let chunk_id = ChunkIdV1::from_bytes([7; 32]);
     let mut encoded = Vec::new();
-    encode_chunk_stream_v2(
+    encode_chunk_stream_v1(
         &key,
         chunk_id,
         Cursor::new(b"authenticated chunk"),
@@ -283,19 +283,19 @@ fn chunk_stream_rejects_tampering_and_context_transplant() {
     *tampered.last_mut().unwrap() ^= 0x80;
     assert!(decode_transactionally(&key, chunk_id, &tampered, 19).is_err());
     assert!(decode_transactionally(&wrong_key, chunk_id, &encoded, 19).is_err());
-    assert!(decode_transactionally(&key, ChunkIdV2::from_bytes([8; 32]), &encoded, 19).is_err());
+    assert!(decode_transactionally(&key, ChunkIdV1::from_bytes([8; 32]), &encoded, 19).is_err());
 
-    let other_chunk_id = ChunkIdV2::from_bytes([10; 32]);
+    let other_chunk_id = ChunkIdV1::from_bytes([10; 32]);
     let mut other = Vec::new();
-    encode_chunk_stream_v2(
+    encode_chunk_stream_v1(
         &key,
         other_chunk_id,
         Cursor::new(b"authenticated chunk"),
         &mut other,
     )
     .unwrap();
-    let mut transplanted = encoded[..CHUNK_STREAM_HEADER_LEN_V2].to_vec();
-    transplanted.extend_from_slice(&other[CHUNK_STREAM_HEADER_LEN_V2..]);
+    let mut transplanted = encoded[..CHUNK_STREAM_HEADER_LEN_V1].to_vec();
+    transplanted.extend_from_slice(&other[CHUNK_STREAM_HEADER_LEN_V1..]);
     assert!(decode_transactionally(&key, chunk_id, &transplanted, 19).is_err());
 }
 
@@ -303,22 +303,22 @@ fn chunk_stream_rejects_tampering_and_context_transplant() {
 fn chunk_stream_rejects_reordered_duplicate_truncated_and_trailing_frames() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 26);
-    let chunk_id = ChunkIdV2::from_bytes([9; 32]);
-    let input = incompressible(MAX_FRAME_PLAINTEXT_V2 * 2 + 7654);
+    let chunk_id = ChunkIdV1::from_bytes([9; 32]);
+    let input = incompressible(MAX_FRAME_PLAINTEXT_V1 * 2 + 7654);
     let mut encoded = Vec::new();
     let expected_original_bytes = input.len() as u64;
-    encode_chunk_stream_v2(&key, chunk_id, Cursor::new(input), &mut encoded).unwrap();
+    encode_chunk_stream_v1(&key, chunk_id, Cursor::new(input), &mut encoded).unwrap();
     let ranges = frame_ranges(&encoded);
     assert!(ranges.len() >= 3);
 
-    let mut reordered = encoded[..CHUNK_STREAM_HEADER_LEN_V2].to_vec();
+    let mut reordered = encoded[..CHUNK_STREAM_HEADER_LEN_V1].to_vec();
     reordered.extend_from_slice(&encoded[ranges[1].clone()]);
     reordered.extend_from_slice(&encoded[ranges[0].clone()]);
     for range in ranges.iter().skip(2) {
         reordered.extend_from_slice(&encoded[range.clone()]);
     }
 
-    let mut duplicate = encoded[..CHUNK_STREAM_HEADER_LEN_V2].to_vec();
+    let mut duplicate = encoded[..CHUNK_STREAM_HEADER_LEN_V1].to_vec();
     duplicate.extend_from_slice(&encoded[ranges[0].clone()]);
     duplicate.extend_from_slice(&encoded[ranges[0].clone()]);
     duplicate.extend_from_slice(&encoded[ranges[1].start..]);
@@ -339,7 +339,7 @@ fn chunk_stream_rejects_reordered_duplicate_truncated_and_trailing_frames() {
 fn chunk_stream_rejects_authenticated_truncated_zstd_stream() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 29);
-    let chunk_id = ChunkIdV2::from_bytes([11; 32]);
+    let chunk_id = ChunkIdV1::from_bytes([11; 32]);
     let mut compressed =
         zstd::stream::encode_all(b"zstd completion must be checked".as_slice(), 3).unwrap();
     compressed.pop();
@@ -363,18 +363,18 @@ fn chunk_stream_rejects_authenticated_truncated_zstd_stream() {
 fn transactional_decode_publishes_valid_output_without_clobbering() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 33);
-    let chunk_id = ChunkIdV2::from_bytes([12; 32]);
+    let chunk_id = ChunkIdV1::from_bytes([12; 32]);
     let plaintext = b"transactional decode";
     let destination = tmp.path().join("decoded.bin");
     let mut encoded = Vec::new();
-    encode_chunk_stream_v2(&key, chunk_id, Cursor::new(plaintext), &mut encoded).unwrap();
+    encode_chunk_stream_v1(&key, chunk_id, Cursor::new(plaintext), &mut encoded).unwrap();
 
-    let stats = decode_chunk_stream_v2_to_path(
+    let stats = decode_chunk_stream_v1_to_path(
         &key,
         chunk_id,
         Cursor::new(&encoded),
         &destination,
-        ChunkDecodeLimitsV2::for_chunk(plaintext.len() as u64),
+        ChunkDecodeLimitsV1::for_chunk(plaintext.len() as u64),
     )
     .unwrap();
 
@@ -387,12 +387,12 @@ fn transactional_decode_publishes_valid_output_without_clobbering() {
         .ends_with(".lios-part")));
 
     std::fs::write(&destination, b"existing").unwrap();
-    let error = decode_chunk_stream_v2_to_path(
+    let error = decode_chunk_stream_v1_to_path(
         &key,
         chunk_id,
         Cursor::new(encoded),
         &destination,
-        ChunkDecodeLimitsV2::for_chunk(plaintext.len() as u64),
+        ChunkDecodeLimitsV1::for_chunk(plaintext.len() as u64),
     )
     .unwrap_err();
     assert!(
@@ -405,10 +405,10 @@ fn transactional_decode_publishes_valid_output_without_clobbering() {
 fn transactional_decode_failure_leaves_no_final_or_partial_output() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 34);
-    let chunk_id = ChunkIdV2::from_bytes([13; 32]);
-    let plaintext = incompressible(MAX_FRAME_PLAINTEXT_V2 + 1234);
+    let chunk_id = ChunkIdV1::from_bytes([13; 32]);
+    let plaintext = incompressible(MAX_FRAME_PLAINTEXT_V1 + 1234);
     let mut encoded = Vec::new();
-    encode_chunk_stream_v2(&key, chunk_id, Cursor::new(&plaintext), &mut encoded).unwrap();
+    encode_chunk_stream_v1(&key, chunk_id, Cursor::new(&plaintext), &mut encoded).unwrap();
 
     let mut tampered = encoded.clone();
     *tampered.last_mut().unwrap() ^= 0x80;
@@ -419,12 +419,12 @@ fn transactional_decode_failure_leaves_no_final_or_partial_output() {
 
     for (index, invalid) in [tampered, truncated, trailing].into_iter().enumerate() {
         let destination = tmp.path().join(format!("failed-{index}.bin"));
-        assert!(decode_chunk_stream_v2_to_path(
+        assert!(decode_chunk_stream_v1_to_path(
             &key,
             chunk_id,
             Cursor::new(invalid),
             &destination,
-            ChunkDecodeLimitsV2::for_chunk(plaintext.len() as u64),
+            ChunkDecodeLimitsV1::for_chunk(plaintext.len() as u64),
         )
         .is_err());
         assert_no_transactional_output(tmp.path(), &destination);
@@ -435,18 +435,18 @@ fn transactional_decode_failure_leaves_no_final_or_partial_output() {
 fn decode_limits_reject_authenticated_expansion_beyond_expected_size() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 35);
-    let chunk_id = ChunkIdV2::from_bytes([14; 32]);
+    let chunk_id = ChunkIdV1::from_bytes([14; 32]);
     let plaintext = vec![0u8; 2 * 1024 * 1024];
     let destination = tmp.path().join("expanded.bin");
     let mut encoded = Vec::new();
-    encode_chunk_stream_v2(&key, chunk_id, Cursor::new(plaintext), &mut encoded).unwrap();
+    encode_chunk_stream_v1(&key, chunk_id, Cursor::new(plaintext), &mut encoded).unwrap();
 
-    let error = decode_chunk_stream_v2_to_path(
+    let error = decode_chunk_stream_v1_to_path(
         &key,
         chunk_id,
         Cursor::new(encoded),
         &destination,
-        ChunkDecodeLimitsV2::for_chunk(1024),
+        ChunkDecodeLimitsV1::for_chunk(1024),
     )
     .unwrap_err();
 
@@ -458,16 +458,16 @@ fn decode_limits_reject_authenticated_expansion_beyond_expected_size() {
 fn decode_limits_reject_too_many_authenticated_frames_including_zero_length() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 36);
-    let chunk_id = ChunkIdV2::from_bytes([15; 32]);
+    let chunk_id = ChunkIdV1::from_bytes([15; 32]);
     let plaintext = b"frame limit";
     let compressed = zstd::stream::encode_all(plaintext.as_slice(), 3).unwrap();
     let encoded = authenticated_stream(36, chunk_id, &[(Vec::new(), false), (compressed, true)]);
     let destination = tmp.path().join("too-many-frames.bin");
-    let mut limits = ChunkDecodeLimitsV2::for_chunk(plaintext.len() as u64);
+    let mut limits = ChunkDecodeLimitsV1::for_chunk(plaintext.len() as u64);
     limits.max_frames = 1;
 
     let error =
-        decode_chunk_stream_v2_to_path(&key, chunk_id, Cursor::new(encoded), &destination, limits)
+        decode_chunk_stream_v1_to_path(&key, chunk_id, Cursor::new(encoded), &destination, limits)
             .unwrap_err();
 
     assert!(matches!(error, LiosError::DataCorruption(ref message) if message.contains("frame")));
@@ -478,16 +478,16 @@ fn decode_limits_reject_too_many_authenticated_frames_including_zero_length() {
 fn decode_limits_reject_encoded_byte_overrun_before_success() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 37);
-    let chunk_id = ChunkIdV2::from_bytes([16; 32]);
+    let chunk_id = ChunkIdV1::from_bytes([16; 32]);
     let plaintext = b"encoded byte limit";
     let destination = tmp.path().join("encoded-limit.bin");
     let mut encoded = Vec::new();
-    encode_chunk_stream_v2(&key, chunk_id, Cursor::new(plaintext), &mut encoded).unwrap();
-    let mut limits = ChunkDecodeLimitsV2::for_chunk(plaintext.len() as u64);
+    encode_chunk_stream_v1(&key, chunk_id, Cursor::new(plaintext), &mut encoded).unwrap();
+    let mut limits = ChunkDecodeLimitsV1::for_chunk(plaintext.len() as u64);
     limits.max_encoded_bytes = encoded.len() as u64 - 1;
 
     let error =
-        decode_chunk_stream_v2_to_path(&key, chunk_id, Cursor::new(encoded), &destination, limits)
+        decode_chunk_stream_v1_to_path(&key, chunk_id, Cursor::new(encoded), &destination, limits)
             .unwrap_err();
 
     assert!(matches!(error, LiosError::DataCorruption(ref message) if message.contains("encoded")));
@@ -498,7 +498,7 @@ fn decode_limits_reject_encoded_byte_overrun_before_success() {
 fn decode_limits_reject_authenticated_zstd_window_above_maximum() {
     let tmp = tempdir().unwrap();
     let key = fixed_key(&tmp.path().join("key"), 38);
-    let chunk_id = ChunkIdV2::from_bytes([17; 32]);
+    let chunk_id = ChunkIdV1::from_bytes([17; 32]);
     let plaintext = incompressible(2 * 1024 * 1024);
     let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
     encoder.window_log(20).unwrap();
@@ -506,22 +506,22 @@ fn decode_limits_reject_authenticated_zstd_window_above_maximum() {
     encoder.write_all(&plaintext).unwrap();
     let compressed = encoder.finish().unwrap();
     let compressed_frames = compressed
-        .chunks(MAX_FRAME_PLAINTEXT_V2)
+        .chunks(MAX_FRAME_PLAINTEXT_V1)
         .enumerate()
         .map(|(index, bytes)| {
             (
                 bytes.to_vec(),
-                (index + 1) * MAX_FRAME_PLAINTEXT_V2 >= compressed.len(),
+                (index + 1) * MAX_FRAME_PLAINTEXT_V1 >= compressed.len(),
             )
         })
         .collect::<Vec<_>>();
     let encoded = authenticated_stream(38, chunk_id, &compressed_frames);
     let destination = tmp.path().join("window-limit.bin");
-    let mut limits = ChunkDecodeLimitsV2::for_chunk(plaintext.len() as u64);
+    let mut limits = ChunkDecodeLimitsV1::for_chunk(plaintext.len() as u64);
     limits.max_zstd_window_log = 19;
 
     let error =
-        decode_chunk_stream_v2_to_path(&key, chunk_id, Cursor::new(encoded), &destination, limits)
+        decode_chunk_stream_v1_to_path(&key, chunk_id, Cursor::new(encoded), &destination, limits)
             .unwrap_err();
 
     assert!(
