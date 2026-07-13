@@ -26,12 +26,40 @@ import {
 } from "lucide-react";
 import { type MouseEvent, useCallback, useEffect, useRef, useState } from "react";
 import liosPetalMark from "./assets/lios-petal-mark.svg";
+import type {
+  CacheCleanupReport,
+  CatalogLoadResult,
+  CatalogRebuildDialog,
+  CatalogRebuildPreview,
+  CatalogTreeNode,
+  ConflictAction,
+  ConflictResolution,
+  DatasetRepoListResult,
+  DriveItem,
+  ModelScopeUserSummary,
+  RecoveryKeyImportDialog,
+  RepoConfig,
+  Snapshot,
+  SpaceSummary,
+  UploadConflict
+} from "./appTypes.ts";
 import {
   createLatestSerialExecutor,
   initializeWithExistingCatalog,
   loadCatalogState
 } from "./catalogState.ts";
 import { errorText } from "./commandError.ts";
+import {
+  breadcrumb,
+  CatalogRecoveryTree,
+  displayPath,
+  findNode,
+  formatBytes,
+  formatCacheBytes,
+  formatDate,
+  sameSpace,
+  treeToDriveItem
+} from "./features/catalog/catalogPresentation.tsx";
 import { TaskCenter } from "./features/tasks/TaskCenter.tsx";
 import { createTaskApi } from "./features/tasks/taskApi.ts";
 import {
@@ -47,123 +75,7 @@ import {
   type RecoveryKeyStatus,
   type RecoveryKeyVerification
 } from "./recoveryKeyPresentation.ts";
-import { setupWarningMessage, type SetupWarning } from "./setupWarning.ts";
-
-type RepoConfig = {
-  namespace: string;
-  dataset: string;
-  endpoint: string;
-};
-
-type SpaceSummary = RepoConfig & {
-  visibility?: string | null;
-  updated_at?: string | null;
-  description?: string | null;
-  task_space_id?: string;
-};
-
-type ModelScopeUserSummary = {
-  username: string;
-  email?: string | null;
-};
-
-type DatasetRepoListResult = {
-  user: ModelScopeUserSummary;
-  repositories: SpaceSummary[];
-};
-
-type LiosConfig = {
-  active_repo?: RepoConfig | null;
-  key_file_path?: string | null;
-  backup_path?: string | null;
-  chunk_size?: number | null;
-};
-
-type PathsDto = {
-  home: string;
-  config: string;
-  database: string;
-  staging: string;
-  logs: string;
-  credentials: string;
-};
-
-type CacheCleanupReport = {
-  files_removed: number;
-  dirs_removed: number;
-  bytes_removed: number;
-};
-
-type CatalogTreeNode = {
-  id: string;
-  name: string;
-  updated_at: string;
-  kind:
-    | { type: "Directory"; children: CatalogTreeNode[] }
-    | {
-        type: "File";
-        original_size: number;
-        sha256: string;
-        object_id: string;
-        chunk_count: number;
-      };
-};
-
-type DriveItem = {
-  id: string;
-  name: string;
-  kind: "Directory" | "File";
-  size: number;
-  updated_at: string;
-  children_count: number;
-};
-
-type CatalogLoadResult = {
-  local_path: string;
-  bytes: number;
-  tree: CatalogTreeNode;
-  warnings: string[];
-};
-
-type CatalogRebuildReport = {
-  nodes_rebuilt: number;
-  directories_rebuilt: number;
-  files_rebuilt: number;
-  content_objects_rebuilt: number;
-  chunks_referenced: number;
-  original_bytes_referenced: number;
-  unreferenced_managed_objects: number;
-};
-
-type CatalogRebuildPreview = {
-  revision: string;
-  tree: CatalogTreeNode;
-  report: CatalogRebuildReport;
-  warnings: string[];
-};
-
-type CatalogRebuildDialog = {
-  space: RepoConfig;
-  status: "loading" | "ready" | "submitting" | "error";
-  preview: CatalogRebuildPreview | null;
-  error: string;
-};
-
-type RecoveryKeyImportDialog = {
-  path: string;
-  verification: RecoveryKeyVerification;
-  importing: boolean;
-  error: string;
-};
-
-type Snapshot = {
-  paths: PathsDto;
-  config: LiosConfig;
-  recovery_key: RecoveryKeyStatus;
-  has_token: boolean;
-  active_task_space_id: string | null;
-  warning: SetupWarning | null;
-};
+import { setupWarningMessage } from "./setupWarning.ts";
 
 type InvokeArgs = Record<string, unknown>;
 
@@ -220,127 +132,8 @@ async function appInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
 
 const taskApi = createTaskApi(appInvoke);
 
-type UploadConflict = {
-  source_path: string;
-  target_name: string;
-  existing_node_id: string;
-  kind: "Directory" | "File";
-};
-
-type ConflictAction = "Replace" | "KeepBoth" | "Skip";
-
-type ConflictResolution = {
-  source_path: string;
-  action: ConflictAction;
-};
-
 type View = "spaces" | "drive" | "settings";
 type CatalogStatus = "idle" | "loading" | "ready" | "missing" | "error";
-
-function formatBytes(bytes: number) {
-  if (!bytes) return "0 B";
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = bytes / 1024;
-  let unit = units.shift() ?? "KB";
-  while (value >= 1024 && units.length > 0) {
-    value /= 1024;
-    unit = units.shift() ?? unit;
-  }
-  return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`;
-}
-
-function formatDate(value?: string | null) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "-";
-  return date.toLocaleString();
-}
-
-function displayPath(value?: string | null) {
-  if (!value) return "-";
-  return value.replace(/^\\\\\?\\/, "");
-}
-
-function formatCacheBytes(bytes: number) {
-  return bytes <= 0 ? "0 B" : formatBytes(bytes);
-}
-
-function nodeKind(node: CatalogTreeNode): "Directory" | "File" {
-  return node.kind.type === "Directory" ? "Directory" : "File";
-}
-
-function nodeSize(node: CatalogTreeNode) {
-  return node.kind.type === "File" ? node.kind.original_size : 0;
-}
-
-function nodeChildrenCount(node: CatalogTreeNode) {
-  return node.kind.type === "Directory" ? node.kind.children.length : 0;
-}
-
-function findNode(node: CatalogTreeNode | null, id: string | null): CatalogTreeNode | null {
-  if (!node || !id) return node;
-  if (node.id === id) return node;
-  if (node.kind.type === "Directory") {
-    for (const child of node.kind.children) {
-      const found = findNode(child, id);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
-function breadcrumb(node: CatalogTreeNode | null, targetId: string | null): CatalogTreeNode[] {
-  if (!node) return [];
-  if (!targetId || node.id === targetId) return [node];
-  if (node.kind.type === "Directory") {
-    for (const child of node.kind.children) {
-      const nested = breadcrumb(child, targetId);
-      if (nested.length > 0) return [node, ...nested];
-    }
-  }
-  return [];
-}
-
-function treeToDriveItem(node: CatalogTreeNode): DriveItem {
-  return {
-    id: node.id,
-    name: node.name,
-    kind: nodeKind(node),
-    size: nodeSize(node),
-    updated_at: node.updated_at,
-    children_count: nodeChildrenCount(node)
-  };
-}
-
-function CatalogRecoveryTree({ node }: { node: CatalogTreeNode }) {
-  const kind = node.kind;
-  return (
-    <li>
-      <div className="rebuildTreeRow">
-        {kind.type === "Directory" ? <Folder aria-hidden /> : <File aria-hidden />}
-        <span>{node.name || "根目录"}</span>
-        {kind.type === "File" && <small>{formatBytes(kind.original_size)}</small>}
-      </div>
-      {kind.type === "Directory" && kind.children.length > 0 && (
-        <ul>
-          {kind.children.map((child) => (
-            <CatalogRecoveryTree node={child} key={child.id} />
-          ))}
-        </ul>
-      )}
-    </li>
-  );
-}
-
-function sameSpace(left: RepoConfig | null | undefined, right: RepoConfig | null | undefined) {
-  return Boolean(
-    left &&
-      right &&
-      left.namespace === right.namespace &&
-      left.dataset === right.dataset &&
-      left.endpoint === right.endpoint
-  );
-}
 
 function App() {
   const [view, setView] = useState<View>("spaces");
