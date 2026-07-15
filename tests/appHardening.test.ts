@@ -13,6 +13,27 @@ test("task UI uses native progress elements without inline style props", async (
   assert.equal(taskCenter.match(/<progress\b/g)?.length, 2);
 });
 
+test("task panel stays docked and scrolls its own task list", async () => {
+  const styles = await readFile(new URL("src/styles.css", root), "utf8");
+  const drawerRule = styles.match(/\.taskDrawer\s*\{([\s\S]*?)\n\}/)?.[1];
+  const workspaceRule = styles.match(/\.driveWorkspace\s*\{([\s\S]*?)\n\}/)?.[1];
+  const rowsRule = styles.match(/\.taskRows\s*\{([\s\S]*?)\n\}/)?.[1];
+  const resizeHandleRule = styles.match(/\.taskResizeHandle\s*\{([\s\S]*?)\n\}/)?.[1];
+
+  assert.ok(drawerRule);
+  assert.ok(workspaceRule);
+  assert.ok(rowsRule);
+  assert.ok(resizeHandleRule);
+  assert.doesNotMatch(drawerRule, /position:\s*fixed/);
+  assert.match(drawerRule, /height:\s*var\(--task-panel-height,\s*220px\)/);
+  assert.doesNotMatch(workspaceRule, /padding:[^;]*(?:132px|126px)/);
+  assert.match(rowsRule, /min-height:\s*0/);
+  assert.match(rowsRule, /overflow:\s*auto/);
+  assert.doesNotMatch(rowsRule, /max-height:/);
+  assert.match(resizeHandleRule, /cursor:\s*ns-resize/);
+  assert.match(resizeHandleRule, /touch-action:\s*none/);
+});
+
 test("frontend verification includes the app hardening scan", async () => {
   const packageJson = JSON.parse(await readFile(new URL("package.json", root), "utf8")) as {
     scripts: Record<string, string>;
