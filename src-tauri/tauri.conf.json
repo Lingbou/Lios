@@ -35,9 +35,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": {
-      "bin/WebView2Loader.dll": "WebView2Loader.dll"
-    },
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico"

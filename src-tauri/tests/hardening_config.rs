@@ -50,3 +50,17 @@ fn capabilities_allow_only_used_dialog_and_window_operations() {
         ]
     );
 }
+
+#[test]
+fn windows_loader_is_only_bundled_on_windows() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let shared = read_json(&manifest.join("tauri.conf.json"));
+    let windows = read_json(&manifest.join("tauri.windows.conf.json"));
+
+    assert!(shared["bundle"].get("resources").is_none());
+    assert_eq!(
+        windows["bundle"]["resources"]["bin/WebView2Loader.dll"],
+        "WebView2Loader.dll"
+    );
+    assert!(manifest.join("bin/WebView2Loader.dll").is_file());
+}
