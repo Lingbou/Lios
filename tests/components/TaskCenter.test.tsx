@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { expect, test, vi } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import { useTasks } from "../../src/features/tasks/useTasks.ts";
 import { TaskCenter } from "../../src/features/tasks/TaskCenter.tsx";
 import type {
@@ -10,6 +10,8 @@ import type {
   TaskItemsPage,
   TaskSummary
 } from "../../src/features/tasks/taskTypes.ts";
+
+const TASK_PANEL_STORAGE_KEY = "lios.task-center.height";
 
 function summary(overrides: Partial<TaskSummary> = {}): TaskSummary {
   return {
@@ -57,6 +59,245 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+
+beforeEach(() => {
+  window.localStorage.clear();
+});
+
+test("keeps a fixed default pane height when many tasks are rendered", () => {
+  const tasks = Array.from({ length: 24 }, (_, index) =>
+    summary({ id: `task-${index}`, item_count: 0 })
+  );
+  const { container } = render(
+    <TaskCenter
+      tasks={tasks}
+      pendingActions={{}}
+      onAction={async () => undefined}
+      listTaskItems={async (taskId, offset) => ({ task_id: taskId, offset, total: 0, items: [] })}
+    />
+  );
+
+  const panel = container.querySelector<HTMLElement>(".taskCenter")!;
+  expect(panel.style.getPropertyValue("--task-panel-height")).toBe("220px");
+  expect(screen.getAllByRole("article")).toHaveLength(24);
+  expect(container.querySelector(".taskRows")).not.toBeNull();
+});
+
+test.each(["mouse", "touch"] as const)("resizes the pane with a %s pointer", async (pointerType) => {
+  const { container } = render(
+    <TaskCenter
+      tasks={[summary()]}
+      pendingActions={{}}
+      onAction={async () => undefined}
+      listTaskItems={async (taskId, offset) => ({ task_id: taskId, offset, total: 0, items: [] })}
+    />
+  );
+  const panel = container.querySelector<HTMLElement>(".taskCenter")!;
+  const handle = container.querySelector<HTMLElement>(".taskResizeHandle")!;
+
+  fireEvent.pointerDown(handle, {
+    pointerId: 7,
+    pointerType,
+    isPrimary: true,
+    button: 0,
+    buttons: 1,
+    clientY: 400
+  });
+  fireEvent.pointerMove(handle, {
+    pointerId: 7,
+    pointerType,
+    buttons: 1,
+    clientY: 320
+  });
+
+  expect(panel).toHaveClass("resizing");
+  expect(panel.style.getPropertyValue("--task-panel-height")).toBe("300px");
+
+  fireEvent.pointerUp(handle, { pointerId: 7, pointerType, clientY: 320 });
+  expect(panel).not.toHaveClass("resizing");
+  await waitFor(() => expect(window.localStorage.getItem(TASK_PANEL_STORAGE_KEY)).toBe("300"));
+});
+
+test("clamps pointer resizing to the safe minimum and maximum", async () => {
+  const { container } = render(
+    <TaskCenter
+      tasks={[summary()]}
+      pendingActions={{}}
+      onAction={async () => undefined}
+      listTaskItems={async (taskId, offset) => ({ task_id: taskId, offset, total: 0, items: [] })}
+    />
+  );
+  const panel = container.querySelector<HTMLElement>(".taskCenter")!;
+  const handle = container.querySelector<HTMLElement>(".taskResizeHandle")!;
+  const expectedMaximum = Math.max(
+    120,
+    Math.floor(Math.min(window.innerHeight * 0.6, window.innerHeight - 240))
+  );
+
+  fireEvent.pointerDown(handle, {
+    pointerId: 8,
+    pointerType: "mouse",
+    isPrimary: true,
+    button: 0,
+    buttons: 1,
+    clientY: 400
+  });
+  fireEvent.pointerMove(handle, {
+    pointerId: 8,
+    pointerType: "mouse",
+    buttons: 1,
+    clientY: 1000
+  });
+  expect(panel.style.getPropertyValue("--task-panel-height")).toBe("120px");
+  fireEvent.pointerUp(handle, { pointerId: 8, pointerType: "mouse", clientY: 1000 });
+
+  fireEvent.pointerDown(handle, {
+    pointerId: 9,
+    pointerType: "mouse",
+    isPrimary: true,
+    button: 0,
+    buttons: 1,
+    clientY: 400
+  });
+  fireEvent.pointerMove(handle, {
+    pointerId: 9,
+    pointerType: "mouse",
+    buttons: 1,
+    clientY: -1000
+  });
+  expect(panel.style.getPropertyValue("--task-panel-height")).toBe(`${expectedMaximum}px`);
+  fireEvent.pointerUp(handle, { pointerId: 9, pointerType: "mouse", clientY: -1000 });
+
+  fireEvent.pointerMove(handle, {
+    pointerId: 9,
+    pointerType: "mouse",
+    buttons: 1,
+    clientY: 1000
+  });
+  expect(panel.style.getPropertyValue("--task-panel-height")).toBe(`${expectedMaximum}px`);
+  await waitFor(() =>
+    expect(window.localStorage.getItem(TASK_PANEL_STORAGE_KEY)).toBe(String(expectedMaximum))
+  );
+});
+
+test("calculates the maximum from workspace content height after padding and gap", () => {
+  const props = {
+    tasks: [summary()],
+    pendingActions: {},
+    onAction: async () => undefined,
+    listTaskItems: async (taskId: string, offset: number) => ({
+      task_id: taskId,
+      offset,
+      total: 0,
+      items: []
+    })
+  };
+  const { container } = render(
+    <div
+      ref={(node) => {
+        if (node) Object.defineProperty(node, "clientHeight", { configurable: true, value: 800 });
+      }}
+      style={{ paddingTop: 16, paddingBottom: 14, rowGap: 12 }}
+    >
+      <TaskCenter {...props} />
+    </div>
+  );
+  const panel = container.querySelector<HTMLElement>(".taskCenter")!;
+  const handle = container.querySelector<HTMLElement>(".taskResizeHandle")!;
+  const usableHeight = 800 - 16 - 14 - 12;
+  const expectedMaximum = Math.floor(Math.min(usableHeight * 0.6, usableHeight - 240));
+
+  fireEvent(window, new Event("resize"));
+
+  fireEvent.pointerDown(handle, {
+    pointerId: 10,
+    pointerType: "mouse",
+    isPrimary: true,
+    button: 0,
+    buttons: 1,
+    clientY: 400
+  });
+  fireEvent.pointerMove(handle, {
+    pointerId: 10,
+    pointerType: "mouse",
+    buttons: 1,
+    clientY: -1000
+  });
+
+  expect(panel.style.getPropertyValue("--task-panel-height")).toBe(`${expectedMaximum}px`);
+});
+
+test("does not overwrite a larger saved height when the resize handle is only clicked", () => {
+  window.localStorage.setItem(TASK_PANEL_STORAGE_KEY, "900");
+  const { container } = render(
+    <TaskCenter
+      tasks={[summary()]}
+      pendingActions={{}}
+      onAction={async () => undefined}
+      listTaskItems={async (taskId, offset) => ({ task_id: taskId, offset, total: 0, items: [] })}
+    />
+  );
+  const handle = container.querySelector<HTMLElement>(".taskResizeHandle")!;
+
+  fireEvent.pointerDown(handle, {
+    pointerId: 11,
+    pointerType: "mouse",
+    isPrimary: true,
+    button: 0,
+    buttons: 1,
+    clientY: 400
+  });
+  fireEvent.pointerUp(handle, {
+    pointerId: 11,
+    pointerType: "mouse",
+    clientY: 400
+  });
+
+  expect(window.localStorage.getItem(TASK_PANEL_STORAGE_KEY)).toBe("900");
+});
+
+test("collapses to the header and restores the persisted expanded height", async () => {
+  window.localStorage.setItem(TASK_PANEL_STORAGE_KEY, "340");
+  const props = {
+    tasks: [summary()],
+    pendingActions: {},
+    onAction: async () => undefined,
+    listTaskItems: async (taskId: string, offset: number) => ({
+      task_id: taskId,
+      offset,
+      total: 0,
+      items: []
+    })
+  };
+  const rendered = render(<TaskCenter {...props} />);
+  const panel = rendered.container.querySelector<HTMLElement>(".taskCenter")!;
+
+  expect(panel.style.getPropertyValue("--task-panel-height")).toBe("340px");
+  const collapseButton = screen.getByRole("button", { name: "收起任务面板" });
+  expect(collapseButton).toHaveAttribute("aria-expanded", "true");
+  await userEvent.click(collapseButton);
+
+  expect(panel).toHaveClass("collapsed");
+  expect(panel.style.getPropertyValue("--task-panel-height")).toBe("46px");
+  expect(screen.queryByRole("article")).not.toBeInTheDocument();
+  expect(window.localStorage.getItem(TASK_PANEL_STORAGE_KEY)).toBe("340");
+
+  const expandButton = screen.getByRole("button", { name: "展开任务面板" });
+  expect(expandButton).toHaveAttribute("aria-expanded", "false");
+  await userEvent.click(expandButton);
+
+  expect(panel).not.toHaveClass("collapsed");
+  expect(panel.style.getPropertyValue("--task-panel-height")).toBe("340px");
+  expect(screen.getByRole("article")).toBeInTheDocument();
+
+  rendered.unmount();
+  const restored = render(<TaskCenter {...props} />);
+  expect(
+    restored.container.querySelector<HTMLElement>(".taskCenter")!.style.getPropertyValue(
+      "--task-panel-height"
+    )
+  ).toBe("340px");
+});
 
 test("failed tasks expose retry only when the server summary allows it", () => {
   const props = {

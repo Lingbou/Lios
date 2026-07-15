@@ -307,7 +307,7 @@ select:focus {
   min-width: 0;
   min-height: 0;
   height: 100%;
-  padding: 16px 18px 132px;
+  padding: 16px 18px 14px;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -811,16 +811,67 @@ select:focus {
 }
 
 .taskDrawer {
-  position: fixed;
-  left: 278px;
-  right: 18px;
-  bottom: 14px;
-  z-index: 10;
+  position: relative;
+  flex: 0 0 auto;
+  min-width: 0;
+  min-height: 0;
+  height: var(--task-panel-height, 220px);
+  display: grid;
+  grid-template-rows: 46px minmax(0, 1fr);
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.94);
   box-shadow: var(--shadow);
   overflow: hidden;
+}
+
+.taskDrawer.collapsed {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.taskDrawer.collapsed .taskHeader {
+  min-height: 0;
+  border-bottom: 0;
+}
+
+.taskDrawer.resizing {
+  border-color: var(--line-strong);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.taskResizeHandle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  height: 8px;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.taskResizeHandle::after {
+  position: absolute;
+  top: 2px;
+  left: 50%;
+  width: 48px;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(217, 79, 149, 0.34);
+  content: "";
+  transform: translateX(-50%);
+  transition: background-color 120ms ease, width 120ms ease;
+}
+
+.taskResizeHandle:hover::after,
+.taskDrawer.resizing .taskResizeHandle::after {
+  width: 64px;
+  background: var(--pink);
+}
+
+.taskDrawer.collapsed .taskResizeHandle {
+  display: none;
 }
 
 .taskHeader {
@@ -834,10 +885,18 @@ select:focus {
   padding: 0 14px;
 }
 
-.taskHeader div {
+.taskHeaderTitle {
   min-width: 0;
   display: grid;
   gap: 2px;
+}
+
+.taskHeaderActions {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .taskHeader span {
@@ -849,10 +908,25 @@ select:focus {
   font-size: 12px;
 }
 
+.taskCollapseButton {
+  width: 32px;
+  min-height: 32px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.taskCollapseButton svg {
+  width: 18px;
+  height: 18px;
+}
+
 .taskRows {
-  max-height: min(420px, calc(100vh - 120px));
+  min-height: 0;
   overflow: auto;
   display: grid;
+  align-content: start;
   gap: 8px;
   padding: 10px;
 }
@@ -1541,11 +1615,6 @@ select:focus {
     max-width: 100%;
   }
 
-  .taskDrawer {
-    left: 12px;
-    right: 12px;
-  }
-
   .taskSummary {
     grid-template-columns: 30px 30px minmax(0, 1fr);
   }
@@ -1606,7 +1675,7 @@ select:focus {
   }
 
   .driveWorkspace {
-    padding: 12px 12px 126px;
+    padding: 12px;
   }
 
   .driveToolbar {

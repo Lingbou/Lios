@@ -3,6 +3,8 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ChevronsDown,
+  ChevronsUp,
   File,
   LoaderCircle,
   Pause,
@@ -13,7 +15,15 @@ import {
   Trash2,
   XCircle
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type PointerEvent as ReactPointerEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import {
   taskActionsForTask,
   taskItemProgressPercent,
@@ -30,10 +40,48 @@ const PAGE_SIZE = 50;
 const DETAIL_ROW_HEIGHT = 56;
 const DETAIL_VIEWPORT_HEIGHT = 240;
 const ACTIVE_DETAIL_REFRESH_MS = 5000;
+const TASK_PANEL_STORAGE_KEY = "lios.task-center.height";
+const TASK_PANEL_MIN_HEIGHT = 120;
+const TASK_PANEL_DEFAULT_HEIGHT = 220;
+const TASK_PANEL_COLLAPSED_HEIGHT = 46;
+const TASK_PANEL_MAX_RATIO = 0.6;
+const WORKSPACE_MIN_HEIGHT = 240;
 
 const activeStates = new Set<TaskState>(["Queued", "Preparing", "Running", "Retrying", "Committing"]);
 const terminalStates = new Set<TaskState>(["Failed", "Completed", "Canceled"]);
 const runningStates = new Set<TaskState>(["Preparing", "Running", "Retrying", "Committing"]);
+
+function readStoredTaskPanelHeight() {
+  if (typeof window === "undefined") return TASK_PANEL_DEFAULT_HEIGHT;
+  try {
+    const stored = window.localStorage.getItem(TASK_PANEL_STORAGE_KEY);
+    if (stored === null) return TASK_PANEL_DEFAULT_HEIGHT;
+    const parsed = Number(stored);
+    if (Number.isFinite(parsed)) return Math.max(TASK_PANEL_MIN_HEIGHT, Math.round(parsed));
+  } catch {
+    // Fall back to the default when storage is unavailable.
+  }
+  return TASK_PANEL_DEFAULT_HEIGHT;
+}
+
+function taskPanelMaxHeight(workspaceHeight: number) {
+  const safeWorkspaceHeight = Number.isFinite(workspaceHeight) && workspaceHeight > 0
+    ? workspaceHeight
+    : TASK_PANEL_DEFAULT_HEIGHT + WORKSPACE_MIN_HEIGHT;
+  return Math.max(
+    TASK_PANEL_MIN_HEIGHT,
+    Math.floor(
+      Math.min(
+        safeWorkspaceHeight * TASK_PANEL_MAX_RATIO,
+        safeWorkspaceHeight - WORKSPACE_MIN_HEIGHT
+      )
+    )
+  );
+}
+
+function clampTaskPanelHeight(height: number, maxHeight: number) {
+  return Math.min(Math.max(Math.round(height), TASK_PANEL_MIN_HEIGHT), maxHeight);
+}
 
 const actionDetails: Record<
   TaskAction,
@@ -284,7 +332,21 @@ export function TaskCenter({
   listTaskItems,
   onError
 }: TaskCenterProps) {
+  const panelRef = useRef<HTMLElement>(null);
+  const resizeStateRef = useRef<{
+    pointerId: number;
+    startY: number;
+    startHeight: number;
+    currentHeight: number;
+    moved: boolean;
+  } | null>(null);
   const [expandedTaskIds, setExpandedTaskIds] = useState<Set<string>>(new Set());
+  const [preferredHeight, setPreferredHeight] = useState(readStoredTaskPanelHeight);
+  const [workspaceHeight, setWorkspaceHeight] = useState(() =>
+    typeof window === "undefined" ? 720 : window.innerHeight
+  );
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
   const counts = useMemo(
     () => ({
       running: tasks.filter((task) => runningStates.has(task.state)).length,
@@ -293,6 +355,49 @@ export function TaskCenter({
     }),
     [tasks]
   );
+  const maxPanelHeight = useMemo(() => taskPanelMaxHeight(workspaceHeight), [workspaceHeight]);
+  const panelHeight = isCollapsed
+    ? TASK_PANEL_COLLAPSED_HEIGHT
+    : clampTaskPanelHeight(preferredHeight, maxPanelHeight);
+
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    const workspace = panel?.parentElement;
+    if (!workspace) return;
+
+    const updateWorkspaceHeight = () => {
+      const workspaceStyles = window.getComputedStyle(workspace);
+      const paddingTop = Number.parseFloat(workspaceStyles.paddingTop) || 0;
+      const paddingBottom = Number.parseFloat(workspaceStyles.paddingBottom) || 0;
+      const panelGap = Number.parseFloat(workspaceStyles.rowGap || workspaceStyles.gap) || 0;
+      const nextHeight = Math.max(
+        0,
+        (workspace.clientHeight || window.innerHeight) - paddingTop - paddingBottom - panelGap
+      );
+      setWorkspaceHeight((current) => current === nextHeight ? current : nextHeight);
+    };
+    updateWorkspaceHeight();
+
+    const observer = new ResizeObserver(updateWorkspaceHeight);
+    observer.observe(workspace);
+    window.addEventListener("resize", updateWorkspaceHeight);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateWorkspaceHeight);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    panelRef.current?.style.setProperty("--task-panel-height", `${panelHeight}px`);
+  }, [panelHeight]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(TASK_PANEL_STORAGE_KEY, String(preferredHeight));
+    } catch {
+      // Resizing still works when storage is unavailable.
+    }
+  }, [preferredHeight]);
 
   const toggleExpanded = (taskId: string) => {
     setExpandedTaskIds((current) => {
@@ -303,16 +408,85 @@ export function TaskCenter({
     });
   };
 
+  const startResizing = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (
+      isCollapsed ||
+      resizeStateRef.current ||
+      event.isPrimary === false ||
+      (event.pointerType === "mouse" && event.button !== 0)
+    ) return;
+    resizeStateRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startHeight: panelHeight,
+      currentHeight: panelHeight,
+      moved: false
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    setIsResizing(true);
+    event.preventDefault();
+  };
+
+  const resizePanel = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const resizeState = resizeStateRef.current;
+    if (!resizeState || resizeState.pointerId !== event.pointerId) return;
+    const nextHeight = clampTaskPanelHeight(
+      resizeState.startHeight + resizeState.startY - event.clientY,
+      maxPanelHeight
+    );
+    if (nextHeight === resizeState.currentHeight) return;
+    resizeState.currentHeight = nextHeight;
+    resizeState.moved = true;
+    panelRef.current?.style.setProperty("--task-panel-height", `${nextHeight}px`);
+    event.preventDefault();
+  };
+
+  const stopResizing = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const resizeState = resizeStateRef.current;
+    if (!resizeState || resizeState.pointerId !== event.pointerId) return;
+    resizeStateRef.current = null;
+    if (resizeState.moved) setPreferredHeight(resizeState.currentHeight);
+    setIsResizing(false);
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+    }
+  };
+
   return (
-    <section className="taskDrawer taskCenter" aria-label="任务">
+    <section
+      className={`taskDrawer taskCenter${isCollapsed ? " collapsed" : ""}${isResizing ? " resizing" : ""}`}
+      aria-label="任务"
+      ref={panelRef}
+    >
+      <div
+        className="taskResizeHandle"
+        aria-hidden="true"
+        onPointerDown={startResizing}
+        onPointerMove={resizePanel}
+        onPointerUp={stopResizing}
+        onPointerCancel={stopResizing}
+        onLostPointerCapture={stopResizing}
+      />
       <div className="taskHeader">
-        <div>
+        <div className="taskHeaderTitle">
           <span>任务</span>
           <small>传输中心</small>
         </div>
-        <small>{counts.running} 运行 / {counts.failed} 失败 / {counts.total} 记录</small>
+        <div className="taskHeaderActions">
+          <small>{counts.running} 运行 / {counts.failed} 失败 / {counts.total} 记录</small>
+          <button
+            className="taskCollapseButton"
+            type="button"
+            title={isCollapsed ? "展开任务面板" : "收起任务面板"}
+            aria-label={isCollapsed ? "展开任务面板" : "收起任务面板"}
+            aria-expanded={!isCollapsed}
+            onClick={() => setIsCollapsed((current) => !current)}
+          >
+            {isCollapsed ? <ChevronsUp aria-hidden /> : <ChevronsDown aria-hidden />}
+          </button>
+        </div>
       </div>
-      <div className="taskRows">
+      {!isCollapsed && <div className="taskRows">
         {tasks.length === 0 ? (
           <div className="taskEmpty">暂无任务</div>
         ) : (
@@ -358,7 +532,7 @@ export function TaskCenter({
             );
           })
         )}
-      </div>
+      </div>}
     </section>
   );
 }
