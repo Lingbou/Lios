@@ -5572,10 +5572,11 @@ mod remote_verification_tests {
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
+    #[cfg(windows)]
+    use super::cleanup_terminal_task_staging_and_record;
     use super::{
         append_task_warning, cleanup_terminal_task_staging,
-        cleanup_terminal_task_staging_after_restart_async,
-        cleanup_terminal_task_staging_and_record, clear_task_record,
+        cleanup_terminal_task_staging_after_restart_async, clear_task_record,
         ensure_verification_revision_unchanged, head_revision_with_cancellation,
         map_remote_integrity_error, validate_local_remote_file, verification_commit_id,
         CommandErrorCode, LocalRemoteFileValidation, TaskLifecycleState,
