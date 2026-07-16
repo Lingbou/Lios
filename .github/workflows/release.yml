@@ -1,0 +1,669 @@
+name: Signed release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+  RUST_VERSION: "1.96.1"
+
+jobs:
+  verify:
+    name: Verify source and release version
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      rpm_fingerprint: ${{ steps.rpm-key.outputs.fingerprint }}
+    steps:
+      - name: Require a protected release tag
+        if: ${{ !github.ref_protected }}
+        shell: bash
+        run: |
+          echo "::error::release tags must be covered by a GitHub tag ruleset or protection rule"
+          exit 1
+
+      - name: Check out the tagged source revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Require the release commit to be on the default branch
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags origin \
+            "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/${DEFAULT_BRANCH}"; then
+            echo "::error::release tag must point to a commit already merged into ${DEFAULT_BRANCH}"
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Set up Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_VERSION"
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Validate release tag and synchronized versions
+        id: version
+        shell: bash
+        run: |
+          version="$(node scripts/version.mjs print)"
+          node scripts/version.mjs check --tag "$GITHUB_REF_NAME"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the reviewed RPM signing key fingerprint
+        id: rpm-key
+        shell: bash
+        run: |
+          fingerprint_file=".github/release/rpm-signing-key.fingerprint"
+          mapfile -t configured_fingerprints < <(
+            grep -Ev '^[[:space:]]*(#|$)' "$fingerprint_file"
+          )
+          if [[ "${#configured_fingerprints[@]}" -ne 1 ]]; then
+            echo "::error::$fingerprint_file must contain exactly one reviewed primary-key fingerprint"
+            exit 1
+          fi
+          fingerprint="$(
+            printf '%s' "${configured_fingerprints[0]}" |
+              tr -d '[:space:]' |
+              tr '[:lower:]' '[:upper:]'
+          )"
+          if [[ ! "$fingerprint" =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]]; then
+            echo "::error::$fingerprint_file is not configured with a full OpenPGP fingerprint"
+            exit 1
+          fi
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Guard the future CLI release boundary
+        shell: bash
+        run: |
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          if jq -e '.packages | any(.name == "lios-cli")' <<<"$metadata" >/dev/null; then
+            echo "::error::lios-cli exists, but its signed x86_64/ARM64 release jobs have not been enabled yet"
+            exit 1
+          fi
+
+      - name: Verify Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+
+      - name: Test frontend logic
+        run: npm run test:frontend
+
+      - name: Test frontend components
+        run: npm run test:components
+
+      - name: Build frontend
+        run: npm run build
+
+  desktop-windows:
+    name: Build signed Windows desktop installer
+    needs: verify
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal
+          rustup default $env:RUST_VERSION
+          rustup target add --toolchain $env:RUST_VERSION x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Test long current-user PATH handling
+        shell: pwsh
+        run: ./scripts/test-windows-path-helper.ps1
+
+      - name: Import Authenticode certificate and create Tauri signing config
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64)) {
+            throw "WINDOWS_CERTIFICATE_BASE64 is required for every release"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw "WINDOWS_CERTIFICATE_PASSWORD is required for every release"
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP "lios-release.pfx"
+          try {
+            $encoded = $env:WINDOWS_CERTIFICATE_BASE64 -replace "\s", ""
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($encoded))
+            $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $importParameters = @{
+              FilePath = $pfxPath
+              CertStoreLocation = "Cert:\CurrentUser\My"
+              Password = $password
+            }
+            $importedCertificates = @(Import-PfxCertificate @importParameters)
+          } finally {
+            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+          $importedThumbprints = @($importedCertificates.Thumbprint | Sort-Object -Unique) -join ","
+          "WINDOWS_IMPORTED_CERT_THUMBPRINTS=$importedThumbprints" >> $env:GITHUB_ENV
+
+          $now = Get-Date
+          $codeSigningCertificates = @(
+            $importedCertificates | Where-Object {
+              $_.HasPrivateKey -and
+              $_.NotBefore -le $now -and
+              $_.NotAfter -gt $now -and
+              ($_.EnhancedKeyUsageList.ObjectId.Value -contains "1.3.6.1.5.5.7.3.3")
+            }
+          )
+          if ($codeSigningCertificates.Count -ne 1) {
+            throw "the PFX must contain exactly one currently valid code-signing certificate with a private key"
+          }
+          $certificate = $codeSigningCertificates[0]
+
+          $timestampUrl = "http://timestamp.digicert.com"
+          $configPath = Join-Path $env:RUNNER_TEMP "tauri.windows.signing.conf.json"
+          @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $certificate.Thumbprint
+                digestAlgorithm = "sha256"
+                timestampUrl = $timestampUrl
+                tsp = $true
+              }
+            }
+          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $configPath
+          "TAURI_SIGNING_CONFIG=$configPath" >> $env:GITHUB_ENV
+          "WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
+
+      - name: Build signed NSIS installer
+        shell: pwsh
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis --config "$env:TAURI_SIGNING_CONFIG"
+
+      - name: Verify signed install, PATH registration, and uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installers = @(Get-ChildItem target\x86_64-pc-windows-msvc\release\bundle\nsis\*-setup.exe -File)
+          if ($installers.Count -ne 1) {
+            throw "expected exactly one NSIS installer, found $($installers.Count)"
+          }
+          $installer = $installers[0]
+          $expectedThumbprint = $env:WINDOWS_CERTIFICATE_THUMBPRINT
+
+          function Assert-SignedByReleaseCertificate([string] $Path) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $Path
+            if ($signature.Status -ne "Valid") {
+              throw "$Path does not have a valid Authenticode signature: $($signature.StatusMessage)"
+            }
+            if ($signature.SignerCertificate.Thumbprint -ne $expectedThumbprint) {
+              throw "$Path was not signed by the imported release certificate"
+            }
+            if (-not $signature.TimeStamperCertificate) {
+              throw "$Path does not contain the required RFC 3161 timestamp"
+            }
+          }
+
+          function Assert-ValidAuthenticodeSignature([string] $Path) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $Path
+            if ($signature.Status -ne "Valid") {
+              throw "$Path does not have a valid Authenticode signature: $($signature.StatusMessage)"
+            }
+          }
+
+          function Get-UserPathEntries {
+            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            if ([string]::IsNullOrWhiteSpace($userPath)) {
+              return @()
+            }
+            return @($userPath -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          }
+
+          function Test-PathEntry([string] $ExpectedPath) {
+            $normalizedExpected = $ExpectedPath.TrimEnd("\")
+            return [bool](Get-UserPathEntries | Where-Object {
+              $_.Trim().TrimEnd("\") -eq $normalizedExpected
+            })
+          }
+
+          Assert-SignedByReleaseCertificate $installer.FullName
+
+          $installDir = Join-Path $env:RUNNER_TEMP "lios-signed-install-$env:GITHUB_RUN_ID"
+          "WINDOWS_SMOKE_INSTALL_DIR=$installDir" >> $env:GITHUB_ENV
+          $installProcess = Start-Process -FilePath $installer.FullName -ArgumentList @(
+            "/S",
+            "/D=$installDir"
+          ) -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) {
+            throw "silent NSIS install failed with exit code $($installProcess.ExitCode)"
+          }
+
+          $installedExecutable = Join-Path $installDir "lios.exe"
+          $webViewLoader = Join-Path $installDir "WebView2Loader.dll"
+          $uninstaller = Join-Path $installDir "uninstall.exe"
+          foreach ($path in @($installedExecutable, $webViewLoader, $uninstaller)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "signed NSIS install did not produce $path"
+            }
+          }
+          Assert-SignedByReleaseCertificate $installedExecutable
+          Assert-SignedByReleaseCertificate $uninstaller
+          Assert-ValidAuthenticodeSignature $webViewLoader
+          if (-not (Test-PathEntry $installDir)) {
+            throw "NSIS installer did not add its install directory to the current-user PATH"
+          }
+
+          $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
+          if ($uninstallProcess.ExitCode -ne 0) {
+            throw "silent NSIS uninstall failed with exit code $($uninstallProcess.ExitCode)"
+          }
+          foreach ($path in @($installedExecutable, $webViewLoader, $uninstaller)) {
+            if (Test-Path -LiteralPath $path) {
+              throw "silent NSIS uninstall left $path behind"
+            }
+          }
+          if (Test-Path -LiteralPath $installDir) {
+            throw "silent NSIS uninstall left the installation directory behind"
+          }
+          if (Test-PathEntry $installDir) {
+            throw "NSIS uninstaller did not remove its install directory from the current-user PATH"
+          }
+
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          Copy-Item $installer.FullName "release-assets\lios-desktop-v$env:VERSION-windows-x86_64-nsis.exe"
+
+      - name: Upload signed Windows artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-desktop-windows
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove Windows signing material and smoke-test installation
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          if ($env:WINDOWS_SMOKE_INSTALL_DIR) {
+            $uninstaller = Join-Path $env:WINDOWS_SMOKE_INSTALL_DIR "uninstall.exe"
+            if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
+              Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $env:WINDOWS_SMOKE_INSTALL_DIR) {
+              Remove-Item -LiteralPath $env:WINDOWS_SMOKE_INSTALL_DIR -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          if ($env:TAURI_SIGNING_CONFIG) {
+            Remove-Item -LiteralPath $env:TAURI_SIGNING_CONFIG -Force -ErrorAction SilentlyContinue
+          }
+          foreach ($thumbprint in @($env:WINDOWS_IMPORTED_CERT_THUMBPRINTS -split ",")) {
+            if (-not [string]::IsNullOrWhiteSpace($thumbprint)) {
+              Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+  desktop-linux:
+    name: Build signed Linux desktop packages
+    needs: verify
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      RPM_SIGNING_KEY_FINGERPRINT: ${{ needs.verify.outputs.rpm_fingerprint }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Set up Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Install Linux packaging dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            build-essential \
+            desktop-file-utils \
+            file \
+            gnupg \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            rpm \
+            xdg-utils
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Require RPM signing key
+        shell: bash
+        env:
+          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+        run: |
+          if [[ -z "$RPM_SIGNING_KEY" ]]; then
+            echo "::error::RPM_SIGNING_KEY is required for every release"
+            exit 1
+          fi
+
+      - name: Build Linux desktop executable
+        run: npx tauri build --no-bundle
+
+      - name: Bundle DEB, signed RPM, and AppImage
+        env:
+          TAURI_SIGNING_RPM_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+          TAURI_SIGNING_RPM_KEY_PASSPHRASE: ${{ secrets.RPM_SIGNING_KEY_PASSPHRASE }}
+        run: npx tauri bundle --ci --bundles deb,rpm,appimage
+
+      - name: Verify and normalize Linux packages
+        shell: bash
+        env:
+          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/lios-rpm-gpg"
+          rpm_key="$RUNNER_TEMP/lios-rpm-signing-key.asc"
+          appimage_root="$(mktemp -d)"
+          deb_root="$(mktemp -d)"
+          cleanup() {
+            rm -rf "$GNUPGHOME" "$rpm_key" "$appimage_root" "$deb_root"
+          }
+          trap cleanup EXIT
+
+          deb="$(find target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
+          rpm_file="$(find target/release/bundle/rpm -maxdepth 1 -name '*.rpm' -print -quit)"
+          appimage="$(find target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
+          test -n "$deb" && test -n "$rpm_file" && test -n "$appimage"
+
+          if dpkg-deb --contents "$deb" | grep -Fi WebView2Loader.dll >/dev/null; then
+            echo "::error::DEB contains the Windows-only WebView2Loader.dll"
+            exit 1
+          fi
+          dpkg-deb --extract "$deb" "$deb_root"
+          desktop-file-validate "$deb_root/usr/share/applications/Lios.desktop"
+          file "$deb_root/usr/bin/lios"
+
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s\n' "$RPM_SIGNING_KEY" > "$rpm_key"
+          gpg --batch --import "$rpm_key"
+          secret_key_listing="$(gpg --batch --with-colons --list-secret-keys --fingerprint)"
+          mapfile -t key_fingerprints < <(
+            awk -F: '
+              $1 == "sec" { primary = 1; next }
+              primary && $1 == "fpr" { print toupper($10); primary = 0 }
+            ' <<<"$secret_key_listing"
+          )
+          if [[ "${#key_fingerprints[@]}" -ne 1 ]]; then
+            echo "::error::RPM_SIGNING_KEY must contain exactly one primary secret key"
+            exit 1
+          fi
+          actual_fingerprint="${key_fingerprints[0]}"
+          expected_fingerprint="$(
+            printf '%s' "$RPM_SIGNING_KEY_FINGERPRINT" |
+              tr -d '[:space:]' |
+              tr '[:lower:]' '[:upper:]'
+          )"
+          if [[ -z "$actual_fingerprint" || "$actual_fingerprint" != "$expected_fingerprint" ]]; then
+            echo "::error::RPM signing key fingerprint does not match RPM_SIGNING_KEY_FINGERPRINT"
+            exit 1
+          fi
+
+          mkdir -p release-assets
+          public_key="release-assets/lios-release-v${VERSION}-rpm-signing-public.asc"
+          gpg --batch --armor --export "$actual_fingerprint" > "$public_key"
+          rpm_abs="$(realpath "$rpm_file")"
+          public_key_abs="$(realpath "$public_key")"
+          docker run --rm \
+            --mount "type=bind,src=${rpm_abs},dst=/input/lios.rpm,readonly" \
+            --mount "type=bind,src=${public_key_abs},dst=/input/rpm-signing-public.asc,readonly" \
+            fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814 \
+            bash -euo pipefail -c '
+              rpm --version
+              rpm_db="$(mktemp -d)"
+              rpm --dbpath "$rpm_db" --initdb
+              rpm --dbpath "$rpm_db" --import /input/rpm-signing-public.asc
+
+              if ! rpm_contents="$(rpm --dbpath "$rpm_db" -qlp /input/lios.rpm 2>&1)"; then
+                printf "%s\n" "$rpm_contents"
+                echo "::error::Fedora RPM tooling could not inspect the package"
+                exit 1
+              fi
+              if grep -Fiq WebView2Loader.dll <<<"$rpm_contents"; then
+                echo "::error::RPM contains the Windows-only WebView2Loader.dll"
+                exit 1
+              fi
+
+              if ! verification="$(rpm --dbpath "$rpm_db" -Kv /input/lios.rpm 2>&1)"; then
+                printf "%s\n" "$verification"
+                echo "::error::RPM native signature verification failed"
+                exit 1
+              fi
+              printf "%s\n" "$verification"
+              if ! grep -Eiq "signature.*: OK|signatures OK" <<<"$verification"; then
+                echo "::error::RPM verification did not report a valid signature"
+                exit 1
+              fi
+            '
+
+          chmod +x "$appimage"
+          (cd "$appimage_root" && "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null)
+          test -d "$appimage_root/squashfs-root"
+          if find "$appimage_root/squashfs-root" -type f -iname WebView2Loader.dll -print -quit | grep -q .; then
+            echo "::error::AppImage contains the Windows-only WebView2Loader.dll"
+            exit 1
+          fi
+
+          cp "$deb" "release-assets/lios-desktop-v${VERSION}-linux-x86_64.deb"
+          cp "$rpm_file" "release-assets/lios-desktop-v${VERSION}-linux-x86_64.rpm"
+          cp "$appimage" "release-assets/lios-desktop-v${VERSION}-linux-x86_64.AppImage"
+
+      - name: Upload signed Linux artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-desktop-linux
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-release-assets:
+    name: Generate checksums and Sigstore bundles
+    needs:
+      - verify
+      - desktop-windows
+      - desktop-linux
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Download natively signed build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-desktop-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Install Cosign v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.1
+
+      - name: Sign and immediately verify the complete payload set
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          payloads=(
+            "lios-desktop-v${VERSION}-linux-x86_64.AppImage"
+            "lios-desktop-v${VERSION}-linux-x86_64.deb"
+            "lios-desktop-v${VERSION}-linux-x86_64.rpm"
+            "lios-desktop-v${VERSION}-windows-x86_64-nsis.exe"
+            "lios-release-v${VERSION}-rpm-signing-public.asc"
+          )
+          mapfile -t actual_payloads < <(find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          if [[ "${actual_payloads[*]}" != "${payloads[*]}" ]]; then
+            printf 'release payload set does not match the expected versioned assets\n' >&2
+            printf 'expected:\n%s\n' "${payloads[*]}" >&2
+            printf 'actual:\n%s\n' "${actual_payloads[*]}" >&2
+            exit 1
+          fi
+          sha256sum "${payloads[@]}" > SHA256SUMS
+          payloads+=(SHA256SUMS)
+
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          for artifact in "${payloads[@]}"; do
+            cosign sign-blob --yes \
+              --bundle "${artifact}.sigstore.json" \
+              "$artifact"
+            cosign verify-blob \
+              --bundle "${artifact}.sigstore.json" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "$artifact"
+          done
+
+      - name: Upload complete signed release asset set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-signed-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  attest-release-assets:
+    name: Generate GitHub artifact attestations
+    needs: sign-release-assets
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download complete signed release asset set
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-signed-assets
+          path: release-assets
+
+      - name: Attest every GitHub Release asset
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: release-assets/*
+
+  publish:
+    name: Publish complete signed GitHub Release
+    needs:
+      - verify
+      - attest-release-assets
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download attested release asset set
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-signed-assets
+          path: release-assets
+
+      - name: Publish complete signed asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_ref="$(gh api "repos/${GH_REPO}/git/ref/tags/${GITHUB_REF_NAME}")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          tag_sha="$(jq -r '.object.sha' <<<"$tag_ref")"
+          while [[ "$tag_type" == "tag" ]]; do
+            tag_object="$(gh api "repos/${GH_REPO}/git/tags/${tag_sha}")"
+            tag_type="$(jq -r '.object.type' <<<"$tag_object")"
+            tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
+          done
+          if [[ "$tag_type" != "commit" || "$tag_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::release tag no longer resolves to the workflow commit"
+            exit 1
+          fi
+
+          notes=$'## Desktop\n- Windows x86_64: signed NSIS installer\n- Linux x86_64: DEB, signed RPM, and AppImage\n- RPM public key: Sigstore-signed release asset\n\n## CLI\nThe signed Linux x86_64/ARM64 CLI matrix will be enabled when the headless CLI crate lands.'
+          flags=(
+            --verify-tag
+            --generate-notes
+            --notes "$notes"
+            --title "Lios ${VERSION}"
+          )
+          if [[ "$VERSION" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" release-assets/* "${flags[@]}"

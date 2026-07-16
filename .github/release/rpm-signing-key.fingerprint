@@ -1,0 +1,3 @@
+# Replace UNCONFIGURED with the full primary OpenPGP fingerprint before the first release.
+# Key rotation must update this reviewed trust anchor in the same release preparation change.
+UNCONFIGURED

@@ -8,6 +8,8 @@
     "test:frontend": "node --test tests/catalogState.test.ts tests/taskPresentation.test.ts tests/recoveryKeyPresentation.test.ts tests/appHardening.test.ts && vitest run",
     "test:components": "vitest run tests/components",
     "build": "tsc && vite build",
+    "version:check": "node scripts/version.mjs check",
+    "version:sync": "node scripts/version.mjs sync",
     "tauri": "tauri"
   },
   "dependencies": {
