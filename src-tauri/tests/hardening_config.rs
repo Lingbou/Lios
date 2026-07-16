@@ -64,3 +64,24 @@ fn windows_loader_is_only_bundled_on_windows() {
     );
     assert!(manifest.join("bin/WebView2Loader.dll").is_file());
 }
+
+#[test]
+fn windows_installer_registers_and_removes_the_single_executable_from_user_path() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let windows = read_json(&manifest.join("tauri.windows.conf.json"));
+    let nsis = &windows["bundle"]["windows"]["nsis"];
+
+    assert_eq!(nsis["installMode"], "currentUser");
+    assert_eq!(nsis["installerHooks"], "windows/nsis-hooks.nsh");
+
+    let hooks = fs::read_to_string(manifest.join("windows/nsis-hooks.nsh")).unwrap();
+    let helper = fs::read_to_string(manifest.join("windows/path-helper.ps1")).unwrap();
+    assert!(hooks.contains("NSIS_HOOK_POSTINSTALL"));
+    assert!(hooks.contains("NSIS_HOOK_PREUNINSTALL"));
+    assert!(hooks.contains("path-helper.ps1"));
+    assert!(!hooks.contains("ReadRegStr"));
+    assert!(helper.contains("DoNotExpandEnvironmentNames"));
+    assert!(helper.contains("RegistryValueKind]::ExpandString"));
+    assert!(helper.contains("$rawPath.Split([char]';')"));
+    assert!(helper.contains("OrdinalIgnoreCase"));
+}

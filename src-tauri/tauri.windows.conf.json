@@ -2,6 +2,12 @@
   "bundle": {
     "resources": {
       "bin/WebView2Loader.dll": "WebView2Loader.dll"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "windows/nsis-hooks.nsh"
+      }
     }
   }
 }
