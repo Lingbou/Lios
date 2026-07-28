@@ -181,6 +181,12 @@ function App() {
     currentFolder?.kind.type === "Directory" ? currentFolder.kind.children.map(treeToDriveItem) : [];
   const visibleItems = query.trim() ? searchResults : children;
   const crumbs = breadcrumb(catalogTree, currentFolderId);
+  const crumbPaths = crumbs.map((_crumb, index) =>
+    crumbs
+      .slice(0, index + 1)
+      .map((crumb) => crumb.name)
+      .join(" / ")
+  );
   const selectedCount = selectedIds.size;
   const activeTasks = tasks.filter((task) =>
     ["Queued", "Preparing", "Running", "Paused", "Retrying", "Committing"].includes(task.state)
@@ -202,6 +208,17 @@ function App() {
   const hasSpaces = displayedSpaces.length > 0;
   const emptyDriveMode = !hasToken ? "connect" : hasSpaces ? "select" : "create";
   const accountName = modelscopeUser?.username ?? "未连接账号";
+  const crumbFallbackLabel =
+    view === "spaces"
+      ? accountName
+      : activeSpace
+        ? activeSpace.dataset
+        : emptyDriveMode === "create"
+          ? "创建一个空间"
+          : emptyDriveMode === "connect"
+            ? "连接 ModelScope"
+            : "选择一个空间";
+  const fullBreadcrumbPath = crumbPaths[crumbPaths.length - 1] ?? crumbFallbackLabel;
 
   async function minimizeWindow() {
     if (!hasTauriRuntime()) return;
@@ -906,32 +923,28 @@ function App() {
 
       <section className="driveWorkspace">
         <header className="driveTopbar">
-          <div className="crumbs">
+          <nav className="crumbs" aria-label="当前路径" title={fullBreadcrumbPath}>
             {crumbs.length > 0 ? (
               crumbs.map((crumb, index) => (
                 <button
                   key={crumb.id}
+                  type="button"
                   onClick={() => setCurrentFolderId(crumb.id)}
                   className={index === crumbs.length - 1 ? "current" : ""}
+                  title={crumbPaths[index]}
+                  aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
+                  aria-current={index === crumbs.length - 1 ? "page" : undefined}
                 >
                   {index > 0 && <ChevronRight aria-hidden />}
-                  {crumb.name}
+                  <span className="crumbLabel">{crumb.name}</span>
                 </button>
               ))
             ) : (
-              <span>
-                {view === "spaces"
-                  ? accountName
-                  : activeSpace
-                  ? activeSpace.dataset
-                  : emptyDriveMode === "create"
-                    ? "创建一个空间"
-                    : emptyDriveMode === "connect"
-                      ? "连接 ModelScope"
-                      : "选择一个空间"}
+              <span className="crumbFallback" title={crumbFallbackLabel}>
+                {crumbFallbackLabel}
               </span>
             )}
-          </div>
+          </nav>
           <div className="searchBox">
             <Search aria-hidden />
             <input
@@ -1609,7 +1622,6 @@ function App() {
                     if (event.key === "Enter") submitCreateSpace();
                     if (event.key === "Escape") setCreateSpaceOpen(false);
                   }}
-                  placeholder="例如 lios-backup"
                 />
               </label>
               {createSpaceError && <div className="fieldError">{createSpaceError}</div>}

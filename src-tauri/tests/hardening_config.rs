@@ -66,22 +66,79 @@ fn windows_loader_is_only_bundled_on_windows() {
 }
 
 #[test]
-fn windows_installer_registers_and_removes_the_single_executable_from_user_path() {
+fn desktop_binary_name_is_reserved_for_the_desktop_product() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo = fs::read_to_string(manifest.join("Cargo.toml")).unwrap();
+    let config = read_json(&manifest.join("tauri.conf.json"));
+
+    assert!(cargo
+        .lines()
+        .any(|line| line.trim() == "name = \"lios-desktop\""));
+    assert!(!cargo.lines().any(|line| line.trim() == "name = \"lios\""));
+    assert_eq!(config["mainBinaryName"], "lios-desktop");
+}
+
+#[test]
+fn windows_installer_is_current_user_only_and_does_not_modify_path() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let shared = read_json(&manifest.join("tauri.conf.json"));
     let windows = read_json(&manifest.join("tauri.windows.conf.json"));
     let nsis = &windows["bundle"]["windows"]["nsis"];
 
+    assert_eq!(shared["productName"], "Lios");
+    assert_eq!(shared["bundle"]["publisher"], "Lingbou");
     assert_eq!(nsis["installMode"], "currentUser");
-    assert_eq!(nsis["installerHooks"], "windows/nsis-hooks.nsh");
+    assert!(nsis.get("installerHooks").is_none());
+    assert!(!manifest.join("windows/nsis-hooks.nsh").exists());
+    assert!(!manifest.join("windows/path-helper.ps1").exists());
+}
 
-    let hooks = fs::read_to_string(manifest.join("windows/nsis-hooks.nsh")).unwrap();
-    let helper = fs::read_to_string(manifest.join("windows/path-helper.ps1")).unwrap();
-    assert!(hooks.contains("NSIS_HOOK_POSTINSTALL"));
-    assert!(hooks.contains("NSIS_HOOK_PREUNINSTALL"));
-    assert!(hooks.contains("path-helper.ps1"));
-    assert!(!hooks.contains("ReadRegStr"));
-    assert!(helper.contains("DoNotExpandEnvironmentNames"));
-    assert!(helper.contains("RegistryValueKind]::ExpandString"));
-    assert!(helper.contains("$rawPath.Split([char]';')"));
-    assert!(helper.contains("OrdinalIgnoreCase"));
+#[test]
+fn release_workflow_is_unsigned_and_checksum_only() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = fs::read_to_string(
+        manifest
+            .parent()
+            .unwrap()
+            .join(".github/workflows/release.yml"),
+    )
+    .unwrap();
+
+    for required in [
+        "name: Unsigned release",
+        "name: Prepare checksummed release assets",
+        "sha256sum \"${payloads[@]}\" > SHA256SUMS",
+        "sha256sum --check SHA256SUMS",
+        "name: Publish unsigned GitHub Release",
+        r#"$installDir = Join-Path $env:LOCALAPPDATA "Lios""#,
+    ] {
+        assert!(
+            workflow.contains(required),
+            "release workflow must contain {required:?}"
+        );
+    }
+
+    for forbidden in [
+        "${{ secrets.",
+        "WINDOWS_CERTIFICATE",
+        "Import-PfxCertificate",
+        "TAURI_SIGNING_CONFIG",
+        "RPM_SIGNING_KEY",
+        "TAURI_SIGNING_RPM_KEY",
+        "rpmsign",
+        "gpg --batch",
+        "cosign",
+        "actions/attest@",
+        "id-token: write",
+        ".sigstore.json",
+        "rpm-signing-public.asc",
+        "certificateThumbprint",
+        r#"/D=$installDir"#,
+        "lios-nsis-path-smoke",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "unsigned release workflow must not contain {forbidden:?}"
+        );
+    }
 }

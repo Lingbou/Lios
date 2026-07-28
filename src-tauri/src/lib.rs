@@ -1,16 +1,10 @@
-mod app_log;
+pub use lios_application::{
+    app_log, catalog_mutation_gate, catalog_probe, catalog_sync, command_error,
+    config_mutation_gate, download_service, production_config, recovery_key_service, task_manager,
+};
 
-pub mod catalog_mutation_gate;
-pub mod catalog_probe;
-mod catalog_sync;
-pub mod command_error;
 pub mod command_surface;
-pub mod config_mutation_gate;
-pub mod download_service;
-pub mod production_config;
-pub mod recovery_key_service;
 mod task_center;
-pub mod task_manager;
 
 #[cfg(test)]
 #[path = "../build_support.rs"]
@@ -51,6 +45,7 @@ use lios_core::crypto::KeyFile;
 use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUserSummary};
 use lios_core::pack::PackOptions;
 use lios_core::restore::{RestoreConflictPolicy, RestoreOptions};
+use lios_core::space_lock::SpaceLockError;
 #[cfg(test)]
 use lios_core::storage::CatalogSyncFile;
 use lios_core::storage::{RepoRevision, StorageAdapter, StorageObject};
@@ -87,6 +82,7 @@ type CommandResult<T> = std::result::Result<T, CommandError>;
 
 struct AppContext {
     paths: LiosPaths,
+    read_staging: tempfile::TempDir,
     app_log: AppLogger,
     catalog_mutation_gate: CatalogMutationGate,
     config_mutation_gate: ConfigMutationGate,
@@ -101,8 +97,14 @@ struct TaskLifecycleState {
 
 impl AppContext {
     fn new() -> Self {
-        let paths = LiosPaths::default_user();
-        let _ = cleanup_temporary_staging(&paths.staging);
+        Self::from_paths(LiosPaths::default_user())
+    }
+
+    fn from_paths(paths: LiosPaths) -> Self {
+        let read_staging = tempfile::Builder::new()
+            .prefix("lios-desktop-catalog-read-")
+            .tempdir()
+            .expect("failed to create private catalog read staging");
         let app_log = AppLogger::new(&paths);
         app_log.log(
             "info",
@@ -111,12 +113,22 @@ impl AppContext {
         );
         Self {
             paths,
+            read_staging,
             app_log,
             catalog_mutation_gate: CatalogMutationGate::default(),
             config_mutation_gate: ConfigMutationGate::default(),
             task_lifecycle_gate: Mutex::new(TaskLifecycleState::default()),
             task_manager: TaskManager::default(),
         }
+    }
+
+    fn fresh_read_staging(&self) -> CommandResult<PathBuf> {
+        let path = self
+            .read_staging
+            .path()
+            .join(Uuid::new_v4().simple().to_string());
+        fs::create_dir(&path).map_err(to_err)?;
+        Ok(path)
     }
 }
 
@@ -542,6 +554,7 @@ fn remote_to_staging_path(staging: &Path, remote_path: &str) -> CommandResult<Pa
     Ok(staging.join(relative))
 }
 
+#[cfg(test)]
 fn sha256_hex_file(path: &Path) -> CommandResult<String> {
     sha256_hex_file_cancellable(path, || false)?.ok_or_else(|| {
         CommandError::new(
@@ -1131,12 +1144,39 @@ fn submit_and_spawn(
     Ok(summary)
 }
 
-fn recover_startup_tasks(paths: &LiosPaths) -> lios_core::Result<StartupTaskRecovery> {
+fn recover_startup_tasks(paths: &LiosPaths) -> CommandResult<StartupTaskRecovery> {
     let mut store = TaskStore::open(&paths.database)?;
-    store.recover_after_restart("legacy task cannot be resumed")?;
+    let mut candidate_spaces = HashSet::new();
+    for task in store.list_summaries()? {
+        if !task_state_is_active(&task.state) {
+            continue;
+        }
+        let space_id = match store.load_spec(task.id) {
+            Ok(Some(spec)) => spec.space_id().to_string(),
+            Ok(None) | Err(_) => task.space_id,
+        };
+        candidate_spaces.insert(space_id);
+    }
+
+    let mut recovered_spaces = HashSet::new();
+    for space_id in candidate_spaces {
+        let _process_space_lock = match paths.try_lock_space(&space_id) {
+            Ok(lock) => lock,
+            Err(SpaceLockError::Busy { .. } | SpaceLockError::InvalidSpaceId) => continue,
+            Err(error) => return Err(CommandError::from(error)),
+        };
+        store
+            .recover_after_restart_in_space(&space_id, "legacy task cannot be resumed")
+            .map_err(to_err)?;
+        recovered_spaces.insert(space_id);
+    }
+
     let mut queued = Vec::new();
     let mut reconcile = Vec::new();
-    for (task, _spec) in store.list_startup_summaries_with_specs()? {
+    for (task, spec) in store.list_startup_summaries_with_specs()? {
+        if !recovered_spaces.contains(spec.space_id()) {
+            continue;
+        }
         match task.state {
             TaskState::Queued => queued.push(task.id),
             TaskState::Committing => reconcile.push(task.id),
@@ -1513,6 +1553,16 @@ async fn run_catalog_reconciliation_locked(
     result
 }
 
+async fn run_startup_catalog_reconciliation(
+    app: tauri::AppHandle,
+    task_id: Uuid,
+    space_id: &str,
+) -> CommandResult<StartupReconciliationOutcome> {
+    let paths = app.state::<AppContext>().paths.clone();
+    let _process_space_lock = paths.try_lock_space(space_id).map_err(CommandError::from)?;
+    run_catalog_reconciliation_locked(app, task_id).await
+}
+
 fn start_startup_tasks(
     app: &tauri::AppHandle,
     paths: &LiosPaths,
@@ -1555,10 +1605,11 @@ async fn run_startup_space_work(
 
     let mut transfer_tasks = VecDeque::new();
     for task_id in group.reconcile {
-        match run_catalog_reconciliation_locked(app.clone(), task_id).await {
+        match run_startup_catalog_reconciliation(app.clone(), task_id, &space_id).await {
             Ok(StartupReconciliationOutcome::Continue) => {}
             Ok(StartupReconciliationOutcome::Replay) => transfer_tasks.push_back(task_id),
             Ok(StartupReconciliationOutcome::Stop) => return,
+            Err(error) if error.code == CommandErrorCode::Busy => return,
             Err(error) => {
                 let state = app.state::<AppContext>();
                 let _ = fail_unrecoverable_reconciliation_with_retry(
@@ -1603,6 +1654,9 @@ async fn run_startup_space_work(
         let Err(error) = result else {
             continue;
         };
+        if error.code == CommandErrorCode::Busy {
+            return;
+        }
         let state = app.state::<AppContext>();
         let task_state = TaskStore::open(&state.paths.database)
             .and_then(|store| store.get_summary(task_id))
@@ -1675,6 +1729,10 @@ async fn run_startup_space_work(
 fn spawn_persisted_task(app: tauri::AppHandle, task_id: Uuid) {
     tauri::async_runtime::spawn(async move {
         if let Err(error) = run_persisted_task(app.clone(), task_id).await {
+            if error.code == CommandErrorCode::Busy {
+                emit_task(&app, &app.state::<AppContext>().paths, task_id);
+                return;
+            }
             let state = app.state::<AppContext>();
             if let Ok(store) = TaskStore::open(&state.paths.database) {
                 if let Some(task) = store.get_summary(task_id).ok().flatten() {
@@ -1745,6 +1803,9 @@ async fn run_persisted_task_locked(
         let state = app.state::<AppContext>();
         (state.paths.clone(), state.task_manager.clone())
     };
+    let _process_space_lock = paths
+        .try_lock_space(&preview_space_id)
+        .map_err(CommandError::from)?;
     let mut spec = {
         let mut store = TaskStore::open(&paths.database).map_err(to_err)?;
         let Some(spec) = store.claim_queued(task_id).map_err(to_err)? else {
@@ -3578,6 +3639,10 @@ async fn initialize_space(
 ) -> CommandResult<CatalogLoadResult> {
     state.paths.ensure_dirs().map_err(to_err)?;
     let repo = validate_repo(space)?;
+    let _process_space_lock = state
+        .paths
+        .try_lock_space(&TaskScope::from_repo(&repo).space_id)
+        .map_err(CommandError::from)?;
     let token = read_token(&state.paths)?;
     let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
     if !adapter
@@ -3652,7 +3717,6 @@ async fn load_space_catalog(
             "space was not found or is not visible",
         ));
     }
-    let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
     let config = {
         let _config_guard = state.config_mutation_gate.lock()?;
         let mut config = load_config(&state.paths)?;
@@ -3661,13 +3725,14 @@ async fn load_space_catalog(
         config
     };
     let key = key_from_config(&config)?;
-    let local_path = state.paths.staging.join(CATALOG_FILE);
+    let staging = state.fresh_read_staging()?;
+    let local_path = staging.join(CATALOG_FILE);
     adapter
         .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
         .await
         .map_err(map_catalog_load_error)?;
     let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
-    let catalog = Catalog::from_staging(state.paths.staging.clone());
+    let catalog = Catalog::from_staging(staging);
     let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
     Ok(CatalogLoadResult {
         local_path: local_path.display().to_string(),
@@ -3686,13 +3751,13 @@ async fn preview_upload_conflicts(
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
     let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
-    let catalog_path = state.paths.staging.join(CATALOG_FILE);
+    let staging = state.fresh_read_staging()?;
+    let catalog_path = staging.join(CATALOG_FILE);
     adapter
         .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
         .await
         .map_err(to_err)?;
-    let catalog = Catalog::from_staging(state.paths.staging.clone());
+    let catalog = Catalog::from_staging(staging);
     let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
     catalog
         .preview_upload_conflicts(&parent_node_id, &paths, &key)
@@ -3708,6 +3773,10 @@ async fn create_folder(
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
     let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let _process_space_lock = state
+        .paths
+        .try_lock_space(&TaskScope::from_repo(&repo).space_id)
+        .map_err(CommandError::from)?;
     let _space_mutation_guard = state
         .task_manager
         .acquire_space(TaskScope::from_repo(&repo).space_id)
@@ -3740,6 +3809,10 @@ async fn rename_node(
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
     let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let _process_space_lock = state
+        .paths
+        .try_lock_space(&TaskScope::from_repo(&repo).space_id)
+        .map_err(CommandError::from)?;
     let _space_mutation_guard = state
         .task_manager
         .acquire_space(TaskScope::from_repo(&repo).space_id)
@@ -3771,13 +3844,13 @@ async fn search_catalog(
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
     let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
-    let catalog_path = state.paths.staging.join(CATALOG_FILE);
+    let staging = state.fresh_read_staging()?;
+    let catalog_path = staging.join(CATALOG_FILE);
     adapter
         .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
         .await
         .map_err(to_err)?;
-    let catalog = Catalog::from_staging(state.paths.staging.clone());
+    let catalog = Catalog::from_staging(staging);
     catalog.search(&query, &key).map_err(to_err)
 }
 
@@ -4252,7 +4325,7 @@ mod task_center_backend_tests {
         activate_new_task, cleanup_is_safe, clear_task_record, finish_active_worker,
         interrupt_task_state, list_task_items_for_paths, observed_task_interrupt, paths_dto,
         persist_submission, recover_startup_tasks, recovery_key_status, submission_summary,
-        task_summaries_for_paths, CatalogMutationGate, CommandError, CommandErrorCode,
+        task_summaries_for_paths, AppContext, CatalogMutationGate, CommandError, CommandErrorCode,
         SetupSnapshot, TaskLifecycleState, TaskUpdateEvent,
     };
 
@@ -4310,6 +4383,38 @@ mod task_center_backend_tests {
             error: None,
             item_count: 2,
             can_retry: false,
+        }
+    }
+
+    #[test]
+    fn desktop_startup_preserves_active_download_sidecars() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let sidecar = paths
+            .staging
+            .join("a".repeat(64))
+            .join("b".repeat(64))
+            .join(Uuid::new_v4().to_string())
+            .join("catalog.download");
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, b"active download").unwrap();
+
+        let context = AppContext::from_paths(paths);
+
+        assert_eq!(std::fs::read(sidecar).unwrap(), b"active download");
+        assert!(context.read_staging.path().is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(context.read_staging.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
         }
     }
 
@@ -4655,8 +4760,8 @@ mod task_center_backend_tests {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         let spec = TaskSpec::Delete {
-            account_id: "account-a".to_string(),
-            space_id: "space-a".to_string(),
+            account_id: "a".repeat(64),
+            space_id: "b".repeat(64),
             repo: RepoConfig {
                 namespace: "novix".to_string(),
                 dataset: "cold".to_string(),
@@ -4697,6 +4802,43 @@ mod task_center_backend_tests {
         assert_eq!(queued[0].0.id, task.id);
         assert_eq!(queued[0].1.account_id(), spec.account_id());
         assert_eq!(queued[0].1.space_id(), spec.space_id());
+    }
+
+    #[test]
+    fn startup_recovery_skips_a_space_locked_by_another_frontend() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let spec = TaskSpec::Delete {
+            account_id: "a".repeat(64),
+            space_id: "b".repeat(64),
+            repo: RepoConfig {
+                namespace: "novix".to_string(),
+                dataset: "cold".to_string(),
+                endpoint: "https://modelscope.cn".to_string(),
+            },
+            node_ids: vec!["node-a".to_string()],
+        };
+        let task = TaskRecord::queued_for_spec(&spec);
+        let store = TaskStore::open(&paths.database).unwrap();
+        store.insert_with_spec(&task, &spec).unwrap();
+        store
+            .update_state(task.id, TaskState::Running, None)
+            .unwrap();
+        let _other_frontend = paths.try_lock_space(spec.space_id()).unwrap();
+
+        let recovery = recover_startup_tasks(&paths).unwrap();
+
+        assert!(recovery.queued.is_empty());
+        assert!(recovery.reconcile.is_empty());
+        assert_eq!(
+            TaskStore::open(&paths.database)
+                .unwrap()
+                .get_summary(task.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
     }
 }
 

@@ -1,3 +1,6 @@
+//! Stable application errors safe to expose through Desktop or CLI adapters.
+
+use lios_core::space_lock::SpaceLockError;
 use lios_core::{LiosError, RemoteError, RemoteErrorKind};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -13,6 +16,7 @@ pub enum CommandErrorCode {
     RateLimited,
     RemoteServer,
     CorruptedData,
+    Busy,
     InvalidInput,
     Storage,
     Internal,
@@ -179,7 +183,7 @@ fn contains_absolute_local_path(message: &str) -> bool {
     false
 }
 
-pub(crate) fn sanitize_persisted_message(message: String) -> String {
+pub fn sanitize_persisted_message(message: String) -> String {
     let sanitized = safe_unsupported_message(message);
     const SAFE_REMOTE_PREFIXES: &[&str] = &[
         "invalid remote object path in catalog:",
@@ -300,6 +304,31 @@ impl From<walkdir::Error> for CommandError {
 impl From<std::path::StripPrefixError> for CommandError {
     fn from(_error: std::path::StripPrefixError) -> Self {
         Self::invalid_input("path is outside the allowed location")
+    }
+}
+
+impl From<SpaceLockError> for CommandError {
+    fn from(error: SpaceLockError) -> Self {
+        match error {
+            SpaceLockError::Busy { space_id } => Self::new(
+                CommandErrorCode::Busy,
+                "this space is busy in another Lios process",
+                true,
+                Some(json!({ "space_id": space_id })),
+            ),
+            SpaceLockError::InvalidSpaceId => Self::new(
+                CommandErrorCode::CorruptedData,
+                "stored space identifier is invalid",
+                false,
+                None,
+            ),
+            SpaceLockError::Io(_) => Self::new(
+                CommandErrorCode::Storage,
+                "local space lock could not be accessed",
+                false,
+                None,
+            ),
+        }
     }
 }
 

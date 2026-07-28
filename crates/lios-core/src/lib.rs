@@ -12,6 +12,7 @@ pub mod framed_v1;
 pub mod modelscope;
 pub mod pack;
 pub mod restore;
+pub mod space_lock;
 pub mod storage;
 pub mod tasks;
 

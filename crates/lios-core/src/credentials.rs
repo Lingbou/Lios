@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+#[cfg(not(windows))]
+use crate::atomic::write_private_atomic;
 use crate::Result;
 
 #[cfg(windows)]
@@ -56,10 +58,7 @@ mod platform {
     use super::*;
 
     pub fn protect_to_file(token: &str, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, token.as_bytes())?;
+        write_private_atomic(path, token.as_bytes())?;
         Ok(())
     }
 

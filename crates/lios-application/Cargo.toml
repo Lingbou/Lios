@@ -1,0 +1,25 @@
+[package]
+name = "lios-application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lios-core = { path = "../lios-core" }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+walkdir = "2"
+
+[dev-dependencies]
+async-trait = "0.1"
+httpmock = "0.7"
+rusqlite = { version = "0.33", features = ["bundled"] }

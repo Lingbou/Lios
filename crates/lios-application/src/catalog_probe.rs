@@ -1,3 +1,5 @@
+//! Safe probes used when opening or initializing encrypted spaces.
+
 use std::path::Path;
 
 use lios_core::catalog::CATALOG_FILE;

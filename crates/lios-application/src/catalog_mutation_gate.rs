@@ -1,3 +1,5 @@
+//! In-process staging and catalog mutation coordination.
+
 use tokio::sync::{Mutex, MutexGuard};
 
 /// Serializes catalog mutation transactions inside one running app process.

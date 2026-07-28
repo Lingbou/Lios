@@ -1,3 +1,5 @@
+//! Validation and persistence for user-facing application configuration.
+
 use lios_core::config::{
     ensure_default_key_binding, validate_modelscope_production_endpoint, LiosConfig, LiosPaths,
     RepoConfig, MODELSCOPE_ENDPOINT,

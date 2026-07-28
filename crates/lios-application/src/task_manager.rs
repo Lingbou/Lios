@@ -1,3 +1,5 @@
+//! Foreground task scheduling and resumability primitives.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};

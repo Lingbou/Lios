@@ -1,3 +1,5 @@
+//! Recovery-key workflows shared by Desktop and CLI.
+
 use std::path::Path;
 
 use lios_core::catalog::{Catalog, CATALOG_FILE};
@@ -227,7 +229,6 @@ pub async fn import_candidate_with_adapter<A: StorageAdapter + ?Sized>(
     .await
 }
 
-#[cfg(test)]
 pub async fn import_candidate_with_adapter_after_verification<
     A: StorageAdapter + ?Sized,
     F: FnOnce(),
