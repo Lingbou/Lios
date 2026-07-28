@@ -1,3 +1,5 @@
+//! Serializes local configuration mutations within one process.
+
 use std::sync::{Mutex, MutexGuard};
 
 use crate::command_error::{CommandError, CommandErrorCode};

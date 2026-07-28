@@ -1,0 +1,44 @@
+[package]
+name = "lios-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless command-line client for the Lios encrypted ModelScope drive"
+readme = "README.md"
+categories = ["command-line-utilities"]
+keywords = ["modelscope", "encrypted-storage", "cli"]
+publish = false
+
+[[bin]]
+name = "lios"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+lios-application = { path = "../lios-application" }
+lios-core = { path = "../lios-core" }
+rpassword = "7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uuid = "1"
+
+[package.metadata.deb]
+name = "lios-cli"
+maintainer = "Lios contributors"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+  ["target/release/lios", "usr/bin/lios", "755"],
+  ["README.md", "usr/share/doc/lios-cli/README.md", "644"],
+]
+extended-description = "Headless Linux client for browsing and operating a Lios encrypted ModelScope drive."
+
+[package.metadata.generate-rpm]
+name = "lios-cli"
+summary = "Headless Lios encrypted-drive client"
+license = "MIT"
+assets = [
+  { source = "target/release/lios", dest = "/usr/bin/lios", mode = "0755" },
+  { source = "README.md", dest = "/usr/share/doc/lios-cli/README.md", mode = "0644", doc = true },
+]

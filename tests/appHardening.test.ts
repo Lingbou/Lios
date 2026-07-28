@@ -34,6 +34,26 @@ test("task panel stays docked and scrolls its own task list", async () => {
   assert.match(resizeHandleRule, /touch-action:\s*none/);
 });
 
+test("breadcrumb labels truncate without overlap and retain their full path", async () => {
+  const app = await readFile(new URL("src/App.tsx", root), "utf8");
+  const styles = await readFile(new URL("src/styles.css", root), "utf8");
+  const buttonRule = styles.match(/\.crumbs button\s*\{([\s\S]*?)\n\}/)?.[1];
+  const labelRule = styles.match(/\.crumbs \.crumbLabel\s*\{([\s\S]*?)\n\}/)?.[1];
+
+  assert.ok(buttonRule);
+  assert.ok(labelRule);
+  assert.match(buttonRule, /min-width:\s*0/);
+  assert.match(buttonRule, /max-width:\s*220px/);
+  assert.match(buttonRule, /overflow:\s*hidden/);
+  assert.match(labelRule, /overflow:\s*hidden/);
+  assert.match(labelRule, /text-overflow:\s*ellipsis/);
+  assert.match(labelRule, /white-space:\s*nowrap/);
+  assert.match(app, /const crumbPaths = crumbs\.map/);
+  assert.match(app, /\.join\(" \/ "\)/);
+  assert.match(app, /title=\{crumbPaths\[index\]\}/);
+  assert.match(app, /<span className="crumbLabel">\{crumb\.name\}<\/span>/);
+});
+
 test("frontend verification includes the app hardening scan", async () => {
   const packageJson = JSON.parse(await readFile(new URL("package.json", root), "utf8")) as {
     scripts: Record<string, string>;

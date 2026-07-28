@@ -1,4 +1,4 @@
-name: Signed release
+name: Unsigned release
 
 on:
   push:
@@ -21,7 +21,6 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
-      rpm_fingerprint: ${{ steps.rpm-key.outputs.fingerprint }}
     steps:
       - name: Require a protected release tag
         if: ${{ !github.ref_protected }}
@@ -84,38 +83,6 @@ jobs:
           node scripts/version.mjs check --tag "$GITHUB_REF_NAME"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Validate the reviewed RPM signing key fingerprint
-        id: rpm-key
-        shell: bash
-        run: |
-          fingerprint_file=".github/release/rpm-signing-key.fingerprint"
-          mapfile -t configured_fingerprints < <(
-            grep -Ev '^[[:space:]]*(#|$)' "$fingerprint_file"
-          )
-          if [[ "${#configured_fingerprints[@]}" -ne 1 ]]; then
-            echo "::error::$fingerprint_file must contain exactly one reviewed primary-key fingerprint"
-            exit 1
-          fi
-          fingerprint="$(
-            printf '%s' "${configured_fingerprints[0]}" |
-              tr -d '[:space:]' |
-              tr '[:lower:]' '[:upper:]'
-          )"
-          if [[ ! "$fingerprint" =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]]; then
-            echo "::error::$fingerprint_file is not configured with a full OpenPGP fingerprint"
-            exit 1
-          fi
-          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
-
-      - name: Guard the future CLI release boundary
-        shell: bash
-        run: |
-          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
-          if jq -e '.packages | any(.name == "lios-cli")' <<<"$metadata" >/dev/null; then
-            echo "::error::lios-cli exists, but its signed x86_64/ARM64 release jobs have not been enabled yet"
-            exit 1
-          fi
-
       - name: Verify Rust formatting
         run: cargo fmt --all -- --check
 
@@ -135,10 +102,9 @@ jobs:
         run: npm run build
 
   desktop-windows:
-    name: Build signed Windows desktop installer
+    name: Build Windows desktop installer
     needs: verify
     runs-on: windows-latest
-    environment: release
     permissions:
       contents: read
     env:
@@ -163,75 +129,11 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Test long current-user PATH handling
+      - name: Build NSIS installer
         shell: pwsh
-        run: ./scripts/test-windows-path-helper.ps1
+        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
-      - name: Import Authenticode certificate and create Tauri signing config
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64)) {
-            throw "WINDOWS_CERTIFICATE_BASE64 is required for every release"
-          }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
-            throw "WINDOWS_CERTIFICATE_PASSWORD is required for every release"
-          }
-
-          $pfxPath = Join-Path $env:RUNNER_TEMP "lios-release.pfx"
-          try {
-            $encoded = $env:WINDOWS_CERTIFICATE_BASE64 -replace "\s", ""
-            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($encoded))
-            $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
-            $importParameters = @{
-              FilePath = $pfxPath
-              CertStoreLocation = "Cert:\CurrentUser\My"
-              Password = $password
-            }
-            $importedCertificates = @(Import-PfxCertificate @importParameters)
-          } finally {
-            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
-          }
-          $importedThumbprints = @($importedCertificates.Thumbprint | Sort-Object -Unique) -join ","
-          "WINDOWS_IMPORTED_CERT_THUMBPRINTS=$importedThumbprints" >> $env:GITHUB_ENV
-
-          $now = Get-Date
-          $codeSigningCertificates = @(
-            $importedCertificates | Where-Object {
-              $_.HasPrivateKey -and
-              $_.NotBefore -le $now -and
-              $_.NotAfter -gt $now -and
-              ($_.EnhancedKeyUsageList.ObjectId.Value -contains "1.3.6.1.5.5.7.3.3")
-            }
-          )
-          if ($codeSigningCertificates.Count -ne 1) {
-            throw "the PFX must contain exactly one currently valid code-signing certificate with a private key"
-          }
-          $certificate = $codeSigningCertificates[0]
-
-          $timestampUrl = "http://timestamp.digicert.com"
-          $configPath = Join-Path $env:RUNNER_TEMP "tauri.windows.signing.conf.json"
-          @{
-            bundle = @{
-              windows = @{
-                certificateThumbprint = $certificate.Thumbprint
-                digestAlgorithm = "sha256"
-                timestampUrl = $timestampUrl
-                tsp = $true
-              }
-            }
-          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $configPath
-          "TAURI_SIGNING_CONFIG=$configPath" >> $env:GITHUB_ENV
-          "WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
-
-      - name: Build signed NSIS installer
-        shell: pwsh
-        run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis --config "$env:TAURI_SIGNING_CONFIG"
-
-      - name: Verify signed install, PATH registration, and uninstall
+      - name: Verify unsigned install, unchanged PATH, and uninstall
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -240,18 +142,11 @@ jobs:
             throw "expected exactly one NSIS installer, found $($installers.Count)"
           }
           $installer = $installers[0]
-          $expectedThumbprint = $env:WINDOWS_CERTIFICATE_THUMBPRINT
 
-          function Assert-SignedByReleaseCertificate([string] $Path) {
+          function Assert-Unsigned([string] $Path) {
             $signature = Get-AuthenticodeSignature -LiteralPath $Path
-            if ($signature.Status -ne "Valid") {
-              throw "$Path does not have a valid Authenticode signature: $($signature.StatusMessage)"
-            }
-            if ($signature.SignerCertificate.Thumbprint -ne $expectedThumbprint) {
-              throw "$Path was not signed by the imported release certificate"
-            }
-            if (-not $signature.TimeStamperCertificate) {
-              throw "$Path does not contain the required RFC 3161 timestamp"
+            if ($signature.Status -ne "NotSigned") {
+              throw "$Path must remain unsigned in the current release policy: $($signature.Status)"
             }
           }
 
@@ -262,46 +157,49 @@ jobs:
             }
           }
 
-          function Get-UserPathEntries {
-            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-            if ([string]::IsNullOrWhiteSpace($userPath)) {
-              return @()
-            }
-            return @($userPath -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          Assert-Unsigned $installer.FullName
+
+          $installDir = Join-Path $env:LOCALAPPDATA "Lios"
+          if (Test-Path -LiteralPath $installDir) {
+            throw "clean Windows runner already contains the Lios install directory: $installDir"
           }
-
-          function Test-PathEntry([string] $ExpectedPath) {
-            $normalizedExpected = $ExpectedPath.TrimEnd("\")
-            return [bool](Get-UserPathEntries | Where-Object {
-              $_.Trim().TrimEnd("\") -eq $normalizedExpected
-            })
-          }
-
-          Assert-SignedByReleaseCertificate $installer.FullName
-
-          $installDir = Join-Path $env:RUNNER_TEMP "lios-signed-install-$env:GITHUB_RUN_ID"
+          $originalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
           "WINDOWS_SMOKE_INSTALL_DIR=$installDir" >> $env:GITHUB_ENV
-          $installProcess = Start-Process -FilePath $installer.FullName -ArgumentList @(
-            "/S",
-            "/D=$installDir"
-          ) -Wait -PassThru
+          $installProcess = Start-Process -FilePath $installer.FullName -ArgumentList "/S" -Wait -PassThru
           if ($installProcess.ExitCode -ne 0) {
             throw "silent NSIS install failed with exit code $($installProcess.ExitCode)"
           }
 
-          $installedExecutable = Join-Path $installDir "lios.exe"
+          $installedExecutable = Join-Path $installDir "lios-desktop.exe"
+          $reservedCliExecutable = Join-Path $installDir "lios.exe"
           $webViewLoader = Join-Path $installDir "WebView2Loader.dll"
           $uninstaller = Join-Path $installDir "uninstall.exe"
           foreach ($path in @($installedExecutable, $webViewLoader, $uninstaller)) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-              throw "signed NSIS install did not produce $path"
+              throw "NSIS install did not produce $path"
             }
           }
-          Assert-SignedByReleaseCertificate $installedExecutable
-          Assert-SignedByReleaseCertificate $uninstaller
+          Assert-Unsigned $installedExecutable
+          Assert-Unsigned $uninstaller
           Assert-ValidAuthenticodeSignature $webViewLoader
-          if (-not (Test-PathEntry $installDir)) {
-            throw "NSIS installer did not add its install directory to the current-user PATH"
+          if (Test-Path -LiteralPath $reservedCliExecutable) {
+            throw "Desktop installer must not claim the reserved CLI executable name: $reservedCliExecutable"
+          }
+          if ([Environment]::GetEnvironmentVariable("Path", "User") -cne $originalUserPath) {
+            throw "Desktop installer modified the current-user PATH"
+          }
+
+          $desktopProcess = $null
+          try {
+            $desktopProcess = Start-Process -FilePath $installedExecutable -PassThru
+            if ($desktopProcess.WaitForExit(5000)) {
+              throw "installed Desktop exited during the startup smoke test with code $($desktopProcess.ExitCode)"
+            }
+          } finally {
+            if ($desktopProcess -and -not $desktopProcess.HasExited) {
+              Stop-Process -Id $desktopProcess.Id -Force
+              $desktopProcess.WaitForExit()
+            }
           }
 
           $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
@@ -316,14 +214,14 @@ jobs:
           if (Test-Path -LiteralPath $installDir) {
             throw "silent NSIS uninstall left the installation directory behind"
           }
-          if (Test-PathEntry $installDir) {
-            throw "NSIS uninstaller did not remove its install directory from the current-user PATH"
+          if ([Environment]::GetEnvironmentVariable("Path", "User") -cne $originalUserPath) {
+            throw "Desktop uninstaller modified the current-user PATH"
           }
 
           New-Item -ItemType Directory -Force release-assets | Out-Null
           Copy-Item $installer.FullName "release-assets\lios-desktop-v$env:VERSION-windows-x86_64-nsis.exe"
 
-      - name: Upload signed Windows artifact
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-desktop-windows
@@ -331,39 +229,34 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Remove Windows signing material and smoke-test installation
+      - name: Clean up smoke-test installation
         if: always()
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
           if ($env:WINDOWS_SMOKE_INSTALL_DIR) {
-            $uninstaller = Join-Path $env:WINDOWS_SMOKE_INSTALL_DIR "uninstall.exe"
+            $expectedInstallDir = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA "Lios")).TrimEnd("\")
+            $smokeInstallDir = [IO.Path]::GetFullPath($env:WINDOWS_SMOKE_INSTALL_DIR).TrimEnd("\")
+            if ($smokeInstallDir -cne $expectedInstallDir) {
+              throw "refusing cleanup outside the expected Lios install directory: $smokeInstallDir"
+            }
+            $uninstaller = Join-Path $smokeInstallDir "uninstall.exe"
             if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
               Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
             }
-            if (Test-Path -LiteralPath $env:WINDOWS_SMOKE_INSTALL_DIR) {
-              Remove-Item -LiteralPath $env:WINDOWS_SMOKE_INSTALL_DIR -Recurse -Force -ErrorAction SilentlyContinue
-            }
-          }
-          if ($env:TAURI_SIGNING_CONFIG) {
-            Remove-Item -LiteralPath $env:TAURI_SIGNING_CONFIG -Force -ErrorAction SilentlyContinue
-          }
-          foreach ($thumbprint in @($env:WINDOWS_IMPORTED_CERT_THUMBPRINTS -split ",")) {
-            if (-not [string]::IsNullOrWhiteSpace($thumbprint)) {
-              Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $smokeInstallDir) {
+              Remove-Item -LiteralPath $smokeInstallDir -Recurse -Force -ErrorAction SilentlyContinue
             }
           }
 
   desktop-linux:
-    name: Build signed Linux desktop packages
+    name: Build Linux desktop packages
     needs: verify
     runs-on: ubuntu-22.04
-    environment: release
     permissions:
       contents: read
     env:
       VERSION: ${{ needs.verify.outputs.version }}
-      RPM_SIGNING_KEY_FINGERPRINT: ${{ needs.verify.outputs.rpm_fingerprint }}
     steps:
       - name: Check out source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -388,7 +281,6 @@ jobs:
             build-essential \
             desktop-file-utils \
             file \
-            gnupg \
             libayatana-appindicator3-dev \
             libfuse2 \
             librsvg2-dev \
@@ -402,37 +294,20 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Require RPM signing key
-        shell: bash
-        env:
-          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
-        run: |
-          if [[ -z "$RPM_SIGNING_KEY" ]]; then
-            echo "::error::RPM_SIGNING_KEY is required for every release"
-            exit 1
-          fi
-
       - name: Build Linux desktop executable
         run: npx tauri build --no-bundle
 
-      - name: Bundle DEB, signed RPM, and AppImage
-        env:
-          TAURI_SIGNING_RPM_KEY: ${{ secrets.RPM_SIGNING_KEY }}
-          TAURI_SIGNING_RPM_KEY_PASSPHRASE: ${{ secrets.RPM_SIGNING_KEY_PASSPHRASE }}
+      - name: Bundle DEB, RPM, and AppImage
         run: npx tauri bundle --ci --bundles deb,rpm,appimage
 
       - name: Verify and normalize Linux packages
         shell: bash
-        env:
-          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
         run: |
           set -euo pipefail
-          export GNUPGHOME="$RUNNER_TEMP/lios-rpm-gpg"
-          rpm_key="$RUNNER_TEMP/lios-rpm-signing-key.asc"
           appimage_root="$(mktemp -d)"
           deb_root="$(mktemp -d)"
           cleanup() {
-            rm -rf "$GNUPGHOME" "$rpm_key" "$appimage_root" "$deb_root"
+            rm -rf "$appimage_root" "$deb_root"
           }
           trap cleanup EXIT
 
@@ -447,48 +322,19 @@ jobs:
           fi
           dpkg-deb --extract "$deb" "$deb_root"
           desktop-file-validate "$deb_root/usr/share/applications/Lios.desktop"
-          file "$deb_root/usr/bin/lios"
-
-          mkdir -p "$GNUPGHOME"
-          chmod 700 "$GNUPGHOME"
-          printf '%s\n' "$RPM_SIGNING_KEY" > "$rpm_key"
-          gpg --batch --import "$rpm_key"
-          secret_key_listing="$(gpg --batch --with-colons --list-secret-keys --fingerprint)"
-          mapfile -t key_fingerprints < <(
-            awk -F: '
-              $1 == "sec" { primary = 1; next }
-              primary && $1 == "fpr" { print toupper($10); primary = 0 }
-            ' <<<"$secret_key_listing"
-          )
-          if [[ "${#key_fingerprints[@]}" -ne 1 ]]; then
-            echo "::error::RPM_SIGNING_KEY must contain exactly one primary secret key"
-            exit 1
-          fi
-          actual_fingerprint="${key_fingerprints[0]}"
-          expected_fingerprint="$(
-            printf '%s' "$RPM_SIGNING_KEY_FINGERPRINT" |
-              tr -d '[:space:]' |
-              tr '[:lower:]' '[:upper:]'
-          )"
-          if [[ -z "$actual_fingerprint" || "$actual_fingerprint" != "$expected_fingerprint" ]]; then
-            echo "::error::RPM signing key fingerprint does not match RPM_SIGNING_KEY_FINGERPRINT"
-            exit 1
-          fi
+          test -x "$deb_root/usr/bin/lios-desktop"
+          test ! -e "$deb_root/usr/bin/lios"
+          file "$deb_root/usr/bin/lios-desktop"
 
           mkdir -p release-assets
-          public_key="release-assets/lios-release-v${VERSION}-rpm-signing-public.asc"
-          gpg --batch --armor --export "$actual_fingerprint" > "$public_key"
           rpm_abs="$(realpath "$rpm_file")"
-          public_key_abs="$(realpath "$public_key")"
           docker run --rm \
             --mount "type=bind,src=${rpm_abs},dst=/input/lios.rpm,readonly" \
-            --mount "type=bind,src=${public_key_abs},dst=/input/rpm-signing-public.asc,readonly" \
             fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814 \
             bash -euo pipefail -c '
               rpm --version
               rpm_db="$(mktemp -d)"
               rpm --dbpath "$rpm_db" --initdb
-              rpm --dbpath "$rpm_db" --import /input/rpm-signing-public.asc
 
               if ! rpm_contents="$(rpm --dbpath "$rpm_db" -qlp /input/lios.rpm 2>&1)"; then
                 printf "%s\n" "$rpm_contents"
@@ -499,22 +345,28 @@ jobs:
                 echo "::error::RPM contains the Windows-only WebView2Loader.dll"
                 exit 1
               fi
+              if ! grep -Fxq "/usr/bin/lios-desktop" <<<"$rpm_contents"; then
+                echo "::error::Desktop RPM does not install /usr/bin/lios-desktop"
+                exit 1
+              fi
+              if grep -Fxq "/usr/bin/lios" <<<"$rpm_contents"; then
+                echo "::error::Desktop RPM claims the reserved CLI path /usr/bin/lios"
+                exit 1
+              fi
 
-              if ! verification="$(rpm --dbpath "$rpm_db" -Kv /input/lios.rpm 2>&1)"; then
+              if ! verification="$(rpm --dbpath "$rpm_db" -K --nosignature /input/lios.rpm 2>&1)"; then
                 printf "%s\n" "$verification"
-                echo "::error::RPM native signature verification failed"
+                echo "::error::RPM digest verification failed"
                 exit 1
               fi
               printf "%s\n" "$verification"
-              if ! grep -Eiq "signature.*: OK|signatures OK" <<<"$verification"; then
-                echo "::error::RPM verification did not report a valid signature"
-                exit 1
-              fi
             '
 
           chmod +x "$appimage"
           (cd "$appimage_root" && "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null)
           test -d "$appimage_root/squashfs-root"
+          test -x "$appimage_root/squashfs-root/usr/bin/lios-desktop"
+          test ! -e "$appimage_root/squashfs-root/usr/bin/lios"
           if find "$appimage_root/squashfs-root" -type f -iname WebView2Loader.dll -print -quit | grep -q .; then
             echo "::error::AppImage contains the Windows-only WebView2Loader.dll"
             exit 1
@@ -524,7 +376,7 @@ jobs:
           cp "$rpm_file" "release-assets/lios-desktop-v${VERSION}-linux-x86_64.rpm"
           cp "$appimage" "release-assets/lios-desktop-v${VERSION}-linux-x86_64.AppImage"
 
-      - name: Upload signed Linux artifacts
+      - name: Upload Linux artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-desktop-linux
@@ -532,42 +384,189 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  sign-release-assets:
-    name: Generate checksums and Sigstore bundles
+  cli-linux:
+    name: Build Linux CLI packages
+    needs: verify
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Install CLI packaging dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            dpkg-dev \
+            file \
+            libssl-dev \
+            pkg-config
+          cargo install --locked cargo-deb --version 3.7.0
+          cargo install --locked cargo-generate-rpm --version 0.21.0
+
+      - name: Build Linux CLI executable
+        run: cargo build --release --locked -p lios-cli --bin lios
+
+      - name: Bundle CLI DEB and RPM
+        shell: bash
+        run: |
+          cargo deb -p lios-cli --no-build
+          cargo generate-rpm -p crates/lios-cli
+
+      - name: Verify and normalize CLI packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb_root="$(mktemp -d)"
+          cleanup() {
+            rm -rf "$deb_root"
+          }
+          trap cleanup EXIT
+
+          deb="$(find target/debian -maxdepth 1 -name '*.deb' -print -quit)"
+          rpm_file="$(find target/generate-rpm -maxdepth 1 -name '*.rpm' -print -quit)"
+          test -n "$deb" && test -n "$rpm_file"
+
+          if [[ "$(dpkg-deb --field "$deb" Package)" != "lios-cli" ]]; then
+            echo "::error::CLI DEB package name must be lios-cli"
+            exit 1
+          fi
+          if [[ "$(dpkg-deb --field "$deb" Architecture)" != "amd64" ]]; then
+            echo "::error::CLI DEB architecture must be amd64"
+            exit 1
+          fi
+          deb_depends="$(dpkg-deb --field "$deb" Depends)"
+          printf 'CLI DEB dependencies: %s\n' "$deb_depends"
+          for required_deb_dependency in libc6 libssl3; do
+            if ! grep -Eq "(^|, )[[:space:]]*${required_deb_dependency}([[:space:](,]|$)" <<<"$deb_depends"; then
+              echo "::error::CLI DEB is missing the runtime dependency $required_deb_dependency"
+              exit 1
+            fi
+          done
+          dpkg-deb --extract "$deb" "$deb_root"
+          test -x "$deb_root/usr/bin/lios"
+          test ! -e "$deb_root/usr/bin/lios-desktop"
+          file "$deb_root/usr/bin/lios"
+          deb_links="$(ldd "$deb_root/usr/bin/lios" 2>&1)"
+          printf '%s\n' "$deb_links"
+          if grep -Fq "not found" <<<"$deb_links"; then
+            echo "::error::CLI DEB contains an executable with unresolved shared libraries"
+            exit 1
+          fi
+          "$deb_root/usr/bin/lios" --help >/dev/null
+
+          rpm_abs="$(realpath "$rpm_file")"
+          docker run --rm \
+            --mount "type=bind,src=${rpm_abs},dst=/input/lios-cli.rpm,readonly" \
+            fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814 \
+            bash -euo pipefail -c '
+              rpm_db="$(mktemp -d)"
+              rpm --dbpath "$rpm_db" --initdb
+
+              if [[ "$(rpm --dbpath "$rpm_db" -qp --qf "%{NAME}" /input/lios-cli.rpm)" != "lios-cli" ]]; then
+                echo "::error::CLI RPM package name must be lios-cli"
+                exit 1
+              fi
+              if [[ "$(rpm --dbpath "$rpm_db" -qp --qf "%{ARCH}" /input/lios-cli.rpm)" != "x86_64" ]]; then
+                echo "::error::CLI RPM architecture must be x86_64"
+                exit 1
+              fi
+              if ! rpm_contents="$(rpm --dbpath "$rpm_db" -qlp /input/lios-cli.rpm 2>&1)"; then
+                printf "%s\n" "$rpm_contents"
+                echo "::error::Fedora RPM tooling could not inspect the CLI package"
+                exit 1
+              fi
+              if ! grep -Fxq "/usr/bin/lios" <<<"$rpm_contents"; then
+                echo "::error::CLI RPM does not install /usr/bin/lios"
+                exit 1
+              fi
+              if grep -Fxq "/usr/bin/lios-desktop" <<<"$rpm_contents"; then
+                echo "::error::CLI RPM claims the Desktop path /usr/bin/lios-desktop"
+                exit 1
+              fi
+
+              if ! rpm_requires="$(rpm --dbpath "$rpm_db" -qpR /input/lios-cli.rpm 2>&1)"; then
+                printf "%s\n" "$rpm_requires"
+                echo "::error::Fedora RPM tooling could not inspect CLI runtime dependencies"
+                exit 1
+              fi
+              printf "%s\n" "$rpm_requires"
+              for required_rpm_dependency in \
+                "libc.so.6()(64bit)" \
+                "libcrypto.so.3()(64bit)" \
+                "libssl.so.3()(64bit)"; do
+                if ! grep -Fxq "$required_rpm_dependency" <<<"$rpm_requires"; then
+                  echo "::error::CLI RPM is missing the runtime dependency $required_rpm_dependency"
+                  exit 1
+                fi
+              done
+
+              if ! verification="$(rpm --dbpath "$rpm_db" -K --nosignature /input/lios-cli.rpm 2>&1)"; then
+                printf "%s\n" "$verification"
+                echo "::error::CLI RPM digest verification failed"
+                exit 1
+              fi
+              printf "%s\n" "$verification"
+              rpm --dbpath "$rpm_db" -i --nodeps --nosignature /input/lios-cli.rpm
+              test -x /usr/bin/lios
+              test ! -e /usr/bin/lios-desktop
+              /usr/bin/lios --help >/dev/null
+            '
+
+          mkdir -p release-assets
+          cp "$deb" "release-assets/lios-cli-v${VERSION}-linux-x86_64.deb"
+          cp "$rpm_file" "release-assets/lios-cli-v${VERSION}-linux-x86_64.rpm"
+
+      - name: Upload CLI artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-cli-linux
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  prepare-release-assets:
+    name: Prepare checksummed release assets
     needs:
       - verify
       - desktop-windows
       - desktop-linux
+      - cli-linux
     runs-on: ubuntu-22.04
     permissions:
       contents: read
-      id-token: write
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
-      - name: Download natively signed build artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: release-desktop-*
+          pattern: release-*-*
           path: release-assets
           merge-multiple: true
 
-      - name: Install Cosign v3
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v3.1.1
-
-      - name: Sign and immediately verify the complete payload set
+      - name: Validate payload set and generate checksums
         shell: bash
         run: |
           set -euo pipefail
           cd release-assets
           payloads=(
+            "lios-cli-v${VERSION}-linux-x86_64.deb"
+            "lios-cli-v${VERSION}-linux-x86_64.rpm"
             "lios-desktop-v${VERSION}-linux-x86_64.AppImage"
             "lios-desktop-v${VERSION}-linux-x86_64.deb"
             "lios-desktop-v${VERSION}-linux-x86_64.rpm"
             "lios-desktop-v${VERSION}-windows-x86_64-nsis.exe"
-            "lios-release-v${VERSION}-rpm-signing-public.asc"
           )
           mapfile -t actual_payloads < <(find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
           if [[ "${actual_payloads[*]}" != "${payloads[*]}" ]]; then
@@ -577,54 +576,21 @@ jobs:
             exit 1
           fi
           sha256sum "${payloads[@]}" > SHA256SUMS
-          payloads+=(SHA256SUMS)
+          sha256sum --check SHA256SUMS
 
-          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
-          for artifact in "${payloads[@]}"; do
-            cosign sign-blob --yes \
-              --bundle "${artifact}.sigstore.json" \
-              "$artifact"
-            cosign verify-blob \
-              --bundle "${artifact}.sigstore.json" \
-              --certificate-identity "$identity" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-              "$artifact"
-          done
-
-      - name: Upload complete signed release asset set
+      - name: Upload complete release asset set
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-signed-assets
+          name: release-assets
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
 
-  attest-release-assets:
-    name: Generate GitHub artifact attestations
-    needs: sign-release-assets
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-      artifact-metadata: write
-    steps:
-      - name: Download complete signed release asset set
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-signed-assets
-          path: release-assets
-
-      - name: Attest every GitHub Release asset
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
-        with:
-          subject-path: release-assets/*
-
   publish:
-    name: Publish complete signed GitHub Release
+    name: Publish unsigned GitHub Release
     needs:
       - verify
-      - attest-release-assets
+      - prepare-release-assets
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -633,16 +599,18 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - name: Download attested release asset set
+      - name: Download release asset set
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-signed-assets
+          name: release-assets
           path: release-assets
 
-      - name: Publish complete signed asset set
+      - name: Publish unsigned asset set
         shell: bash
         run: |
           set -euo pipefail
+          (cd release-assets && sha256sum --check SHA256SUMS)
+
           tag_ref="$(gh api "repos/${GH_REPO}/git/ref/tags/${GITHUB_REF_NAME}")"
           tag_type="$(jq -r '.object.type' <<<"$tag_ref")"
           tag_sha="$(jq -r '.object.sha' <<<"$tag_ref")"
@@ -656,7 +624,7 @@ jobs:
             exit 1
           fi
 
-          notes=$'## Desktop\n- Windows x86_64: signed NSIS installer\n- Linux x86_64: DEB, signed RPM, and AppImage\n- RPM public key: Sigstore-signed release asset\n\n## CLI\nThe signed Linux x86_64/ARM64 CLI matrix will be enabled when the headless CLI crate lands.'
+          notes=$'## Desktop\n- Windows x86_64: unsigned NSIS installer\n- Linux x86_64: unsigned DEB, RPM, and AppImage\n\n## CLI\n- Linux x86_64: unsigned DEB and RPM\n- No official tarball, bare binary, or ARM64 package is published\n\n## Security notice\n- This release intentionally has no Lios Authenticode, OpenPGP, or Sigstore signatures and no GitHub artifact attestations\n- Verify the six versioned packages against SHA256SUMS before installation\n- Windows may display an Unknown publisher or SmartScreen warning\n- Signed packages will be introduced in a future version; these assets will not be replaced in place'
           flags=(
             --verify-tag
             --generate-notes

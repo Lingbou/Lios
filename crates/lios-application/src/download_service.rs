@@ -1,3 +1,5 @@
+//! Validation and preparation for persisted download tasks.
+
 use lios_core::catalog::CatalogSelection;
 use lios_core::tasks::TaskRecord;
 use std::path::PathBuf;

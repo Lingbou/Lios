@@ -49,6 +49,29 @@ fn ensure_dirs_ignores_an_unavailable_logs_path_and_keeps_staging_usable() {
     assert!(paths.logs.is_file());
 }
 
+#[cfg(unix)]
+#[test]
+fn ensure_dirs_repairs_private_state_directory_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let paths = LiosPaths::from_home(tmp.path());
+    std::fs::create_dir_all(&paths.staging).unwrap();
+    std::fs::set_permissions(&paths.home, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::set_permissions(&paths.staging, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    paths.ensure_dirs().unwrap();
+
+    let home_mode = std::fs::metadata(&paths.home).unwrap().permissions().mode() & 0o777;
+    let staging_mode = std::fs::metadata(&paths.staging)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(home_mode, 0o700);
+    assert_eq!(staging_mode, 0o700);
+}
+
 #[test]
 fn task_scoped_paths_are_nested_under_staging_and_reject_unsafe_ids() {
     let tmp = tempdir().unwrap();
@@ -283,6 +306,33 @@ fn credentials_roundtrip_through_platform_protection() {
     assert_eq!(loaded, token);
     #[cfg(windows)]
     assert_ne!(std::fs::read(&path).unwrap(), token.as_bytes());
+}
+
+#[cfg(unix)]
+#[test]
+fn plaintext_credentials_are_atomically_replaced_with_owner_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("credentials.enc");
+    std::fs::write(&path, b"stale token").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    protect_to_file("first token", &path).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "first token");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    protect_to_file("replacement token", &path).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement token");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
 }
 
 #[test]
@@ -1130,6 +1180,83 @@ fn task_store_replaces_catalog_transaction_checkpoints_atomically() {
         Some(second_catalog)
     );
     assert_eq!(store.list_checkpoints(task.id).unwrap(), second_objects);
+}
+
+#[test]
+fn task_store_requeues_an_interrupted_active_task_without_restarting_completed_items() {
+    let tmp = tempdir().unwrap();
+    let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let spec = TaskSpec::Delete {
+        account_id: "a".repeat(64),
+        space_id: "b".repeat(64),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let mut task = TaskRecord::queued_for_spec(&spec);
+    task.state = TaskState::Running;
+    task.phase = Some("uploading".to_string());
+    task.progress_total = 2;
+    task.progress_done = 1;
+    task.bytes_total = 20;
+    task.bytes_done = 10;
+    task.speed_bps = 5;
+    task.eta_seconds = Some(2);
+    let running = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        name: "running.bin".to_string(),
+        relative_path: None,
+        source_path: None,
+        source_modified_at_ns: None,
+        size: 10,
+        state: TaskItemState::Running,
+        phase: Some("uploading".to_string()),
+        bytes_done: 5,
+        bytes_total: 10,
+        error: Some("stale".to_string()),
+    };
+    let completed = TaskItem {
+        id: Uuid::new_v4(),
+        task_id: task.id,
+        name: "completed.bin".to_string(),
+        relative_path: None,
+        source_path: None,
+        source_modified_at_ns: None,
+        size: 10,
+        state: TaskItemState::Completed,
+        phase: Some("completed".to_string()),
+        bytes_done: 10,
+        bytes_total: 10,
+        error: None,
+    };
+    store
+        .insert_with_spec_and_items(&task, &spec, &[running.clone(), completed.clone()])
+        .unwrap();
+
+    assert!(store.requeue_interrupted(task.id).unwrap());
+
+    let queued = store.get(task.id).unwrap().unwrap();
+    assert_eq!(queued.state, TaskState::Queued);
+    assert_eq!(queued.phase, None);
+    assert_eq!(queued.progress_done, 0);
+    assert_eq!(queued.bytes_done, 0);
+    assert_eq!(queued.speed_bps, 0);
+    assert_eq!(queued.eta_seconds, None);
+    assert_eq!(queued.attempt, 1);
+    let items = store.list_items(task.id).unwrap();
+    let restarted = items.iter().find(|item| item.id == running.id).unwrap();
+    assert_eq!(restarted.state, TaskItemState::Queued);
+    assert_eq!(restarted.phase, None);
+    assert_eq!(restarted.bytes_done, 0);
+    assert_eq!(restarted.error, None);
+    assert_eq!(
+        items.iter().find(|item| item.id == completed.id).unwrap(),
+        &completed
+    );
 }
 
 #[test]
@@ -2049,6 +2176,46 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
             .count(),
         5
     );
+}
+
+#[test]
+fn task_store_restart_recovery_can_be_scoped_to_one_locked_space() {
+    let tmp = tempdir().unwrap();
+    let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
+    let spec_for = |space_id: &str| TaskSpec::Delete {
+        account_id: "a".repeat(64),
+        space_id: space_id.to_string(),
+        repo: RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: space_id.to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+        },
+        node_ids: vec!["node-a".to_string()],
+    };
+    let first_spec = spec_for(&"b".repeat(64));
+    let second_spec = spec_for(&"c".repeat(64));
+    let first = TaskRecord::queued_for_spec(&first_spec);
+    let second = TaskRecord::queued_for_spec(&second_spec);
+    store.insert_with_spec(&first, &first_spec).unwrap();
+    store.insert_with_spec(&second, &second_spec).unwrap();
+    store
+        .update_state(first.id, TaskState::Running, None)
+        .unwrap();
+    store
+        .update_state(second.id, TaskState::Running, None)
+        .unwrap();
+
+    let report = store
+        .recover_after_restart_in_space(first_spec.space_id(), "legacy task cannot be resumed")
+        .unwrap();
+
+    assert_eq!(report.requeued, 1);
+    let first = store.get(first.id).unwrap().unwrap();
+    let second = store.get(second.id).unwrap().unwrap();
+    assert_eq!(first.state, TaskState::Queued);
+    assert_eq!(first.attempt, 1);
+    assert_eq!(second.state, TaskState::Running);
+    assert_eq!(second.attempt, 0);
 }
 
 #[test]

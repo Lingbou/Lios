@@ -7,6 +7,8 @@ use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(unix)]
+use crate::atomic::ensure_private_directory;
 use crate::atomic::{append_private, write_atomic};
 use crate::crypto::KeyFile;
 use crate::{LiosError, Result};
@@ -85,8 +87,8 @@ impl LiosPaths {
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
-        fs::create_dir_all(&self.home)?;
-        fs::create_dir_all(&self.staging)?;
+        ensure_private_state_directory(&self.home)?;
+        ensure_private_state_directory(&self.staging)?;
         Ok(())
     }
 
@@ -113,11 +115,22 @@ impl LiosPaths {
     }
 }
 
-fn is_internal_scope_id(value: &str) -> bool {
+pub(crate) fn is_internal_scope_id(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+pub(crate) fn ensure_private_state_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        ensure_private_directory(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
 }
 
 impl LiosConfig {

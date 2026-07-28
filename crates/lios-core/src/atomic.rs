@@ -151,6 +151,13 @@ pub(crate) fn write_atomic_new(path: &Path, contents: &[u8]) -> io::Result<()> {
     temp.persist_new(path)
 }
 
+#[cfg(not(windows))]
+pub(crate) fn write_private_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut temp = SiblingTempFile::create_private(path, ".lios-tmp")?;
+    temp.file_mut().write_all(contents)?;
+    temp.persist_replace(path)
+}
+
 pub(crate) fn write_private_atomic_new(path: &Path, contents: &[u8]) -> io::Result<()> {
     if path.exists() {
         return Err(io::Error::new(

@@ -1,3 +1,5 @@
+//! Redacted application logging shared by all product frontends.
+
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -29,7 +31,7 @@ static SIGNED_QUERY_SECRET: LazyLock<Regex> = LazyLock::new(|| {
     .expect("signed URL redaction regex is valid")
 });
 
-pub(crate) struct AppLogger {
+pub struct AppLogger {
     paths: LiosPaths,
     redactor: Redactor,
     write_lock: Mutex<()>,
@@ -40,7 +42,7 @@ struct Redactor {
 }
 
 impl AppLogger {
-    pub(crate) fn new(paths: &LiosPaths) -> Self {
+    pub fn new(paths: &LiosPaths) -> Self {
         Self {
             paths: paths.clone(),
             redactor: Redactor::new(paths),
@@ -48,11 +50,11 @@ impl AppLogger {
         }
     }
 
-    pub(crate) fn log(&self, level: &str, event: &str, details: Value) {
+    pub fn log(&self, level: &str, event: &str, details: Value) {
         let _ = self.write_at(Utc::now(), level, event, details);
     }
 
-    pub(crate) fn write_at(
+    pub fn write_at(
         &self,
         timestamp: DateTime<Utc>,
         level: &str,

@@ -1,3 +1,5 @@
+//! Catalog synchronization planning and publication shared by all frontends.
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -20,20 +22,20 @@ use uuid::Uuid;
 use crate::command_error::{CommandError, CommandErrorCode};
 use crate::{remote_to_staging_path, sha256_hex_file, to_err, CommandResult};
 
-pub(crate) struct SyncWork {
-    pub(crate) upload: Vec<CatalogSyncUpload>,
-    pub(crate) delete: Vec<String>,
-    pub(crate) initial_remote_inventory: Vec<StorageObject>,
-    pub(crate) prepublish_safe_paths: HashSet<String>,
-    pub(crate) base_catalog_sha256: Option<String>,
-    pub(crate) expected_revision: Option<RepoRevision>,
-    pub(crate) probe_directory: PathBuf,
+pub struct SyncWork {
+    pub upload: Vec<CatalogSyncUpload>,
+    pub delete: Vec<String>,
+    pub initial_remote_inventory: Vec<StorageObject>,
+    pub prepublish_safe_paths: HashSet<String>,
+    pub base_catalog_sha256: Option<String>,
+    pub expected_revision: Option<RepoRevision>,
+    pub probe_directory: PathBuf,
 }
 
-pub(crate) struct CatalogBaseline {
-    pub(crate) catalog_sha256: Option<String>,
-    pub(crate) referenced_paths: HashSet<String>,
-    pub(crate) remote_objects: Vec<StorageObject>,
+pub struct CatalogBaseline {
+    pub catalog_sha256: Option<String>,
+    pub referenced_paths: HashSet<String>,
+    pub remote_objects: Vec<StorageObject>,
 }
 
 fn desired_catalog_objects(
@@ -82,7 +84,7 @@ fn catalog_reference_paths(catalog: &Catalog, key: &KeyFile) -> CommandResult<Ha
     Ok(referenced)
 }
 
-pub(crate) fn catalog_baseline_from_downloaded_catalog(
+pub fn catalog_baseline_from_downloaded_catalog(
     paths: &LiosPaths,
     catalog: &Catalog,
     key: &KeyFile,
@@ -95,7 +97,7 @@ pub(crate) fn catalog_baseline_from_downloaded_catalog(
     })
 }
 
-pub(crate) async fn download_catalog_baseline(
+pub async fn download_catalog_baseline(
     paths: &LiosPaths,
     key: &KeyFile,
     adapter: &ModelScopeAdapter,
@@ -115,7 +117,7 @@ pub(crate) async fn download_catalog_baseline(
     Ok((catalog, baseline))
 }
 
-pub(crate) fn plan_catalog_sync_with_baseline(
+pub fn plan_catalog_sync_with_baseline(
     desired: Vec<CatalogSyncFile>,
     baseline: CatalogBaseline,
     probe_directory: PathBuf,
@@ -148,7 +150,7 @@ pub(crate) fn plan_catalog_sync_with_baseline(
     })
 }
 
-pub(crate) fn plan_catalog_sync(
+pub fn plan_catalog_sync(
     paths: &LiosPaths,
     catalog: &Catalog,
     key: &KeyFile,
@@ -158,7 +160,7 @@ pub(crate) fn plan_catalog_sync(
     plan_catalog_sync_with_baseline(desired, baseline, paths.staging.clone())
 }
 
-pub(crate) fn persist_sync_checkpoints(
+pub fn persist_sync_checkpoints(
     paths: &LiosPaths,
     task_id: Uuid,
     work: &SyncWork,
@@ -217,7 +219,7 @@ pub(crate) fn persist_sync_checkpoints(
         .map_err(to_err)
 }
 
-pub(crate) async fn execute_sync_work<A, C, P>(
+pub async fn execute_sync_work<A, C, P>(
     adapter: &A,
     repo: &RepoConfig,
     work: SyncWork,
@@ -249,7 +251,7 @@ where
     .map_err(to_err)
 }
 
-pub(crate) async fn sync_current_catalog(
+pub async fn sync_current_catalog(
     paths: &LiosPaths,
     catalog: &Catalog,
     key: &KeyFile,

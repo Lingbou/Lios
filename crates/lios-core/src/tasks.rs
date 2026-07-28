@@ -683,6 +683,60 @@ impl TaskStore {
         Ok(changed == 1)
     }
 
+    /// Requeues one task left active by a process that no longer owns its
+    /// per-space operating-system lock.
+    ///
+    /// Callers must acquire that lock before using this method; the database
+    /// alone cannot distinguish a crashed worker from a worker in another
+    /// process.
+    pub fn requeue_interrupted(&mut self, id: Uuid) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            r#"
+            UPDATE tasks
+            SET state = ?2,
+                phase = NULL,
+                progress_done = 0,
+                bytes_done = 0,
+                speed_bps = 0,
+                eta_seconds = NULL,
+                attempt = attempt + 1,
+                error = NULL,
+                updated_at = ?3
+            WHERE id = ?1
+              AND state IN (?4, ?5, ?6)
+              AND spec_json IS NOT NULL
+            "#,
+            rusqlite::params![
+                id.to_string(),
+                TaskState::Queued.as_str(),
+                now_timestamp(),
+                TaskState::Preparing.as_str(),
+                TaskState::Running.as_str(),
+                TaskState::Retrying.as_str(),
+            ],
+        )?;
+        if changed == 1 {
+            transaction.execute(
+                r#"
+                UPDATE task_items
+                SET state = ?2, phase = NULL, bytes_done = 0, error = NULL
+                WHERE task_id = ?1 AND state IN (?3, ?4)
+                "#,
+                rusqlite::params![
+                    id.to_string(),
+                    TaskItemState::Queued.as_str(),
+                    TaskItemState::Running.as_str(),
+                    TaskItemState::Queued.as_str(),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
     pub fn requeue_committing(&mut self, id: Uuid) -> Result<bool> {
         let transaction = self
             .connection
@@ -1273,6 +1327,27 @@ impl TaskStore {
         &mut self,
         unrecoverable_message: &str,
     ) -> Result<TaskRecoveryReport> {
+        self.recover_after_restart_matching(unrecoverable_message, None)
+    }
+
+    /// Recovers interrupted tasks for one remote space only.
+    ///
+    /// The caller must hold that space's operating-system lock for the entire
+    /// call so another Desktop or CLI process cannot still be running a task
+    /// that this method requeues.
+    pub fn recover_after_restart_in_space(
+        &mut self,
+        space_id: &str,
+        unrecoverable_message: &str,
+    ) -> Result<TaskRecoveryReport> {
+        self.recover_after_restart_matching(unrecoverable_message, Some(space_id))
+    }
+
+    fn recover_after_restart_matching(
+        &mut self,
+        unrecoverable_message: &str,
+        space_id: Option<&str>,
+    ) -> Result<TaskRecoveryReport> {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1281,7 +1356,9 @@ impl TaskStore {
                 r#"
                 SELECT id, spec_json
                 FROM tasks
-                WHERE spec_json IS NOT NULL AND state IN (?1, ?2, ?3, ?4, ?5, ?6)
+                WHERE spec_json IS NOT NULL
+                  AND state IN (?1, ?2, ?3, ?4, ?5, ?6)
+                  AND (?7 IS NULL OR space_id = ?7)
                 "#,
             )?;
             let rows = statement.query_map(
@@ -1292,6 +1369,7 @@ impl TaskStore {
                     TaskState::Paused.as_str(),
                     TaskState::Retrying.as_str(),
                     TaskState::Committing.as_str(),
+                    space_id,
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?;
@@ -1336,7 +1414,9 @@ impl TaskStore {
             WHERE state = ?2
               AND task_id IN (
                   SELECT id FROM tasks
-                  WHERE spec_json IS NOT NULL AND state IN (?3, ?4, ?5)
+                  WHERE spec_json IS NOT NULL
+                    AND state IN (?3, ?4, ?5)
+                    AND (?6 IS NULL OR space_id = ?6)
               )
             "#,
             rusqlite::params![
@@ -1345,6 +1425,7 @@ impl TaskStore {
                 TaskState::Preparing.as_str(),
                 TaskState::Running.as_str(),
                 TaskState::Retrying.as_str(),
+                space_id,
             ],
         )?;
         let requeued = transaction.execute(
@@ -1355,7 +1436,9 @@ impl TaskStore {
                 error = NULL,
                 attempt = attempt + 1,
                 updated_at = ?2
-            WHERE spec_json IS NOT NULL AND state IN (?3, ?4, ?5)
+            WHERE spec_json IS NOT NULL
+              AND state IN (?3, ?4, ?5)
+              AND (?6 IS NULL OR space_id = ?6)
             "#,
             rusqlite::params![
                 TaskState::Queued.as_str(),
@@ -1363,6 +1446,7 @@ impl TaskStore {
                 TaskState::Preparing.as_str(),
                 TaskState::Running.as_str(),
                 TaskState::Retrying.as_str(),
+                space_id,
             ],
         )?;
         transaction.execute(
@@ -1371,7 +1455,9 @@ impl TaskStore {
             SET state = ?1, phase = NULL, error = ?2
             WHERE task_id IN (
                 SELECT id FROM tasks
-                WHERE spec_json IS NULL AND state IN (?3, ?4, ?5, ?6, ?7, ?8)
+                WHERE spec_json IS NULL
+                  AND state IN (?3, ?4, ?5, ?6, ?7, ?8)
+                  AND (?11 IS NULL OR space_id = ?11)
             ) AND state IN (?9, ?10)
             "#,
             rusqlite::params![
@@ -1385,13 +1471,16 @@ impl TaskStore {
                 TaskState::Committing.as_str(),
                 TaskItemState::Queued.as_str(),
                 TaskItemState::Running.as_str(),
+                space_id,
             ],
         )?;
         let failed_unrecoverable = transaction.execute(
             r#"
             UPDATE tasks
             SET state = ?1, phase = NULL, error = ?2, updated_at = ?3
-            WHERE spec_json IS NULL AND state IN (?4, ?5, ?6, ?7, ?8, ?9)
+            WHERE spec_json IS NULL
+              AND state IN (?4, ?5, ?6, ?7, ?8, ?9)
+              AND (?10 IS NULL OR space_id = ?10)
             "#,
             rusqlite::params![
                 TaskState::Failed.as_str(),
@@ -1403,11 +1492,12 @@ impl TaskStore {
                 TaskState::Paused.as_str(),
                 TaskState::Retrying.as_str(),
                 TaskState::Committing.as_str(),
+                space_id,
             ],
         )?;
         let needs_reconciliation = transaction.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE spec_json IS NOT NULL AND state = ?1",
-            rusqlite::params![TaskState::Committing.as_str()],
+            "SELECT COUNT(*) FROM tasks WHERE spec_json IS NOT NULL AND state = ?1 AND (?2 IS NULL OR space_id = ?2)",
+            rusqlite::params![TaskState::Committing.as_str(), space_id],
             |row| row.get::<_, i64>(0),
         )?;
         let needs_reconciliation = usize::try_from(needs_reconciliation).map_err(|_| {

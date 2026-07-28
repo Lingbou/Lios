@@ -1,11 +1,7 @@
-#[allow(dead_code)]
-#[path = "../src/app_log.rs"]
-mod app_log;
-
 use std::fs;
 
-use app_log::AppLogger;
 use chrono::{TimeZone, Utc};
+use lios_application::app_log::AppLogger;
 use lios_core::config::LiosPaths;
 use serde_json::{json, Value};
 use tempfile::tempdir;

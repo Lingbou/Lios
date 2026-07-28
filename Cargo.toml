@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/lios-application",
+    "crates/lios-cli",
     "crates/lios-core",
     "src-tauri",
 ]

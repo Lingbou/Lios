@@ -8,6 +8,7 @@ export type CommandErrorCode =
   | "RateLimited"
   | "RemoteServer"
   | "CorruptedData"
+  | "Busy"
   | "InvalidInput"
   | "Storage"
   | "Internal";
@@ -29,6 +30,7 @@ const commandErrorCodes: readonly CommandErrorCode[] = [
   "RateLimited",
   "RemoteServer",
   "CorruptedData",
+  "Busy",
   "InvalidInput",
   "Storage",
   "Internal"
