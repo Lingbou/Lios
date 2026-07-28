@@ -222,7 +222,7 @@ jobs:
           Copy-Item $installer.FullName "release-assets\lios-desktop-v$env:VERSION-windows-x86_64-nsis.exe"
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-desktop-windows
           path: release-assets/*
@@ -377,7 +377,7 @@ jobs:
           cp "$appimage" "release-assets/lios-desktop-v${VERSION}-linux-x86_64.AppImage"
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-desktop-linux
           path: release-assets/*
@@ -528,7 +528,7 @@ jobs:
           cp "$rpm_file" "release-assets/lios-cli-v${VERSION}-linux-x86_64.rpm"
 
       - name: Upload CLI artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-cli-linux
           path: release-assets/*
@@ -579,7 +579,7 @@ jobs:
           sha256sum --check SHA256SUMS
 
       - name: Upload complete release asset set
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-assets
           path: release-assets/*
