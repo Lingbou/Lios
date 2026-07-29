@@ -28,7 +28,11 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> CliResult<()> {
-    let context = CliContext::new(cli.home)?;
+    let context = if matches!(&cli.command, Command::Status(_)) {
+        CliContext::new_for_status(cli.home)?
+    } else {
+        CliContext::new(cli.home)?
+    };
     match cli.command {
         Command::Setup => {
             let snapshot = context.setup()?;
@@ -57,7 +61,14 @@ async fn run(cli: Cli) -> CliResult<()> {
         Command::Status(args) => {
             let report = context.status(args.remote).await?;
             println!("Lios {}", env!("CARGO_PKG_VERSION"));
-            println!("State: {}", report.setup.paths.home.display());
+            if report.setup.paths.config.is_file() {
+                println!("State: {}", report.setup.paths.home.display());
+            } else {
+                println!(
+                    "State: not initialized ({})",
+                    report.setup.paths.home.display()
+                );
+            }
             match report.setup.recovery_key.key_location {
                 Some(path) => println!("Recovery key: configured at {path}"),
                 None => println!("Recovery key: missing"),

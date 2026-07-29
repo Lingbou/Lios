@@ -38,6 +38,15 @@ impl CliContext {
         })
     }
 
+    pub fn new_for_status(home: Option<PathBuf>) -> CliResult<Self> {
+        let paths = home
+            .map(LiosPaths::from_home)
+            .unwrap_or_else(LiosPaths::default_user);
+        Ok(Self {
+            application: Application::new_without_initializing(paths)?,
+        })
+    }
+
     pub fn setup(&self) -> CliResult<SetupSnapshot> {
         let snapshot = self.application.setup()?;
         if !snapshot.has_token {
@@ -55,7 +64,7 @@ impl CliContext {
     }
 
     pub async fn status(&self, remote: bool) -> CliResult<StatusReport> {
-        let setup = self.application.setup()?;
+        let setup = self.application.inspect_setup()?;
         let remote_user = if remote {
             Some(
                 self.application
