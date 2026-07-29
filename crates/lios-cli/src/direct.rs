@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use lios_application::service::{Application, CatalogSnapshot, DatasetRepoList, SetupSnapshot};
@@ -198,18 +198,44 @@ fn canonicalize_upload_paths(paths: Vec<PathBuf>) -> CliResult<Vec<PathBuf>> {
 }
 
 fn prompt_conflict_action(target_name: &str, source_path: &str) -> CliResult<ConflictAction> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    prompt_conflict_action_with_io(
+        target_name,
+        source_path,
+        &mut stdin.lock(),
+        &mut stdout.lock(),
+        &mut stderr.lock(),
+    )
+}
+
+fn prompt_conflict_action_with_io(
+    target_name: &str,
+    source_path: &str,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    error_output: &mut impl Write,
+) -> CliResult<ConflictAction> {
     loop {
-        print!(
+        write!(
+            output,
             "Upload conflict for {target_name} ({source_path}): [k]eep both, [r]eplace, [s]kip (default k): "
-        );
-        io::stdout().flush()?;
+        )?;
+        output.flush()?;
         let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
+        if input.read_line(&mut answer)? == 0 {
+            return Err(CliError::invalid_input(
+                "upload conflict input ended before a choice was made",
+            ));
+        }
         match answer.trim().to_ascii_lowercase().as_str() {
             "" | "k" | "keep" | "keep-both" => return Ok(ConflictAction::KeepBoth),
             "r" | "replace" => return Ok(ConflictAction::Replace),
             "s" | "skip" => return Ok(ConflictAction::Skip),
-            _ => eprintln!("Please enter k, r, or s."),
+            _ => {
+                let _ = writeln!(error_output, "Please enter k, r, or s.");
+            }
         }
     }
 }
@@ -281,11 +307,15 @@ fn tree_node_to_drive_item(node: &CatalogTreeNode) -> DriveItem {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::path::PathBuf;
 
     use lios_core::catalog::{CatalogTreeNode, CatalogTreeNodeKind, DriveItemKind};
 
-    use super::{canonicalize_upload_paths, list_tree_path, resolve_catalog_path};
+    use super::{
+        canonicalize_upload_paths, list_tree_path, prompt_conflict_action_with_io,
+        resolve_catalog_path,
+    };
 
     fn tree() -> CatalogTreeNode {
         CatalogTreeNode {
@@ -345,5 +375,38 @@ mod tests {
             result,
             vec![current.join("Cargo.toml").canonicalize().unwrap()]
         );
+    }
+
+    #[test]
+    fn upload_conflict_distinguishes_eof_from_an_empty_choice() {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let mut error_output = Vec::new();
+
+        let error = prompt_conflict_action_with_io(
+            "report.pdf",
+            "/tmp/report.pdf",
+            &mut input,
+            &mut output,
+            &mut error_output,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "upload conflict input ended before a choice was made"
+        );
+
+        let mut input = Cursor::new(b"\n");
+        let action = prompt_conflict_action_with_io(
+            "report.pdf",
+            "/tmp/report.pdf",
+            &mut input,
+            &mut output,
+            &mut error_output,
+        )
+        .unwrap();
+
+        assert_eq!(action, lios_core::catalog::ConflictAction::KeepBoth);
     }
 }
