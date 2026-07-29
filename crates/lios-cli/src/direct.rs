@@ -233,16 +233,7 @@ fn resolve_catalog_path<'a>(
             "catalog paths must be absolute and start with /",
         ));
     }
-    let mut segments = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .peekable();
-    if segments
-        .peek()
-        .is_some_and(|segment| segment.eq_ignore_ascii_case(&root.name))
-    {
-        segments.next();
-    }
+    let segments = path.split('/').filter(|segment| !segment.is_empty());
     let mut current = root;
     for segment in segments {
         current = match &current.kind {
@@ -320,10 +311,7 @@ mod tests {
         let tree = tree();
         assert_eq!(resolve_catalog_path(&tree, "/").unwrap().id, "root");
         assert_eq!(resolve_catalog_path(&tree, "/docs").unwrap().id, "docs");
-        assert_eq!(
-            resolve_catalog_path(&tree, "/SPACE/Docs").unwrap().id,
-            "docs"
-        );
+        assert_eq!(resolve_catalog_path(&tree, "/DoCs").unwrap().id, "docs");
         assert!(resolve_catalog_path(&tree, "docs").is_err());
         assert!(resolve_catalog_path(&tree, "/missing").is_err());
     }
@@ -335,6 +323,34 @@ mod tests {
         assert_eq!(items[0].name, "README.md");
         assert_eq!(items[0].size, 4);
         assert_eq!(items[0].kind, DriveItemKind::File);
+    }
+
+    #[test]
+    fn first_path_segment_can_name_a_root_child_that_matches_the_root() {
+        let mut tree = tree();
+        let CatalogTreeNodeKind::Directory { children } = &mut tree.kind else {
+            unreachable!();
+        };
+        children.push(CatalogTreeNode {
+            id: "same-name-child".to_string(),
+            name: "space".to_string(),
+            updated_at: "now".to_string(),
+            kind: CatalogTreeNodeKind::Directory {
+                children: vec![CatalogTreeNode {
+                    id: "marker".to_string(),
+                    name: "marker".to_string(),
+                    updated_at: "now".to_string(),
+                    kind: CatalogTreeNodeKind::Directory {
+                        children: Vec::new(),
+                    },
+                }],
+            },
+        });
+
+        let items = list_tree_path(&tree, "/space").unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "marker");
     }
 
     #[test]
