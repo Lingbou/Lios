@@ -61,7 +61,7 @@ async fn run(cli: Cli) -> CliResult<()> {
         Command::Status(args) => {
             let report = context.status(args.remote).await?;
             println!("Lios {}", env!("CARGO_PKG_VERSION"));
-            if report.setup.paths.config.is_file() {
+            if report.setup.initialized {
                 println!("State: {}", report.setup.paths.home.display());
             } else {
                 println!(
