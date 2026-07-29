@@ -60,6 +60,10 @@ pub struct Application {
 impl Application {
     pub fn new(paths: LiosPaths) -> CommandResult<Self> {
         paths.ensure_dirs().map_err(to_err)?;
+        Self::new_without_initializing(paths)
+    }
+
+    pub fn new_without_initializing(paths: LiosPaths) -> CommandResult<Self> {
         let read_staging = tempfile::Builder::new()
             .prefix("lios-catalog-read-")
             .tempdir()
@@ -104,6 +108,22 @@ impl Application {
             has_token: self.paths.credentials.is_file(),
             active_task_space_id,
             warning,
+        })
+    }
+
+    pub fn inspect_setup(&self) -> CommandResult<SetupSnapshot> {
+        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
+        let active_task_space_id = config
+            .active_repo
+            .as_ref()
+            .map(|repo| TaskScope::from_repo(repo).space_id);
+        Ok(SetupSnapshot {
+            paths: self.paths.clone(),
+            recovery_key: recovery_key_status(&config),
+            config,
+            has_token: self.paths.credentials.is_file(),
+            active_task_space_id,
+            warning: None,
         })
     }
 
