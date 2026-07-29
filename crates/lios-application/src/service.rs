@@ -219,6 +219,14 @@ impl Application {
     pub async fn open_space(&self, repo: RepoConfig) -> CommandResult<CatalogSnapshot> {
         let repo = validate_repo(repo)?;
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
+        self.open_space_with_adapter(repo, &adapter).await
+    }
+
+    async fn open_space_with_adapter(
+        &self,
+        repo: RepoConfig,
+        adapter: &(impl StorageAdapter + ?Sized),
+    ) -> CommandResult<CatalogSnapshot> {
         if !adapter
             .repo_exists(&repo.namespace, &repo.dataset)
             .await
@@ -228,7 +236,7 @@ impl Application {
                 "space was not found or is not visible",
             ));
         }
-        let config = self.persist_active_repo_and_load(repo.clone())?;
+        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
         let staging = self.fresh_read_staging()?;
         let local_path = staging.join(CATALOG_FILE);
@@ -236,7 +244,9 @@ impl Application {
             .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
             .await
             .map_err(map_catalog_load_error)?;
-        snapshot_from_catalog(&Catalog::from_staging(staging), &key, Vec::new())
+        let snapshot = snapshot_from_catalog(&Catalog::from_staging(staging), &key, Vec::new())?;
+        self.persist_active_repo(repo)?;
+        Ok(snapshot)
     }
 
     pub async fn list_children(&self, parent_node_id: &str) -> CommandResult<Vec<DriveItem>> {
@@ -440,4 +450,93 @@ pub fn existing_absolute_directory(path: &Path) -> CommandResult<PathBuf> {
         ));
     }
     path.canonicalize().map_err(to_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use async_trait::async_trait;
+    use lios_core::catalog::Catalog;
+    use lios_core::config::{LiosConfig, LiosPaths, RepoConfig, MODELSCOPE_ENDPOINT};
+    use lios_core::crypto::KeyFile;
+    use lios_core::storage::{StorageAdapter, StorageObject};
+    use lios_core::Result;
+    use tempfile::tempdir;
+
+    use super::Application;
+
+    struct CatalogFromDifferentKeyAdapter {
+        catalog: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl StorageAdapter for CatalogFromDifferentKeyAdapter {
+        async fn create_repo(&self, _namespace: &str, _dataset: &str) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn repo_exists(&self, _namespace: &str, _dataset: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn list_objects(
+            &self,
+            _namespace: &str,
+            _dataset: &str,
+            _prefix: &str,
+        ) -> Result<Vec<StorageObject>> {
+            unreachable!()
+        }
+
+        async fn download_object(
+            &self,
+            _namespace: &str,
+            _dataset: &str,
+            _remote_path: &str,
+            local_path: &Path,
+        ) -> Result<()> {
+            tokio::fs::write(local_path, &self.catalog).await?;
+            Ok(())
+        }
+    }
+
+    fn repo(namespace: &str, dataset: &str) -> RepoConfig {
+        RepoConfig {
+            namespace: namespace.to_string(),
+            dataset: dataset.to_string(),
+            endpoint: MODELSCOPE_ENDPOINT.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_space_open_preserves_the_active_repo() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let application = Application::new(paths.clone()).unwrap();
+        application.setup().unwrap();
+        let previous = repo("owner", "previous");
+        let mut config = LiosConfig::load(&paths.config).unwrap();
+        config.active_repo = Some(previous.clone());
+        config.save(&paths.config).unwrap();
+        let other_home = tempdir().unwrap();
+        let other_key = KeyFile::generate_to_path(other_home.path().join("recovery.key")).unwrap();
+        let other_catalog =
+            Catalog::initialize_empty("target", &other_key, other_home.path().join("staging"))
+                .unwrap();
+        let adapter = CatalogFromDifferentKeyAdapter {
+            catalog: fs::read(other_catalog.encrypted_catalog_path()).unwrap(),
+        };
+
+        application
+            .open_space_with_adapter(repo("owner", "target"), &adapter)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            LiosConfig::load(&paths.config).unwrap().active_repo,
+            Some(previous)
+        );
+    }
 }
