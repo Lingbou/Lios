@@ -27,6 +27,7 @@ use crate::{to_err, CommandError, CommandResult};
 #[derive(Debug, Clone)]
 pub struct SetupSnapshot {
     pub paths: LiosPaths,
+    pub initialized: bool,
     pub config: LiosConfig,
     pub recovery_key: RecoveryKeyStatus,
     pub has_token: bool,
@@ -97,34 +98,34 @@ impl Application {
             let warning = prepare_startup_config(&self.paths, &mut config)?;
             (config, warning)
         };
+        Ok(self.setup_snapshot(config, true, warning))
+    }
+
+    pub fn inspect_setup(&self) -> CommandResult<SetupSnapshot> {
+        let initialized = self.paths.config.is_file();
+        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
+        Ok(self.setup_snapshot(config, initialized, None))
+    }
+
+    fn setup_snapshot(
+        &self,
+        config: LiosConfig,
+        initialized: bool,
+        warning: Option<SetupWarning>,
+    ) -> SetupSnapshot {
         let active_task_space_id = config
             .active_repo
             .as_ref()
             .map(|repo| TaskScope::from_repo(repo).space_id);
-        Ok(SetupSnapshot {
+        SetupSnapshot {
             paths: self.paths.clone(),
+            initialized,
             recovery_key: recovery_key_status(&config),
             config,
             has_token: self.paths.credentials.is_file(),
             active_task_space_id,
             warning,
-        })
-    }
-
-    pub fn inspect_setup(&self) -> CommandResult<SetupSnapshot> {
-        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
-        let active_task_space_id = config
-            .active_repo
-            .as_ref()
-            .map(|repo| TaskScope::from_repo(repo).space_id);
-        Ok(SetupSnapshot {
-            paths: self.paths.clone(),
-            recovery_key: recovery_key_status(&config),
-            config,
-            has_token: self.paths.credentials.is_file(),
-            active_task_space_id,
-            warning: None,
-        })
+        }
     }
 
     pub fn set_token(&self, token: &str) -> CommandResult<()> {
