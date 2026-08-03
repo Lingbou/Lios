@@ -139,6 +139,17 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     temp.persist_replace(path)
 }
 
+pub fn copy_file_atomic(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
+    let mut source_file = File::open(source)?;
+    let mut temp = SiblingTempFile::create(destination, ".lios-part")?;
+    io::copy(&mut source_file, temp.file_mut())?;
+    if replace {
+        temp.persist_replace(destination)
+    } else {
+        temp.persist_new(destination)
+    }
+}
+
 pub(crate) fn write_atomic_new(path: &Path, contents: &[u8]) -> io::Result<()> {
     if path.exists() {
         return Err(io::Error::new(

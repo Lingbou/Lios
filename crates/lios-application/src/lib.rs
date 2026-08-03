@@ -13,11 +13,15 @@ pub mod catalog_sync;
 pub mod command_error;
 pub mod config_mutation_gate;
 pub mod download_service;
+pub mod location;
 pub mod production_config;
 pub mod recovery_key_service;
 pub mod service;
+pub mod space_registry;
 pub mod task_manager;
 pub mod task_runner;
+pub mod transfer_planner;
+pub mod transfer_request;
 
 pub use command_error::{CommandError, CommandErrorCode};
 

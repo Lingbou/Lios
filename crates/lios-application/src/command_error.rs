@@ -1,5 +1,6 @@
 //! Stable application errors safe to expose through Desktop or CLI adapters.
 
+use lios_core::config::ConfigLockError;
 use lios_core::space_lock::SpaceLockError;
 use lios_core::{LiosError, RemoteError, RemoteErrorKind};
 use serde::Serialize;
@@ -65,6 +66,25 @@ impl std::fmt::Display for CommandError {
 }
 
 impl std::error::Error for CommandError {}
+
+impl From<ConfigLockError> for CommandError {
+    fn from(error: ConfigLockError) -> Self {
+        match error {
+            ConfigLockError::Busy => Self::new(
+                CommandErrorCode::Busy,
+                "Lios configuration is busy in another process",
+                true,
+                None,
+            ),
+            ConfigLockError::Io(_) => Self::new(
+                CommandErrorCode::Storage,
+                "Lios configuration lock could not be opened",
+                true,
+                None,
+            ),
+        }
+    }
+}
 
 impl From<RemoteError> for CommandError {
     fn from(error: RemoteError) -> Self {

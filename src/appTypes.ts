@@ -11,6 +11,7 @@ export type RepoConfig = {
 };
 
 export type SpaceSummary = RepoConfig & {
+  space_name: string;
   visibility?: string | null;
   updated_at?: string | null;
   description?: string | null;
@@ -28,7 +29,8 @@ export type DatasetRepoListResult = {
 };
 
 export type LiosConfig = {
-  active_repo?: RepoConfig | null;
+  schema_version: number;
+  spaces: Record<string, RepoConfig>;
   key_file_path?: string | null;
   backup_path?: string | null;
   chunk_size?: number | null;
@@ -98,7 +100,7 @@ export type CatalogRebuildPreview = {
 };
 
 export type CatalogRebuildDialog = {
-  space: RepoConfig;
+  space: SpaceSummary;
   status: "loading" | "ready" | "submitting" | "error";
   preview: CatalogRebuildPreview | null;
   error: string;
@@ -116,7 +118,7 @@ export type Snapshot = {
   config: LiosConfig;
   recovery_key: RecoveryKeyStatus;
   has_token: boolean;
-  active_task_space_id: string | null;
+  spaces: SpaceSummary[];
   warning: SetupWarning | null;
 };
 

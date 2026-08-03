@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Lios",
   "mainBinaryName": "lios-desktop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "dev.lios.client",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -28,6 +28,7 @@
   },
   "bundle": {
     "active": false,
+    "externalBin": ["binaries/lios-worker"],
     "publisher": "Lingbou",
     "targets": "all",
     "icon": [

@@ -14,12 +14,18 @@ publish = false
 name = "lios"
 path = "src/main.rs"
 
+[[bin]]
+name = "lios-worker"
+path = "src/worker.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 lios-application = { path = "../lios-application" }
 lios-core = { path = "../lios-core" }
 rpassword = "7"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 uuid = "1"
 
 [package.metadata.deb]
@@ -30,6 +36,7 @@ priority = "optional"
 depends = "$auto"
 assets = [
   ["target/release/lios", "usr/bin/lios", "755"],
+  ["target/release/lios-worker", "usr/bin/lios-worker", "755"],
   ["README.md", "usr/share/doc/lios-cli/README.md", "644"],
 ]
 extended-description = "Headless Linux client for browsing and operating a Lios encrypted ModelScope drive."
@@ -40,5 +47,6 @@ summary = "Headless Lios encrypted-drive client"
 license = "MIT"
 assets = [
   { source = "target/release/lios", dest = "/usr/bin/lios", mode = "0755" },
+  { source = "target/release/lios-worker", dest = "/usr/bin/lios-worker", mode = "0755" },
   { source = "README.md", dest = "/usr/share/doc/lios-cli/README.md", mode = "0644", doc = true },
 ]

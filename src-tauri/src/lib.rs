@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 
 use app_log::AppLogger;
 use catalog_mutation_gate::CatalogMutationGate;
@@ -28,6 +29,8 @@ use command_error::{CommandError, CommandErrorCode};
 use command_surface::with_registered_commands;
 use config_mutation_gate::ConfigMutationGate;
 use download_service::prepare_download_task;
+use lios_application::service::Application;
+use lios_application::space_registry::SpaceRegistry;
 use lios_core::cache::{cleanup_temporary_staging, prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
     Catalog, CatalogIntegrityOutcome, CatalogRebuildOutcome, CatalogRebuildReport,
@@ -148,8 +151,30 @@ struct SetupSnapshot {
     config: LiosConfig,
     recovery_key: RecoveryKeyStatus,
     has_token: bool,
-    active_task_space_id: Option<String>,
+    spaces: Vec<RegisteredSpaceDto>,
     warning: Option<SetupWarning>,
+}
+
+#[derive(Serialize)]
+struct RegisteredSpaceDto {
+    space_name: String,
+    namespace: String,
+    dataset: String,
+    endpoint: String,
+    task_space_id: String,
+}
+
+impl RegisteredSpaceDto {
+    fn new(space_name: String, repo: RepoConfig) -> Self {
+        let task_space_id = TaskScope::from_repo(&repo).space_id;
+        Self {
+            space_name,
+            namespace: repo.namespace,
+            dataset: repo.dataset,
+            endpoint: repo.endpoint,
+            task_space_id,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -502,19 +527,6 @@ fn update_terminal_task_items(
 
 fn read_token(paths: &LiosPaths) -> CommandResult<String> {
     unprotect_from_file(&paths.credentials).map_err(to_err)
-}
-
-fn adapter_from_config(
-    paths: &LiosPaths,
-    config: &LiosConfig,
-) -> CommandResult<(ModelScopeAdapter, RepoConfig)> {
-    let repo = config
-        .active_repo
-        .clone()
-        .ok_or_else(|| CommandError::invalid_input("dataset repo is not configured"))?;
-    let repo = validate_repo(repo)?;
-    let token = read_token(paths)?;
-    Ok((ModelScopeAdapter::new(repo.endpoint.clone(), token), repo))
 }
 
 fn key_from_config(config: &LiosConfig) -> CommandResult<KeyFile> {
@@ -922,7 +934,11 @@ fn terminal_staging_cleanup_label(spec: &TaskSpec) -> Option<&'static str> {
     match spec {
         TaskSpec::VerifySpace { .. } => Some("verification"),
         TaskSpec::RebuildCatalog { .. } => Some("catalog rebuild"),
-        TaskSpec::Upload { .. } | TaskSpec::Delete { .. } | TaskSpec::Download { .. } => None,
+        TaskSpec::Copy { .. }
+        | TaskSpec::Sync { .. }
+        | TaskSpec::Upload { .. }
+        | TaskSpec::Delete { .. }
+        | TaskSpec::Download { .. } => None,
     }
 }
 
@@ -1140,8 +1156,47 @@ fn submit_and_spawn(
     let task = persist_submission(&state.paths, &spec, source_files).map_err(to_err)?;
     let summary = submission_summary(&task)?;
     emit_task(app, &state.paths, task.id);
-    spawn_persisted_task(app.clone(), task.id);
+    start_shared_worker(&state.paths)?;
     Ok(summary)
+}
+
+fn start_shared_worker(paths: &LiosPaths) -> CommandResult<()> {
+    if paths.worker_running().map_err(CommandError::from)? {
+        return Ok(());
+    }
+    let _ = fs::remove_file(paths.worker_stop_path());
+    paths.ensure_worker_control_dir()?;
+    let current = std::env::current_exe().map_err(to_err)?;
+    let extension = current.extension().map(|value| value.to_os_string());
+    let mut worker = current.with_file_name("lios-worker");
+    if let Some(extension) = extension {
+        worker.set_extension(extension);
+    }
+    if !worker.is_file() {
+        return Err(CommandError::new(
+            CommandErrorCode::Storage,
+            "lios-worker is missing from the Desktop installation",
+            false,
+            None,
+        ));
+    }
+    let home_root = paths.home.parent().ok_or_else(|| {
+        CommandError::new(
+            CommandErrorCode::Storage,
+            "Lios Home has no parent directory for worker startup",
+            false,
+            None,
+        )
+    })?;
+    ProcessCommand::new(worker)
+        .arg("--home")
+        .arg(home_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(to_err)?;
+    Ok(())
 }
 
 fn recover_startup_tasks(paths: &LiosPaths) -> CommandResult<StartupTaskRecovery> {
@@ -1234,7 +1289,9 @@ fn reconciliation_error_should_wait(error: &CommandError) -> bool {
 
 fn task_spec_repo(spec: &TaskSpec) -> &RepoConfig {
     match spec {
-        TaskSpec::Upload { repo, .. }
+        TaskSpec::Copy { repo, .. }
+        | TaskSpec::Sync { repo, .. }
+        | TaskSpec::Upload { repo, .. }
         | TaskSpec::Delete { repo, .. }
         | TaskSpec::Download { repo, .. }
         | TaskSpec::VerifySpace { repo, .. }
@@ -2165,6 +2222,9 @@ async fn execute_task_spec(
     cancellation: &CancellationToken,
 ) -> CommandResult<TaskWorkerOutcome> {
     match spec {
+        TaskSpec::Copy { .. } | TaskSpec::Sync { .. } => Err(CommandError::invalid_input(
+            "persisted 0.2 transfer execution is unavailable",
+        )),
         TaskSpec::Upload {
             repo,
             parent_node_id,
@@ -3566,16 +3626,17 @@ fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnap
         let warning = prepare_startup_config(&state.paths, &mut config)?;
         (config, warning)
     };
-    let active_task_space_id = config
-        .active_repo
-        .as_ref()
-        .map(|repo| TaskScope::from_repo(repo).space_id);
+    let spaces = config
+        .spaces
+        .iter()
+        .map(|(name, repo)| RegisteredSpaceDto::new(name.clone(), repo.clone()))
+        .collect();
     Ok(SetupSnapshot {
         paths: paths_dto(&state.paths),
         recovery_key: recovery_key_status(&config),
         config,
         has_token: state.paths.credentials.exists(),
-        active_task_space_id,
+        spaces,
         warning,
     })
 }
@@ -3589,6 +3650,7 @@ fn setup_token(state: tauri::State<'_, AppContext>, token: String) -> CommandRes
 #[tauri::command]
 async fn create_dataset_repo(
     state: tauri::State<'_, AppContext>,
+    name: String,
     namespace: String,
     dataset: String,
     endpoint: String,
@@ -3599,16 +3661,21 @@ async fn create_dataset_repo(
         dataset,
         endpoint,
     })?;
-    let token = read_token(&state.paths)?;
-    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
-    adapter
-        .create_repo(&repo.namespace, &repo.dataset)
-        .await
-        .map_err(to_err)?;
-    let _config_guard = state.config_mutation_gate.lock()?;
-    let mut config = load_config(&state.paths)?;
-    config.active_repo = Some(repo);
-    persist_config(&state.paths, &mut config)
+    let application = Application::new(state.paths.clone())?;
+    application.create_dataset_repo(repo.clone()).await?;
+    if let Err(error) = application.initialize_space(repo.clone()).await {
+        return Err(CommandError::new(
+            error.code,
+            format!(
+                "Repository {}/{} was created but not registered; retry with `lios space init {} {}/{}`: {}",
+                repo.namespace, repo.dataset, name, repo.namespace, repo.dataset, error.message
+            ),
+            error.retryable,
+            error.details,
+        ));
+    }
+    SpaceRegistry::new(state.paths.clone()).add(&name, repo)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -3635,10 +3702,10 @@ async fn list_dataset_repos(
 #[tauri::command]
 async fn initialize_space(
     state: tauri::State<'_, AppContext>,
-    space: RepoConfig,
+    space_name: String,
 ) -> CommandResult<CatalogLoadResult> {
     state.paths.ensure_dirs().map_err(to_err)?;
-    let repo = validate_repo(space)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let _process_space_lock = state
         .paths
         .try_lock_space(&TaskScope::from_repo(&repo).space_id)
@@ -3674,13 +3741,7 @@ async fn initialize_space(
             .await
             .map_err(to_err)?,
     };
-    let config = {
-        let _config_guard = state.config_mutation_gate.lock()?;
-        let mut config = load_config(&state.paths)?;
-        config.active_repo = Some(repo.clone());
-        persist_config(&state.paths, &mut config)?;
-        config
-    };
+    let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
     reset_staging(&state.paths)?;
     let catalog = Catalog::initialize_empty(&repo.dataset, &key, state.paths.staging.clone())
@@ -3702,156 +3763,83 @@ async fn initialize_space(
 #[tauri::command]
 async fn load_space_catalog(
     state: tauri::State<'_, AppContext>,
-    space: RepoConfig,
+    space_name: String,
 ) -> CommandResult<CatalogLoadResult> {
     state.paths.ensure_dirs().map_err(to_err)?;
-    let repo = validate_repo(space)?;
-    let token = read_token(&state.paths)?;
-    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
-    if !adapter
-        .repo_exists(&repo.namespace, &repo.dataset)
-        .await
-        .map_err(to_err)?
-    {
-        return Err(CommandError::invalid_input(
-            "space was not found or is not visible",
-        ));
-    }
-    let config = {
-        let _config_guard = state.config_mutation_gate.lock()?;
-        let mut config = load_config(&state.paths)?;
-        config.active_repo = Some(repo.clone());
-        persist_config(&state.paths, &mut config)?;
-        config
-    };
-    let key = key_from_config(&config)?;
-    let staging = state.fresh_read_staging()?;
-    let local_path = staging.join(CATALOG_FILE);
-    adapter
-        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
-        .await
-        .map_err(map_catalog_load_error)?;
-    let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
-    let catalog = Catalog::from_staging(staging);
-    let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
+    let snapshot = Application::new(state.paths.clone())?
+        .open_space(repo)
+        .await?;
     Ok(CatalogLoadResult {
-        local_path: local_path.display().to_string(),
-        bytes,
-        tree,
-        warnings: Vec::new(),
+        local_path: snapshot.local_path.display().to_string(),
+        bytes: snapshot.bytes,
+        tree: snapshot.tree,
+        warnings: snapshot.warnings,
     })
 }
 
 #[tauri::command]
 async fn preview_upload_conflicts(
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     parent_node_id: String,
     paths: Vec<String>,
 ) -> CommandResult<Vec<UploadConflict>> {
-    let config = load_config(&state.paths)?;
-    let key = key_from_config(&config)?;
-    let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let staging = state.fresh_read_staging()?;
-    let catalog_path = staging.join(CATALOG_FILE);
-    adapter
-        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
-        .await
-        .map_err(to_err)?;
-    let catalog = Catalog::from_staging(staging);
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-    catalog
-        .preview_upload_conflicts(&parent_node_id, &paths, &key)
-        .map_err(to_err)
+    Application::new(state.paths.clone())?
+        .preview_upload_conflicts_in(repo, &parent_node_id, &paths)
+        .await
 }
 
 #[tauri::command]
 async fn create_folder(
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     parent_node_id: String,
     name: String,
 ) -> CommandResult<CatalogLoadResult> {
-    let config = load_config(&state.paths)?;
-    let key = key_from_config(&config)?;
-    let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let _process_space_lock = state
-        .paths
-        .try_lock_space(&TaskScope::from_repo(&repo).space_id)
-        .map_err(CommandError::from)?;
-    let _space_mutation_guard = state
-        .task_manager
-        .acquire_space(TaskScope::from_repo(&repo).space_id)
-        .await;
-    let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
-    let local_path = state.paths.staging.join(CATALOG_FILE);
-    let (catalog, baseline) =
-        download_catalog_baseline(&state.paths, &key, &adapter, &repo).await?;
-    catalog
-        .create_folder(&parent_node_id, &name, &key)
-        .map_err(to_err)?;
-    let warnings =
-        sync_current_catalog(&state.paths, &catalog, &key, &adapter, &repo, baseline).await?;
-    let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
-    let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
+    let snapshot = Application::new(state.paths.clone())?
+        .create_folder_in(repo, &parent_node_id, &name)
+        .await?;
     Ok(CatalogLoadResult {
-        local_path: local_path.display().to_string(),
-        bytes,
-        tree,
-        warnings,
+        local_path: snapshot.local_path.display().to_string(),
+        bytes: snapshot.bytes,
+        tree: snapshot.tree,
+        warnings: snapshot.warnings,
     })
 }
 
 #[tauri::command]
 async fn rename_node(
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     node_id: String,
     new_name: String,
 ) -> CommandResult<CatalogLoadResult> {
-    let config = load_config(&state.paths)?;
-    let key = key_from_config(&config)?;
-    let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let _process_space_lock = state
-        .paths
-        .try_lock_space(&TaskScope::from_repo(&repo).space_id)
-        .map_err(CommandError::from)?;
-    let _space_mutation_guard = state
-        .task_manager
-        .acquire_space(TaskScope::from_repo(&repo).space_id)
-        .await;
-    let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
-    let local_path = state.paths.staging.join(CATALOG_FILE);
-    let (catalog, baseline) =
-        download_catalog_baseline(&state.paths, &key, &adapter, &repo).await?;
-    catalog
-        .rename_node(&node_id, &new_name, &key)
-        .map_err(to_err)?;
-    let warnings =
-        sync_current_catalog(&state.paths, &catalog, &key, &adapter, &repo, baseline).await?;
-    let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
-    let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
+    let snapshot = Application::new(state.paths.clone())?
+        .rename_node_in(repo, &node_id, &new_name)
+        .await?;
     Ok(CatalogLoadResult {
-        local_path: local_path.display().to_string(),
-        bytes,
-        tree,
-        warnings,
+        local_path: snapshot.local_path.display().to_string(),
+        bytes: snapshot.bytes,
+        tree: snapshot.tree,
+        warnings: snapshot.warnings,
     })
 }
 
 #[tauri::command]
 async fn search_catalog(
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     query: String,
 ) -> CommandResult<Vec<DriveItem>> {
-    let config = load_config(&state.paths)?;
-    let key = key_from_config(&config)?;
-    let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let staging = state.fresh_read_staging()?;
-    let catalog_path = staging.join(CATALOG_FILE);
-    adapter
-        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
+    Application::new(state.paths.clone())?
+        .search_in(repo, &query)
         .await
-        .map_err(to_err)?;
-    let catalog = Catalog::from_staging(staging);
-    catalog.search(&query, &key).map_err(to_err)
 }
 
 #[tauri::command]
@@ -3864,13 +3852,10 @@ fn export_recovery_key(
         &state.config_mutation_gate,
         Path::new(&destination),
     )?;
-    let active_repo = LiosConfig::load(&state.paths.config)
-        .ok()
-        .and_then(|config| config.active_repo);
     state.app_log.log(
         "info",
         "recovery_key_exported",
-        recovery_log_details(false, active_repo.as_ref()),
+        serde_json::json!({ "catalog_checked": false }),
     );
     Ok(status)
 }
@@ -3906,6 +3891,7 @@ async fn import_recovery_key(
 async fn enqueue_upload_to_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     parent_node_id: String,
     paths: Vec<String>,
     mut conflict_resolutions: Vec<ConflictResolution>,
@@ -3936,7 +3922,7 @@ async fn enqueue_upload_to_folder(
     }
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
-    let (_adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let source_snapshot = snapshot_upload_sources(&upload_paths).map_err(to_err)?;
     let spec = TaskSpec::Upload {
@@ -3956,6 +3942,7 @@ async fn enqueue_upload_to_folder(
 async fn enqueue_delete_nodes(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     node_ids: Vec<String>,
 ) -> CommandResult<TaskSummary> {
     if node_ids.is_empty() {
@@ -3965,7 +3952,7 @@ async fn enqueue_delete_nodes(
     }
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
-    let (_adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let spec = TaskSpec::Delete {
         account_id: scope.account_id,
@@ -3980,6 +3967,7 @@ async fn enqueue_delete_nodes(
 async fn enqueue_download(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     node_ids: Vec<String>,
     output_dir: String,
 ) -> CommandResult<TaskSummary> {
@@ -3991,7 +3979,7 @@ async fn enqueue_download(
     };
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
-    let (_adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let spec = TaskSpec::Download {
         account_id: scope.account_id,
@@ -4007,13 +3995,13 @@ async fn enqueue_download(
 async fn enqueue_verify_space(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
-    space: RepoConfig,
+    space_name: String,
     full: bool,
 ) -> CommandResult<TaskSummary> {
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
     read_token(&state.paths)?;
-    let repo = validate_repo(space)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let spec = TaskSpec::VerifySpace {
         account_id: scope.account_id,
@@ -4027,11 +4015,11 @@ async fn enqueue_verify_space(
 #[tauri::command]
 async fn preview_rebuild_catalog(
     state: tauri::State<'_, AppContext>,
-    space: RepoConfig,
+    space_name: String,
 ) -> CommandResult<CatalogRebuildPreviewResult> {
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
-    let repo = validate_repo(space)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let _space_permit = state
         .task_manager
@@ -4117,13 +4105,13 @@ async fn preview_rebuild_catalog(
 async fn enqueue_rebuild_catalog(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
-    space: RepoConfig,
+    space_name: String,
     expected_revision: String,
 ) -> CommandResult<TaskSummary> {
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
     read_token(&state.paths)?;
-    let repo = validate_repo(space)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let expected_revision = expected_revision.trim();
     if expected_revision.is_empty() {
         return Err(CommandError::invalid_input(
@@ -4186,14 +4174,16 @@ async fn pause_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    interrupt_task_state(
-        &state.paths,
-        &state.task_lifecycle_gate,
-        task_id,
-        TaskState::Paused,
-    )
-    .await?;
-    state.task_manager.cancel(task_id).await;
+    let summary = task_summary_for_paths(&state.paths, task_id)?
+        .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
+    if summary.state == TaskState::Queued {
+        Application::new(state.paths.clone())?
+            .pause_task(task_id)
+            .await?;
+    } else {
+        state.paths.ensure_worker_control_dir()?;
+        fs::write(state.paths.worker_pause_path(task_id), b"pause\n").map_err(to_err)?;
+    }
     emit_task(&app, &state.paths, task_id);
     Ok(())
 }
@@ -4204,17 +4194,8 @@ async fn resume_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    if state.task_manager.is_running(task_id).await {
-        state.task_manager.wait_until_stopped(task_id).await;
-    }
-    if task_store(&state.paths)?
-        .transition_state(task_id, TaskState::Paused, TaskState::Queued)
-        .map_err(to_err)?
-    {
-        spawn_persisted_task(app.clone(), task_id);
-    } else {
-        return Err(CommandError::invalid_input("only paused tasks can resume"));
-    }
+    Application::new(state.paths.clone())?.requeue_paused_task(task_id)?;
+    start_shared_worker(&state.paths)?;
     emit_task(&app, &state.paths, task_id);
     Ok(())
 }
@@ -4225,19 +4206,9 @@ async fn retry_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    if state.task_manager.is_running(task_id).await {
-        return Err(CommandError::invalid_input(
-            "task worker must stop before retrying",
-        ));
-    }
-    let mut store = task_store(&state.paths)?;
-    if !store.requeue_failed(task_id).map_err(to_err)? {
-        return Err(CommandError::invalid_input(
-            "only failed tasks with a saved specification can retry",
-        ));
-    }
+    Application::new(state.paths.clone())?.requeue_failed_task(task_id)?;
     emit_task(&app, &state.paths, task_id);
-    spawn_persisted_task(app.clone(), task_id);
+    start_shared_worker(&state.paths)?;
     Ok(())
 }
 
@@ -4247,14 +4218,16 @@ async fn cancel_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    interrupt_task_state(
-        &state.paths,
-        &state.task_lifecycle_gate,
-        task_id,
-        TaskState::Canceled,
-    )
-    .await?;
-    state.task_manager.cancel(task_id).await;
+    let summary = task_summary_for_paths(&state.paths, task_id)?
+        .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
+    if matches!(summary.state, TaskState::Queued | TaskState::Paused) {
+        Application::new(state.paths.clone())?
+            .cancel_task(task_id)
+            .await?;
+    } else {
+        state.paths.ensure_worker_control_dir()?;
+        fs::write(state.paths.worker_cancel_path(task_id), b"cancel\n").map_err(to_err)?;
+    }
     emit_task(&app, &state.paths, task_id);
     Ok(())
 }
@@ -4297,7 +4270,9 @@ pub fn run() {
                 }),
             );
             start_terminal_task_staging_cleanup(&handle, &paths);
-            start_startup_tasks(&handle, &paths, recovery)?;
+            if !recovery.queued.is_empty() || !recovery.reconcile.is_empty() {
+                start_shared_worker(&paths)?;
+            }
             Ok(())
         })
         .invoke_handler(with_registered_commands!(generate_tauri_handler))
@@ -4437,7 +4412,7 @@ mod task_center_backend_tests {
             recovery_key: recovery_key_status(&config),
             config,
             has_token: false,
-            active_task_space_id: None,
+            spaces: Vec::new(),
             warning: None,
         };
         let event = TaskUpdateEvent::Upsert {
@@ -6447,7 +6422,7 @@ mod recovery_key_service_tests {
         let active_key = KeyFile::load_from_path(&active_key_path).unwrap();
         let target = repo();
         let mut config = LiosConfig::load(&paths.config).unwrap();
-        config.active_repo = Some(target.clone());
+        config.spaces.insert("archive".to_string(), target.clone());
         config.save(&paths.config).unwrap();
         let original_config = fs::read(&paths.config).unwrap();
         let remote = tempdir().unwrap();
@@ -6492,7 +6467,7 @@ mod recovery_key_service_tests {
         let active_key = KeyFile::load_from_path(&active_key_path).unwrap();
         let target = repo();
         let mut config = LiosConfig::load(&paths.config).unwrap();
-        config.active_repo = Some(target.clone());
+        config.spaces.insert("archive".to_string(), target.clone());
         config.save(&paths.config).unwrap();
         let remote = tempdir().unwrap();
         let remote_staging = remote.path().join("remote");
@@ -6514,7 +6489,10 @@ mod recovery_key_service_tests {
         let adapter =
             FakeCatalogAdapter::catalog_with_action(remote_staging.join(CATALOG_FILE), move || {
                 let mut config = LiosConfig::load(&config_path).unwrap();
-                config.active_repo = Some(concurrent_repo_for_action);
+                config.spaces.clear();
+                config
+                    .spaces
+                    .insert("other".to_string(), concurrent_repo_for_action);
                 config.key_file_path = Some(concurrent_key_for_action);
                 config.save(&config_path).unwrap();
                 *concurrent_bytes_for_action.lock().unwrap() =
@@ -6538,7 +6516,7 @@ mod recovery_key_service_tests {
             concurrent_bytes.lock().unwrap().clone().unwrap()
         );
         let saved = LiosConfig::load(&paths.config).unwrap();
-        assert_eq!(saved.active_repo, Some(concurrent_repo));
+        assert_eq!(saved.spaces.get("other"), Some(&concurrent_repo));
         assert_eq!(
             saved.key_file_path.as_deref(),
             Some(concurrent_key_path.as_path())
@@ -6552,7 +6530,7 @@ mod recovery_key_service_tests {
         let active_key = KeyFile::load_from_path(&active_key_path).unwrap();
         let target = repo();
         let mut config = LiosConfig::load(&paths.config).unwrap();
-        config.active_repo = Some(target.clone());
+        config.spaces.insert("archive".to_string(), target.clone());
         config.save(&paths.config).unwrap();
         let remote = tempdir().unwrap();
         let remote_staging = remote.path().join("remote");
@@ -6583,7 +6561,8 @@ mod recovery_key_service_tests {
             gate_held_tx.send(()).unwrap();
             write_rx.recv().unwrap();
             let mut config = LiosConfig::load(&writer_config_path).unwrap();
-            config.active_repo = Some(writer_repo);
+            config.spaces.clear();
+            config.spaces.insert("winner".to_string(), writer_repo);
             config.key_file_path = Some(writer_key_path);
             config.save(&writer_config_path).unwrap();
             written_tx
@@ -6619,7 +6598,7 @@ mod recovery_key_service_tests {
         assert_eq!(error.code, CommandErrorCode::RemoteConflict);
         assert_eq!(fs::read(&paths.config).unwrap(), concurrent_bytes);
         let saved = LiosConfig::load(&paths.config).unwrap();
-        assert_eq!(saved.active_repo, Some(concurrent_repo));
+        assert_eq!(saved.spaces.get("winner"), Some(&concurrent_repo));
         assert_eq!(
             saved.key_file_path.as_deref(),
             Some(concurrent_key_path.as_path())

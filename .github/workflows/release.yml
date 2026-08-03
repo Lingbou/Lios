@@ -129,6 +129,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Build bundled Windows worker
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p lios-cli --bin lios-worker --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Force src-tauri\binaries | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\lios-worker.exe src-tauri\binaries\lios-worker-x86_64-pc-windows-msvc.exe
+
       - name: Build NSIS installer
         shell: pwsh
         run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
@@ -171,15 +178,17 @@ jobs:
           }
 
           $installedExecutable = Join-Path $installDir "lios-desktop.exe"
+          $workerExecutable = Join-Path $installDir "lios-worker.exe"
           $reservedCliExecutable = Join-Path $installDir "lios.exe"
           $webViewLoader = Join-Path $installDir "WebView2Loader.dll"
           $uninstaller = Join-Path $installDir "uninstall.exe"
-          foreach ($path in @($installedExecutable, $webViewLoader, $uninstaller)) {
+          foreach ($path in @($installedExecutable, $workerExecutable, $webViewLoader, $uninstaller)) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
               throw "NSIS install did not produce $path"
             }
           }
           Assert-Unsigned $installedExecutable
+          Assert-Unsigned $workerExecutable
           Assert-Unsigned $uninstaller
           Assert-ValidAuthenticodeSignature $webViewLoader
           if (Test-Path -LiteralPath $reservedCliExecutable) {
@@ -206,7 +215,7 @@ jobs:
           if ($uninstallProcess.ExitCode -ne 0) {
             throw "silent NSIS uninstall failed with exit code $($uninstallProcess.ExitCode)"
           }
-          foreach ($path in @($installedExecutable, $webViewLoader, $uninstaller)) {
+          foreach ($path in @($installedExecutable, $workerExecutable, $webViewLoader, $uninstaller)) {
             if (Test-Path -LiteralPath $path) {
               throw "silent NSIS uninstall left $path behind"
             }
@@ -294,6 +303,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Build bundled Linux worker
+        shell: bash
+        run: |
+          cargo build --release --locked -p lios-cli --bin lios-worker
+          mkdir -p src-tauri/binaries
+          cp target/release/lios-worker src-tauri/binaries/lios-worker-x86_64-unknown-linux-gnu
+
       - name: Build Linux desktop executable
         run: npx tauri build --no-bundle
 
@@ -323,8 +339,10 @@ jobs:
           dpkg-deb --extract "$deb" "$deb_root"
           desktop-file-validate "$deb_root/usr/share/applications/Lios.desktop"
           test -x "$deb_root/usr/bin/lios-desktop"
+          test -x "$deb_root/usr/bin/lios-worker"
           test ! -e "$deb_root/usr/bin/lios"
           file "$deb_root/usr/bin/lios-desktop"
+          file "$deb_root/usr/bin/lios-worker"
 
           mkdir -p release-assets
           rpm_abs="$(realpath "$rpm_file")"
@@ -414,8 +432,8 @@ jobs:
           cargo install --locked cargo-deb --version 3.7.0
           cargo install --locked cargo-generate-rpm --version 0.21.0
 
-      - name: Build Linux CLI executable
-        run: cargo build --release --locked -p lios-cli --bin lios
+      - name: Build Linux CLI executables
+        run: cargo build --release --locked -p lios-cli
 
       - name: Bundle CLI DEB and RPM
         shell: bash
@@ -455,8 +473,10 @@ jobs:
           done
           dpkg-deb --extract "$deb" "$deb_root"
           test -x "$deb_root/usr/bin/lios"
+          test -x "$deb_root/usr/bin/lios-worker"
           test ! -e "$deb_root/usr/bin/lios-desktop"
           file "$deb_root/usr/bin/lios"
+          file "$deb_root/usr/bin/lios-worker"
           deb_links="$(ldd "$deb_root/usr/bin/lios" 2>&1)"
           printf '%s\n' "$deb_links"
           if grep -Fq "not found" <<<"$deb_links"; then

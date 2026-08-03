@@ -18,7 +18,11 @@ use crate::catalog_probe::{ensure_space_can_initialize, map_catalog_load_error};
 use crate::catalog_sync::{download_catalog_baseline, sync_current_catalog, CatalogBaseline};
 use crate::config_mutation_gate::ConfigMutationGate;
 use crate::production_config::{
-    configured_endpoint, persist_config, prepare_startup_config, validate_repo, SetupWarning,
+    configured_endpoint, prepare_startup_config, validate_repo, SetupWarning,
+};
+use crate::recovery_key_service::{
+    export_recovery_key_for_paths, import_recovery_key_for_paths, verify_recovery_key_for_paths,
+    RecoveryKeyVerification,
 };
 use crate::recovery_key_service::{recovery_key_status, RecoveryKeyStatus};
 use crate::task_manager::{TaskManager, TaskScope};
@@ -31,7 +35,6 @@ pub struct SetupSnapshot {
     pub config: LiosConfig,
     pub recovery_key: RecoveryKeyStatus,
     pub has_token: bool,
-    pub active_task_space_id: Option<String>,
     pub warning: Option<SetupWarning>,
 }
 
@@ -94,6 +97,7 @@ impl Application {
         self.paths.ensure_dirs().map_err(to_err)?;
         let (config, warning) = {
             let _guard = self.config_gate.lock()?;
+            let _process_guard = self.paths.try_lock_config().map_err(CommandError::from)?;
             let mut config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
             let warning = prepare_startup_config(&self.paths, &mut config)?;
             (config, warning)
@@ -113,17 +117,12 @@ impl Application {
         initialized: bool,
         warning: Option<SetupWarning>,
     ) -> SetupSnapshot {
-        let active_task_space_id = config
-            .active_repo
-            .as_ref()
-            .map(|repo| TaskScope::from_repo(repo).space_id);
         SetupSnapshot {
             paths: self.paths.clone(),
             initialized,
             recovery_key: recovery_key_status(&config),
             config,
             has_token: self.paths.credentials.is_file(),
-            active_task_space_id,
             warning,
         }
     }
@@ -137,14 +136,6 @@ impl Application {
         }
         self.paths.ensure_dirs().map_err(to_err)?;
         protect_to_file(token, &self.paths.credentials).map_err(to_err)
-    }
-
-    pub fn active_repo(&self) -> CommandResult<RepoConfig> {
-        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
-        let repo = config
-            .active_repo
-            .ok_or_else(|| CommandError::invalid_input("no active space is configured"))?;
-        validate_repo(repo)
     }
 
     pub async fn list_dataset_repos(
@@ -169,7 +160,7 @@ impl Application {
             .create_repo(&repo.namespace, &repo.dataset)
             .await
             .map_err(to_err)?;
-        self.persist_active_repo(repo)
+        Ok(())
     }
 
     pub async fn initialize_space(&self, repo: RepoConfig) -> CommandResult<CatalogSnapshot> {
@@ -206,7 +197,7 @@ impl Application {
                 .await
                 .map_err(to_err)?,
         };
-        let config = self.persist_active_repo_and_load(repo.clone())?;
+        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
         reset_staging(&self.paths)?;
         let catalog = Catalog::initialize_empty(&repo.dataset, &key, self.paths.staging.clone())
@@ -245,38 +236,102 @@ impl Application {
             .await
             .map_err(map_catalog_load_error)?;
         let snapshot = snapshot_from_catalog(&Catalog::from_staging(staging), &key, Vec::new())?;
-        self.persist_active_repo(repo)?;
         Ok(snapshot)
     }
 
-    pub async fn list_children(&self, parent_node_id: &str) -> CommandResult<Vec<DriveItem>> {
-        let (catalog, key, _repo) = self.download_active_catalog().await?;
+    pub fn recovery_key_status(&self) -> CommandResult<RecoveryKeyStatus> {
+        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
+        Ok(recovery_key_status(&config))
+    }
+
+    pub fn backup_recovery_key(&self, destination: &Path) -> CommandResult<RecoveryKeyStatus> {
+        export_recovery_key_for_paths(&self.paths, &self.config_gate, destination)
+    }
+
+    pub async fn verify_recovery_key(
+        &self,
+        candidate: &Path,
+    ) -> CommandResult<RecoveryKeyVerification> {
+        verify_recovery_key_for_paths(&self.paths, candidate).await
+    }
+
+    pub async fn import_recovery_key(
+        &self,
+        candidate: &Path,
+    ) -> CommandResult<RecoveryKeyVerification> {
+        import_recovery_key_for_paths(&self.paths, &self.config_gate, candidate).await
+    }
+
+    pub async fn list_children_in(
+        &self,
+        repo: RepoConfig,
+        parent_node_id: &str,
+    ) -> CommandResult<Vec<DriveItem>> {
+        let (catalog, key) = self.download_catalog_for(repo).await?;
         catalog.list_children(parent_node_id, &key).map_err(to_err)
     }
 
-    pub async fn search(&self, query: &str) -> CommandResult<Vec<DriveItem>> {
-        let (catalog, key, _repo) = self.download_active_catalog().await?;
+    pub async fn search_in(&self, repo: RepoConfig, query: &str) -> CommandResult<Vec<DriveItem>> {
+        let (catalog, key) = self.download_catalog_for(repo).await?;
         catalog.search(query, &key).map_err(to_err)
     }
 
-    pub async fn preview_upload_conflicts(
+    pub async fn preview_upload_conflicts_in(
         &self,
+        repo: RepoConfig,
         parent_node_id: &str,
         paths: &[PathBuf],
     ) -> CommandResult<Vec<UploadConflict>> {
-        let (catalog, key, _repo) = self.download_active_catalog().await?;
+        let (catalog, key) = self.download_catalog_for(repo).await?;
         catalog
             .preview_upload_conflicts(parent_node_id, paths, &key)
             .map_err(to_err)
     }
 
-    pub async fn create_folder(
+    pub async fn create_folder_in(
         &self,
+        repo: RepoConfig,
         parent_node_id: &str,
         name: &str,
     ) -> CommandResult<CatalogSnapshot> {
-        let (config, key, adapter, repo) = self.active_context()?;
-        drop(config);
+        self.mutate_space_catalog(repo, |catalog, key| {
+            catalog
+                .create_folder(parent_node_id, name, key)
+                .map_err(to_err)
+        })
+        .await
+    }
+
+    pub async fn move_node_in(
+        &self,
+        repo: RepoConfig,
+        node_id: &str,
+        new_parent_node_id: &str,
+        new_name: &str,
+        replace_node_id: Option<&str>,
+    ) -> CommandResult<CatalogSnapshot> {
+        self.mutate_space_catalog(repo, |catalog, key| {
+            if let Some(replace_node_id) = replace_node_id {
+                catalog
+                    .delete_nodes(&[replace_node_id.to_string()], key)
+                    .map_err(to_err)?;
+            }
+            catalog
+                .move_node(node_id, new_parent_node_id, new_name, key)
+                .map_err(to_err)
+        })
+        .await
+    }
+
+    async fn mutate_space_catalog(
+        &self,
+        repo: RepoConfig,
+        mutation: impl FnOnce(&Catalog, &KeyFile) -> CommandResult<()>,
+    ) -> CommandResult<CatalogSnapshot> {
+        let repo = validate_repo(repo)?;
+        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
+        let key = key_from_config(&config)?;
+        let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
         let scope = TaskScope::from_repo(&repo);
         let _process_space_lock = self
             .paths
@@ -286,36 +341,22 @@ impl Application {
         let _catalog_guard = self.catalog_gate.lock_mutation().await;
         let (catalog, baseline) =
             download_catalog_baseline(&self.paths, &key, &adapter, &repo).await?;
-        catalog
-            .create_folder(parent_node_id, name, &key)
-            .map_err(to_err)?;
+        mutation(&catalog, &key)?;
         let warnings =
             sync_current_catalog(&self.paths, &catalog, &key, &adapter, &repo, baseline).await?;
         snapshot_from_catalog(&catalog, &key, warnings)
     }
 
-    pub async fn rename_node(
+    pub async fn rename_node_in(
         &self,
+        repo: RepoConfig,
         node_id: &str,
         new_name: &str,
     ) -> CommandResult<CatalogSnapshot> {
-        let (config, key, adapter, repo) = self.active_context()?;
-        drop(config);
-        let scope = TaskScope::from_repo(&repo);
-        let _process_space_lock = self
-            .paths
-            .try_lock_space(&scope.space_id)
-            .map_err(CommandError::from)?;
-        let _space_guard = self.task_manager.acquire_space(scope.space_id).await;
-        let _catalog_guard = self.catalog_gate.lock_mutation().await;
-        let (catalog, baseline) =
-            download_catalog_baseline(&self.paths, &key, &adapter, &repo).await?;
-        catalog
-            .rename_node(node_id, new_name, &key)
-            .map_err(to_err)?;
-        let warnings =
-            sync_current_catalog(&self.paths, &catalog, &key, &adapter, &repo, baseline).await?;
-        snapshot_from_catalog(&catalog, &key, warnings)
+        self.mutate_space_catalog(repo, |catalog, key| {
+            catalog.rename_node(node_id, new_name, key).map_err(to_err)
+        })
+        .await
     }
 
     pub fn normalize_conflict_resolutions(
@@ -340,42 +381,18 @@ impl Application {
         })
     }
 
-    fn persist_active_repo(&self, repo: RepoConfig) -> CommandResult<()> {
-        self.persist_active_repo_and_load(repo).map(|_| ())
-    }
-
-    fn persist_active_repo_and_load(&self, repo: RepoConfig) -> CommandResult<LiosConfig> {
-        let _guard = self.config_gate.lock()?;
-        let mut config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
-        config.active_repo = Some(repo);
-        prepare_startup_config(&self.paths, &mut config)?;
-        persist_config(&self.paths, &mut config)?;
-        Ok(config)
-    }
-
-    pub(crate) fn active_context(
-        &self,
-    ) -> CommandResult<(LiosConfig, KeyFile, ModelScopeAdapter, RepoConfig)> {
+    async fn download_catalog_for(&self, repo: RepoConfig) -> CommandResult<(Catalog, KeyFile)> {
         let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
-        let repo = config
-            .active_repo
-            .clone()
-            .ok_or_else(|| CommandError::invalid_input("no active space is configured"))?;
         let repo = validate_repo(repo)?;
         let key = key_from_config(&config)?;
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
-        Ok((config, key, adapter, repo))
-    }
-
-    async fn download_active_catalog(&self) -> CommandResult<(Catalog, KeyFile, RepoConfig)> {
-        let (_config, key, adapter, repo) = self.active_context()?;
         let staging = self.fresh_read_staging()?;
         let local_path = staging.join(CATALOG_FILE);
         adapter
             .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
             .await
             .map_err(map_catalog_load_error)?;
-        Ok((Catalog::from_staging(staging), key, repo))
+        Ok((Catalog::from_staging(staging), key))
     }
 
     fn fresh_read_staging(&self) -> CommandResult<PathBuf> {
@@ -511,15 +528,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_space_open_preserves_the_active_repo() {
+    async fn failed_space_open_does_not_mutate_the_space_registry() {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         let application = Application::new(paths.clone()).unwrap();
         application.setup().unwrap();
-        let previous = repo("owner", "previous");
         let mut config = LiosConfig::load(&paths.config).unwrap();
-        config.active_repo = Some(previous.clone());
+        config
+            .spaces
+            .insert("previous".to_string(), repo("owner", "previous"));
         config.save(&paths.config).unwrap();
+        let before = fs::read(&paths.config).unwrap();
         let other_home = tempdir().unwrap();
         let other_key = KeyFile::generate_to_path(other_home.path().join("recovery.key")).unwrap();
         let other_catalog =
@@ -534,9 +553,6 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(
-            LiosConfig::load(&paths.config).unwrap().active_repo,
-            Some(previous)
-        );
+        assert_eq!(fs::read(&paths.config).unwrap(), before);
     }
 }
