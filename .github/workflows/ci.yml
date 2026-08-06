@@ -60,6 +60,13 @@ jobs:
       - name: Verify Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Build Tauri sidecar
+        shell: bash
+        run: |
+          cargo build --locked -p lios-cli --bin lios-worker
+          mkdir -p src-tauri/binaries
+          cp target/debug/lios-worker src-tauri/binaries/lios-worker-x86_64-unknown-linux-gnu
+
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
