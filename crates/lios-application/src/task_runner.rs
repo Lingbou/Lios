@@ -1435,29 +1435,28 @@ fn validate_local_destination_fingerprint(action: &PersistedTransferAction) -> C
     let Some(path) = action.local_destination_path.as_deref() else {
         return Ok(());
     };
+    if action.kind == TransferActionKind::Delete {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(to_err(error)),
+            Ok(metadata) if action.entry_kind == TransferEntryKind::Directory => {
+                // Child deletions intentionally change their parent directory's
+                // length and modification time. Revalidate link/reparse safety,
+                // but let remove_dir provide the final non-empty safety check.
+                fingerprint_path(path).map_err(|_| local_destination_changed(action))?;
+                if !metadata.is_dir() {
+                    return Err(local_destination_changed(action));
+                }
+                return Ok(());
+            }
+            Ok(_) => {}
+        }
+    }
     match action.destination_fingerprint.as_deref() {
         Some(expected) => {
-            let actual = fingerprint_path(path).map_err(|_| {
-                CommandError::new(
-                    CommandErrorCode::RemoteConflict,
-                    format!(
-                        "local destination changed after planning: {}",
-                        action.relative_path
-                    ),
-                    true,
-                    None,
-                )
-            })?;
+            let actual = fingerprint_path(path).map_err(|_| local_destination_changed(action))?;
             if actual != expected {
-                return Err(CommandError::new(
-                    CommandErrorCode::RemoteConflict,
-                    format!(
-                        "local destination changed after planning: {}",
-                        action.relative_path
-                    ),
-                    true,
-                    None,
-                ));
+                return Err(local_destination_changed(action));
             }
         }
         None if path.exists() => {
@@ -1474,6 +1473,18 @@ fn validate_local_destination_fingerprint(action: &PersistedTransferAction) -> C
         None => {}
     }
     Ok(())
+}
+
+fn local_destination_changed(action: &PersistedTransferAction) -> CommandError {
+    CommandError::new(
+        CommandErrorCode::RemoteConflict,
+        format!(
+            "local destination changed after planning: {}",
+            action.relative_path
+        ),
+        true,
+        None,
+    )
 }
 
 fn apply_pull_action(
@@ -1777,10 +1788,16 @@ mod tests {
         CatalogTransactionProgress,
     };
     use lios_core::config::LiosPaths;
-    use lios_core::tasks::{CheckpointState, TaskRecord, TaskStore};
+    use lios_core::tasks::{
+        CheckpointState, PersistedTransferAction, TaskRecord, TaskStore, TransferActionKind,
+        TransferActionState, TransferEntryKind,
+    };
     use tempfile::tempdir;
 
-    use super::persist_transaction_progress;
+    use super::{
+        delete_local_destination, fingerprint_path, persist_transaction_progress,
+        validate_local_destination_fingerprint,
+    };
 
     #[test]
     fn transaction_progress_persists_uploaded_and_committed_checkpoints() {
@@ -1825,5 +1842,37 @@ mod tests {
             store.list_checkpoints(task.id).unwrap()[0].state,
             CheckpointState::Committed
         );
+    }
+
+    #[test]
+    fn planned_child_deletion_does_not_invalidate_parent_directory_deletion() {
+        let temp = tempdir().unwrap();
+        let parent = temp.path().join("old");
+        std::fs::create_dir(&parent).unwrap();
+        let child = parent.join("file.txt");
+        std::fs::write(&child, b"stale").unwrap();
+
+        let action = |relative_path: &str,
+                      path: std::path::PathBuf,
+                      entry_kind: TransferEntryKind| PersistedTransferAction {
+            relative_path: relative_path.to_string(),
+            source_path: None,
+            remote_node_id: None,
+            local_destination_path: Some(path.clone()),
+            kind: TransferActionKind::Delete,
+            entry_kind,
+            source_sha256: None,
+            source_fingerprint: None,
+            size: 0,
+            destination_fingerprint: Some(fingerprint_path(&path).unwrap()),
+            state: TransferActionState::Pending,
+        };
+        let child_action = action("old/file.txt", child, TransferEntryKind::File);
+        let parent_action = action("old", parent, TransferEntryKind::Directory);
+
+        validate_local_destination_fingerprint(&child_action).unwrap();
+        delete_local_destination(&child_action).unwrap();
+        validate_local_destination_fingerprint(&parent_action).unwrap();
+        delete_local_destination(&parent_action).unwrap();
     }
 }

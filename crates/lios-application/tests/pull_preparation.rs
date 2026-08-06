@@ -59,3 +59,59 @@ fn remote_directory_trailing_slash_maps_contents_symmetrically() {
         PlanActionKind::Create
     );
 }
+
+#[test]
+fn sync_contents_to_local_root_deletes_destination_only_root_entries() {
+    let temp = tempdir().unwrap();
+    let destination_path = temp.path().join("restore");
+    std::fs::create_dir(&destination_path).unwrap();
+    std::fs::write(destination_path.join("remove.txt"), b"stale").unwrap();
+    let destination = LocalLocation {
+        path: destination_path,
+        trailing_slash: false,
+    };
+
+    let prepared = prepare_pull(
+        &[RemoteSource {
+            node: remote_dir(),
+            trailing_slash: true,
+        }],
+        &destination,
+        &PlanOptions {
+            delete: true,
+            yes: true,
+            ..PlanOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.plan.action("remove.txt").unwrap().kind,
+        PlanActionKind::Delete
+    );
+}
+
+#[test]
+fn sync_excludes_are_relative_to_the_selected_remote_root() {
+    let temp = tempdir().unwrap();
+    let destination = LocalLocation {
+        path: temp.path().join("restore"),
+        trailing_slash: false,
+    };
+
+    let prepared = prepare_pull(
+        &[RemoteSource {
+            node: remote_dir(),
+            trailing_slash: false,
+        }],
+        &destination,
+        &PlanOptions {
+            exclude: vec!["image.jpg".to_string()],
+            ..PlanOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(prepared.plan.action("photos").is_some());
+    assert!(prepared.plan.action("photos/image.jpg").is_none());
+}

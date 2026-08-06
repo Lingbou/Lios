@@ -16,7 +16,7 @@ use clap::Parser;
 use error::{CliError, CliResult};
 use lios_application::location::{Location, LocationParser, RemoteLocation};
 use lios_application::service::Application;
-use lios_application::space_registry::SpaceRegistry;
+use lios_application::space_registry::{validate_space_name, SpaceRegistry};
 use lios_application::transfer_planner::{PlanOptions, TreeEntry};
 use lios_application::transfer_request::{
     prepare_pull, prepare_push, PreparedPull, PreparedPush, RemoteSource,
@@ -648,6 +648,7 @@ async fn run_sync(
         PlanOptions {
             delete: args.delete,
             exclude: excludes.clone(),
+            exclude_root: None,
             replace_type: args.replace_type,
             yes: args.yes,
             no_clobber: false,
@@ -1425,6 +1426,7 @@ async fn run_space(
             endpoint,
         } => {
             let repo = parse_repository_address(&repository, endpoint)?;
+            registry.ensure_can_add(&name, &repo)?;
             application.open_space(repo.clone()).await?;
             registry.add(&name, repo.clone())?;
             registered_space_output(name, repo)
@@ -1435,6 +1437,7 @@ async fn run_space(
             endpoint,
         } => {
             let repo = parse_repository_address(&repository, endpoint)?;
+            registry.ensure_can_add(&name, &repo)?;
             application.initialize_space(repo.clone()).await?;
             registry.add(&name, repo.clone())?;
             registered_space_output(name, repo)
@@ -1445,6 +1448,7 @@ async fn run_space(
             dataset,
             endpoint,
         } => {
+            validate_space_name(&name)?;
             let namespace = match namespace {
                 Some(namespace) => namespace,
                 None => {
@@ -1460,6 +1464,7 @@ async fn run_space(
                 dataset: dataset.unwrap_or_else(|| name.clone()),
                 endpoint,
             })?;
+            registry.ensure_can_add(&name, &repo)?;
             application.create_dataset_repo(repo.clone()).await?;
             if let Err(error) = application.initialize_space(repo.clone()).await {
                 let mut cli_error = CliError::from(error);
@@ -1499,6 +1504,9 @@ fn reject_json_interaction(cli: &Cli) -> CliResult<()> {
         )),
         Command::Sync(args) if args.progress => Err(CliError::invalid_input(
             "--json cannot be combined with progress",
+        )),
+        Command::Rm(args) if !args.yes && !args.dry_run => Err(CliError::invalid_input(
+            "--json requires `rm --yes` unless --dry-run is used",
         )),
         _ => Ok(()),
     }
@@ -1586,5 +1594,15 @@ mod tests {
             split_catalog_parent("/a/b").unwrap(),
             ("/a".to_string(), "b".to_string())
         );
+    }
+
+    #[test]
+    fn json_rm_rejects_interactive_confirmation() {
+        let cli =
+            Cli::try_parse_from(["lios", "--json", "rm", "photos:/old", "--recursive"]).unwrap();
+
+        let error = reject_json_interaction(&cli).unwrap_err();
+
+        assert!(error.message.contains("--yes"));
     }
 }

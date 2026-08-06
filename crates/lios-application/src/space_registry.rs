@@ -34,19 +34,20 @@ impl SpaceRegistry {
         validate_space_name(name)?;
         let repo = validate_repo(repo)?;
         self.mutate(|spaces| {
-            if spaces.contains_key(name) {
-                return Err(CommandError::invalid_input(format!(
-                    "space `{name}` is already registered"
-                )));
-            }
-            if spaces.values().any(|existing| existing == &repo) {
-                return Err(CommandError::invalid_input(
-                    "this Repository Address is already registered",
-                ));
-            }
+            validate_available_registration(spaces, name, &repo)?;
             spaces.insert(name.to_string(), repo);
             Ok(())
         })
+    }
+
+    /// Preflight a registration before a remote create or initialize call.
+    /// `add` repeats the validation while holding the config lock so a race
+    /// still cannot publish a duplicate local registration.
+    pub fn ensure_can_add(&self, name: &str, repo: &RepoConfig) -> CommandResult<()> {
+        validate_space_name(name)?;
+        let repo = validate_repo(repo.clone())?;
+        let spaces = self.list()?;
+        validate_available_registration(&spaces, name, &repo)
     }
 
     pub fn rename(&self, old: &str, new: &str) -> CommandResult<()> {
@@ -124,6 +125,24 @@ fn validate_unique_addresses(spaces: &BTreeMap<String, RepoConfig>) -> CommandRe
                 "a Repository Address cannot have multiple SpaceNames",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_available_registration(
+    spaces: &BTreeMap<String, RepoConfig>,
+    name: &str,
+    repo: &RepoConfig,
+) -> CommandResult<()> {
+    if spaces.contains_key(name) {
+        return Err(CommandError::invalid_input(format!(
+            "space `{name}` is already registered"
+        )));
+    }
+    if spaces.values().any(|existing| existing == repo) {
+        return Err(CommandError::invalid_input(
+            "this Repository Address is already registered",
+        ));
     }
     Ok(())
 }

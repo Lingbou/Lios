@@ -63,6 +63,91 @@ fn push_uses_sha256_to_skip_identical_remote_files() {
     );
 }
 
+#[test]
+fn sync_contents_to_space_root_deletes_destination_only_root_entries() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("dir");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("keep.txt"), b"new").unwrap();
+
+    let prepared = prepare_push(
+        &[LocalLocation {
+            path: source,
+            trailing_slash: true,
+        }],
+        "/",
+        &[
+            TreeEntry::file("keep.txt", "old", 3),
+            TreeEntry::file("remove.txt", "stale", 5),
+        ],
+        &PlanOptions {
+            delete: true,
+            yes: true,
+            ..PlanOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.plan.action("remove.txt").unwrap().kind,
+        PlanActionKind::Delete
+    );
+}
+
+#[test]
+fn local_file_with_trailing_slash_is_rejected() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("file.txt");
+    std::fs::write(&source, b"hello").unwrap();
+
+    let error = prepare_push(
+        &[LocalLocation {
+            path: source,
+            trailing_slash: true,
+        }],
+        "/backup",
+        &[],
+        &PlanOptions::default(),
+    )
+    .unwrap_err();
+
+    assert!(error.message.contains("trailing slash"));
+}
+
+#[test]
+fn sync_excludes_are_relative_to_the_selected_source_root() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("dir");
+    std::fs::create_dir_all(source.join("cache")).unwrap();
+    std::fs::write(source.join("keep.txt"), b"new").unwrap();
+    std::fs::write(source.join("cache/new.bin"), b"new").unwrap();
+
+    let prepared = prepare_push(
+        &[LocalLocation {
+            path: source,
+            trailing_slash: true,
+        }],
+        "/backup",
+        &[
+            TreeEntry::directory("backup"),
+            TreeEntry::directory("backup/cache"),
+            TreeEntry::file("backup/cache/old.bin", "stale", 5),
+        ],
+        &PlanOptions {
+            delete: true,
+            exclude: vec!["cache/**".to_string()],
+            yes: true,
+            ..PlanOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(prepared.plan.action("backup/keep.txt").is_some());
+    assert!(prepared.plan.action("backup/cache").is_none());
+    assert!(prepared.plan.action("backup/cache/new.bin").is_none());
+    assert!(prepared.plan.action("backup/cache/old.bin").is_none());
+}
+
 #[cfg(unix)]
 #[test]
 fn push_rejects_symbolic_links_instead_of_following_them() {

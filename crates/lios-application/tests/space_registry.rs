@@ -22,6 +22,11 @@ fn registry_validates_aliases_and_forbids_duplicate_repository_addresses() {
     registry.add("photos", repo("allen", "photos")).unwrap();
     assert_eq!(registry.resolve("photos").unwrap(), repo("allen", "photos"));
 
+    let duplicate_name = registry
+        .ensure_can_add("photos", &repo("allen", "other"))
+        .unwrap_err();
+    assert_eq!(duplicate_name.code, CommandErrorCode::InvalidInput);
+
     let invalid = registry.add("Photos", repo("allen", "other")).unwrap_err();
     assert_eq!(invalid.code, CommandErrorCode::InvalidInput);
 
@@ -29,6 +34,10 @@ fn registry_validates_aliases_and_forbids_duplicate_repository_addresses() {
         .add("archive", repo("allen", "photos"))
         .unwrap_err();
     assert_eq!(duplicate.code, CommandErrorCode::InvalidInput);
+    let duplicate_address = registry
+        .ensure_can_add("archive", &repo("allen", "photos"))
+        .unwrap_err();
+    assert_eq!(duplicate_address.code, CommandErrorCode::InvalidInput);
 
     registry.rename("photos", "family_photos").unwrap();
     assert!(registry.resolve("photos").is_err());

@@ -98,6 +98,7 @@ SHA-256 identifies unchanged files. Same-type differences are replaced by defaul
 type changes require `--replace-type --yes`. `sync --delete --yes` removes destination-only Catalog
 entries inside the selected target subtree; excluded paths are protected from deletion. Remote
 deletion removes Catalog references and does not promise ModelScope capacity reclamation.
+`--exclude` and `--exclude-from` patterns are matched relative to the selected source root.
 
 Symlinks and junctions are rejected. Lios 0.2 does not preserve permissions, ownership, or
 modification times.

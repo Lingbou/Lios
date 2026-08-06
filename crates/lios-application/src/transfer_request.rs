@@ -177,6 +177,8 @@ pub fn prepare_push(
     let mut source_entries = BTreeMap::<String, TreeEntry>::new();
     let mut source_paths = BTreeMap::new();
     let mut source_fingerprints = BTreeMap::new();
+    let mut delete_destination_root = false;
+    let mut exclude_root = None;
     if sources.len() > 1 && !destination.is_empty() {
         insert_directory_with_ancestors(&mut source_entries, &destination);
     }
@@ -189,6 +191,11 @@ pub fn prepare_push(
             .map(|name| name.to_string_lossy().into_owned())
             .ok_or_else(|| CommandError::invalid_input("copy source has no file name"))?;
         if metadata.is_file() {
+            if source.trailing_slash {
+                return Err(CommandError::invalid_input(
+                    "a trailing slash is only valid for a directory source",
+                ));
+            }
             let target = if sources.len() > 1 || destination_kind == Some(EntryKind::Directory) {
                 join_catalog(&destination, &source_name)
             } else {
@@ -214,12 +221,17 @@ pub fn prepare_push(
                 "copy sources must be regular files or directories",
             ));
         }
+        delete_destination_root = delete_destination_root
+            || (sources.len() == 1 && source.trailing_slash && destination.is_empty());
 
         let base = if source.trailing_slash {
             destination.clone()
         } else {
             join_catalog(&destination, &source_name)
         };
+        if sources.len() == 1 {
+            exclude_root = Some(base.clone());
+        }
         if !base.is_empty() {
             insert_directory_with_ancestors(&mut source_entries, &base);
         }
@@ -233,9 +245,15 @@ pub fn prepare_push(
     }
 
     let source_entries = source_entries.into_values().collect::<Vec<_>>();
-    let destination_entries =
-        transfer_scope_entries(&source_entries, remote_entries, options.delete);
-    let plan = TransferPlanner::plan(&source_entries, &destination_entries, options)?;
+    let destination_entries = transfer_scope_entries(
+        &source_entries,
+        remote_entries,
+        options.delete,
+        delete_destination_root,
+    );
+    let mut planner_options = options.clone();
+    planner_options.exclude_root = exclude_root;
+    let plan = TransferPlanner::plan(&source_entries, &destination_entries, &planner_options)?;
     Ok(PreparedPush {
         plan,
         source_paths,
@@ -297,6 +315,10 @@ pub fn prepare_pull(
 
     let mut source_entries = BTreeMap::new();
     let mut remote_node_ids = BTreeMap::new();
+    let mut exclude_root = None;
+    let delete_destination_root = sources.len() == 1
+        && sources[0].trailing_slash
+        && matches!(sources[0].node.kind, CatalogTreeNodeKind::Directory { .. });
     for (index, source) in sources.iter().enumerate() {
         let target = if let Some(exact_name) = exact_name.as_ref() {
             exact_name.clone()
@@ -307,6 +329,9 @@ pub fn prepare_pull(
         } else {
             source.node.name.clone()
         };
+        if sources.len() == 1 && matches!(source.node.kind, CatalogTreeNodeKind::Directory { .. }) {
+            exclude_root = Some(target.clone());
+        }
         if sources.len() > 1 && exact_name.is_some() {
             return Err(CommandError::invalid_input(
                 "multiple remote sources require a directory destination",
@@ -329,9 +354,15 @@ pub fn prepare_pull(
     let (destination_entries, destination_fingerprints) =
         snapshot_local_destination(&destination_root)?;
     let source_entries = source_entries.into_values().collect::<Vec<_>>();
-    let scoped_destination =
-        transfer_scope_entries(&source_entries, &destination_entries, options.delete);
-    let plan = TransferPlanner::plan(&source_entries, &scoped_destination, options)?;
+    let scoped_destination = transfer_scope_entries(
+        &source_entries,
+        &destination_entries,
+        options.delete,
+        delete_destination_root,
+    );
+    let mut planner_options = options.clone();
+    planner_options.exclude_root = exclude_root;
+    let plan = TransferPlanner::plan(&source_entries, &scoped_destination, &planner_options)?;
     let destination_paths = plan
         .actions
         .iter()
@@ -525,8 +556,12 @@ fn transfer_scope_entries(
     source: &[TreeEntry],
     destination: &[TreeEntry],
     delete: bool,
+    delete_destination_root: bool,
 ) -> Vec<TreeEntry> {
     if !delete {
+        return destination.to_vec();
+    }
+    if delete_destination_root {
         return destination.to_vec();
     }
     let source_paths = source

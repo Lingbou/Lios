@@ -45,6 +45,7 @@ impl TreeEntry {
 pub struct PlanOptions {
     pub delete: bool,
     pub exclude: Vec<String>,
+    pub exclude_root: Option<String>,
     pub replace_type: bool,
     pub yes: bool,
     pub no_clobber: bool,
@@ -105,7 +106,11 @@ impl TransferPlanner {
         let mut ordered_source = source.iter().collect::<Vec<_>>();
         ordered_source.sort_by_key(|entry| (path_depth(&entry.path), entry.path.clone()));
         for entry in ordered_source {
-            if is_excluded(&entry.path, &options.exclude) {
+            if is_excluded(
+                &entry.path,
+                &options.exclude,
+                options.exclude_root.as_deref(),
+            ) {
                 continue;
             }
             let existing = destination_by_folded.get(&fold_path(&entry.path)).copied();
@@ -144,7 +149,14 @@ impl TransferPlanner {
             let mut deletions = destination
                 .iter()
                 .filter(|entry| !source_folded.contains(&fold_path(&entry.path)))
-                .filter(|entry| !delete_is_protected(&entry.path, destination, &options.exclude))
+                .filter(|entry| {
+                    !delete_is_protected(
+                        &entry.path,
+                        destination,
+                        &options.exclude,
+                        options.exclude_root.as_deref(),
+                    )
+                })
                 .collect::<Vec<_>>();
             deletions.sort_by_key(|entry| {
                 (
@@ -222,15 +234,30 @@ fn path_depth(path: &str) -> usize {
     path.bytes().filter(|byte| *byte == b'/').count()
 }
 
-fn delete_is_protected(path: &str, destination: &[TreeEntry], patterns: &[String]) -> bool {
-    is_excluded(path, patterns)
+fn delete_is_protected(
+    path: &str,
+    destination: &[TreeEntry],
+    patterns: &[String],
+    root: Option<&str>,
+) -> bool {
+    is_excluded(path, patterns, root)
         || destination.iter().any(|entry| {
-            entry.path.starts_with(&format!("{path}/")) && is_excluded(&entry.path, patterns)
+            entry.path.starts_with(&format!("{path}/")) && is_excluded(&entry.path, patterns, root)
         })
 }
 
-fn is_excluded(path: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| glob_matches(pattern, path))
+fn is_excluded(path: &str, patterns: &[String], root: Option<&str>) -> bool {
+    let scoped_path = match root {
+        None | Some("") => path,
+        Some(root) if path == root => "",
+        Some(root) => match path.strip_prefix(&format!("{root}/")) {
+            Some(relative) => relative,
+            None => return false,
+        },
+    };
+    patterns
+        .iter()
+        .any(|pattern| glob_matches(pattern.trim_start_matches('/'), scoped_path))
 }
 
 fn glob_matches(pattern: &str, path: &str) -> bool {
