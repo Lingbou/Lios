@@ -856,6 +856,59 @@ impl Catalog {
         self.save_v1(&mut loaded.catalog, key)
     }
 
+    pub fn move_node(
+        &self,
+        node_id: &str,
+        new_parent_id: &str,
+        new_name: &str,
+        key: &KeyFile,
+    ) -> Result<()> {
+        let new_name = normalize_name(new_name)?;
+        let mut loaded = self.load_catalog_v1(key)?;
+        if node_id == loaded.catalog.root_id {
+            return Err(LiosError::Unsupported(
+                "cannot move the Catalog root".to_string(),
+            ));
+        }
+        ensure_directory_v1(&loaded.catalog, new_parent_id)?;
+        let mut descendants = HashSet::new();
+        collect_descendant_ids(&loaded.catalog, node_id, &mut descendants);
+        if descendants.contains(new_parent_id) {
+            return Err(LiosError::Unsupported(
+                "cannot move a directory into itself".to_string(),
+            ));
+        }
+        if child_ids(&loaded.catalog, new_parent_id)
+            .into_iter()
+            .any(|id| {
+                id != node_id
+                    && windows_names_equal(&loaded.catalog.nodes[id].descriptor.name, &new_name)
+            })
+        {
+            return Err(LiosError::Unsupported(format!(
+                "folder already contains {new_name}"
+            )));
+        }
+        let old_parent = catalog_node(&loaded.catalog, node_id)?
+            .descriptor
+            .parent_id
+            .clone();
+        let node =
+            loaded.catalog.nodes.get_mut(node_id).ok_or_else(|| {
+                LiosError::Unsupported(format!("catalog node not found: {node_id}"))
+            })?;
+        node.descriptor.parent_id = Some(new_parent_id.to_string());
+        node.descriptor.name = new_name;
+        node.descriptor.updated_at = timestamp();
+        node.descriptor_encrypted_sha256 = None;
+        if let Some(old_parent) = old_parent {
+            mark_node_updated(&mut loaded.catalog, &old_parent)?;
+        }
+        mark_node_updated(&mut loaded.catalog, new_parent_id)?;
+        prepare_catalog_for_v1_write(&mut loaded)?;
+        self.save_v1(&mut loaded.catalog, key)
+    }
+
     pub fn delete_nodes(&self, node_ids: &[String], key: &KeyFile) -> Result<()> {
         let mut loaded = self.load_catalog_v1(key)?;
         let ids = node_ids

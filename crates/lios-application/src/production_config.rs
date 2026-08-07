@@ -2,7 +2,7 @@
 
 use lios_core::config::{
     ensure_default_key_binding, validate_modelscope_production_endpoint, LiosConfig, LiosPaths,
-    RepoConfig, MODELSCOPE_ENDPOINT,
+    RepoConfig, CONFIG_SCHEMA_VERSION, MODELSCOPE_ENDPOINT,
 };
 use serde::Serialize;
 
@@ -11,6 +11,7 @@ use crate::command_error::CommandError;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum SetupWarningCode {
     ReconnectRequired,
+    LegacyRepositoryNeedsRegistration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -20,19 +21,13 @@ pub struct SetupWarning {
 }
 
 pub fn configured_endpoint(
-    config: &LiosConfig,
+    _config: &LiosConfig,
     endpoint: Option<String>,
 ) -> Result<String, CommandError> {
     let endpoint = endpoint
         .and_then(|value| {
             let trimmed = value.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
-        })
-        .or_else(|| {
-            config
-                .active_repo
-                .as_ref()
-                .map(|repo| repo.endpoint.clone())
         })
         .unwrap_or_else(|| MODELSCOPE_ENDPOINT.to_string());
     validate_modelscope_production_endpoint(&endpoint).map_err(Into::into)
@@ -53,18 +48,29 @@ pub fn validate_repo(repo: RepoConfig) -> Result<RepoConfig, CommandError> {
 
 fn validated_config(config: &LiosConfig) -> Result<LiosConfig, CommandError> {
     let mut validated = config.clone();
-    if let Some(repo) = validated.active_repo.take() {
-        validated.active_repo = Some(validate_repo(repo)?);
+    for repo in validated.spaces.values_mut() {
+        *repo = validate_repo(repo.clone())?;
     }
     Ok(validated)
 }
 
 fn migrate_legacy_config(
+    paths: &LiosPaths,
     config: &LiosConfig,
 ) -> Result<(LiosConfig, Option<SetupWarning>, bool), CommandError> {
+    if config.schema_version >= CONFIG_SCHEMA_VERSION {
+        return Ok((config.clone(), None, false));
+    }
+    let backup = paths.home.join("config.yaml.v1.bak");
+    if paths.config.is_file() && !backup.exists() {
+        std::fs::copy(&paths.config, &backup)?;
+    }
     let mut migrated = config.clone();
-    let Some(repo) = migrated.active_repo.take() else {
-        return Ok((migrated, None, false));
+    migrated.schema_version = CONFIG_SCHEMA_VERSION;
+    migrated.spaces.clear();
+    let legacy_repo = migrated.legacy_active_repo.take();
+    let Some(repo) = legacy_repo else {
+        return Ok((migrated, None, true));
     };
     if validate_modelscope_production_endpoint(&repo.endpoint).is_err() {
         return Ok((
@@ -79,11 +85,20 @@ fn migrate_legacy_config(
     }
 
     let validated = validate_repo(repo.clone())?;
-    let changed = validated.namespace != repo.namespace
-        || validated.dataset != repo.dataset
-        || validated.endpoint != repo.endpoint;
-    migrated.active_repo = Some(validated);
-    Ok((migrated, None, changed))
+    Ok((
+        migrated,
+        Some(SetupWarning {
+            code: SetupWarningCode::LegacyRepositoryNeedsRegistration,
+            message: format!(
+                "Previous Repository Address {}/{} was not registered automatically; run `lios space add NAME {}/{}`",
+                validated.namespace,
+                validated.dataset,
+                validated.namespace,
+                validated.dataset
+            ),
+        }),
+        true,
+    ))
 }
 
 pub fn persist_config(paths: &LiosPaths, config: &mut LiosConfig) -> Result<(), CommandError> {
@@ -97,7 +112,7 @@ pub fn prepare_startup_config(
     paths: &LiosPaths,
     config: &mut LiosConfig,
 ) -> Result<Option<SetupWarning>, CommandError> {
-    let (mut prepared, warning, migrated) = migrate_legacy_config(config)?;
+    let (mut prepared, warning, migrated) = migrate_legacy_config(paths, config)?;
     let key_bound = ensure_default_key_binding(paths, &mut prepared)?;
     if migrated || key_bound {
         persist_config(paths, &mut prepared)?;
@@ -120,17 +135,12 @@ mod tests {
     use crate::command_error::CommandErrorCode;
 
     #[test]
-    fn rejects_custom_endpoint_loaded_from_old_config() {
-        let config = LiosConfig {
-            active_repo: Some(RepoConfig {
-                namespace: "novix".to_string(),
-                dataset: "cold".to_string(),
-                endpoint: "http://127.0.0.1:12345".to_string(),
-            }),
-            ..LiosConfig::default()
-        };
-
-        let error = configured_endpoint(&config, None).unwrap_err();
+    fn rejects_an_explicit_custom_endpoint() {
+        let error = configured_endpoint(
+            &LiosConfig::default(),
+            Some("http://127.0.0.1:12345".to_string()),
+        )
+        .unwrap_err();
         assert_eq!(error.code, CommandErrorCode::InvalidInput);
     }
 
@@ -154,15 +164,19 @@ mod tests {
         let paths = LiosPaths::from_home(temp.path());
         paths.ensure_dirs().unwrap();
         let mut config = LiosConfig {
-            active_repo: Some(RepoConfig {
-                namespace: "novix".to_string(),
-                dataset: "cold".to_string(),
-                endpoint: "http://127.0.0.1:12345".to_string(),
-            }),
             key_file_path: None,
             backup_path: None,
             chunk_size: Some(1024),
+            ..LiosConfig::default()
         };
+        config.spaces.insert(
+            "cold".to_string(),
+            RepoConfig {
+                namespace: "novix".to_string(),
+                dataset: "cold".to_string(),
+                endpoint: "http://127.0.0.1:12345".to_string(),
+            },
+        );
         config.save(&paths.config).unwrap();
         let original = fs::read(&paths.config).unwrap();
         config.key_file_path = Some(paths.home.join("imported.key"));
@@ -179,7 +193,7 @@ mod tests {
         let paths = LiosPaths::from_home(temp.path());
         paths.ensure_dirs().unwrap();
         let mut config = LiosConfig {
-            active_repo: Some(RepoConfig {
+            legacy_active_repo: Some(RepoConfig {
                 namespace: "novix".to_string(),
                 dataset: "cold".to_string(),
                 endpoint: "http://127.0.0.1:12345".to_string(),
@@ -187,6 +201,8 @@ mod tests {
             key_file_path: None,
             backup_path: None,
             chunk_size: None,
+            schema_version: 1,
+            spaces: Default::default(),
         };
         config.save(&paths.config).unwrap();
 
@@ -197,8 +213,8 @@ mod tests {
 
         assert_eq!(warning.code, SetupWarningCode::ReconnectRequired);
         assert!(warning.message.contains("reconnect"));
-        assert!(config.active_repo.is_none());
-        assert!(saved.active_repo.is_none());
+        assert!(config.legacy_active_repo.is_none());
+        assert!(saved.legacy_active_repo.is_none());
         assert_eq!(saved.key_file_path, config.key_file_path);
         assert!(paths.home.join("recovery.key").exists());
     }

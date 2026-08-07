@@ -38,7 +38,6 @@ import type {
   DriveItem,
   ModelScopeUserSummary,
   RecoveryKeyImportDialog,
-  RepoConfig,
   Snapshot,
   SpaceSummary,
   UploadConflict
@@ -102,7 +101,8 @@ function previewSnapshot(): Snapshot {
       credentials: "~\\.lios\\credentials.enc"
     },
     config: {
-      active_repo: null,
+      schema_version: 2,
+      spaces: {},
       key_file_path: "~\\.lios\\recovery.key",
       chunk_size: 134217728
     },
@@ -112,7 +112,7 @@ function previewSnapshot(): Snapshot {
       backup_location: null
     },
     has_token: false,
-    active_task_space_id: null,
+    spaces: [],
     warning: null
   };
 }
@@ -197,7 +197,7 @@ function App() {
       ["Queued", "Preparing", "Running", "Paused", "Retrying", "Committing"].includes(task.state)
   );
   const hasToken = Boolean(snapshot?.has_token);
-  const selectedSpace = activeSpace ?? snapshot?.config.active_repo ?? null;
+  const selectedSpace = activeSpace;
 
   const displayedSpaces = spaces;
   const visibleSpaces = query.trim()
@@ -262,55 +262,31 @@ function App() {
     setSnapshot(next);
     const warning = setupWarningMessage(next.warning);
     if (warning) setMessage(warning);
-    const configuredRepo = next.config.active_repo;
-    const scopedConfiguredRepo: SpaceSummary | null = configuredRepo
-      ? {
-          ...configuredRepo,
-          task_space_id: next.active_task_space_id ?? undefined
-        }
+    setSpaces(next.spaces);
+    setSpacesLoaded(true);
+    const preferredName =
+      activeSpace?.space_name ?? globalThis.localStorage?.getItem("lios.lastSpaceName") ?? null;
+    const visibleActiveRepo = preferredName
+      ? next.spaces.find((space) => space.space_name === preferredName) ?? null
       : null;
-    let visibleActiveRepo = scopedConfiguredRepo;
-    setManualEndpoint((current) => configuredRepo?.endpoint || current);
+    setManualEndpoint((current) => visibleActiveRepo?.endpoint || current);
     if (loadSpaces && next.has_token) {
-      setSpacesLoaded(false);
       const result = await appInvoke<DatasetRepoListResult>("list_dataset_repos", {
-        endpoint: configuredRepo?.endpoint || manualEndpoint
+        endpoint: visibleActiveRepo?.endpoint || manualEndpoint
       });
       setModelscopeUser(result.user);
-      setSpaces(result.repositories);
-      setSpacesLoaded(true);
-      const configuredSpace = configuredRepo
-        ? result.repositories.find((space) => sameSpace(space, configuredRepo))
-        : undefined;
-      if (configuredRepo && !configuredSpace) {
-        visibleActiveRepo = null;
-        setCatalogTree(null);
-        setCatalogStatus("idle");
-        setCurrentFolderId(null);
-        setSelectedIds(new Set());
-        setSearchResults([]);
-        setQuery("");
-        setMessage("");
-      } else if (configuredSpace) {
-        visibleActiveRepo = configuredSpace;
-      }
-    } else if (
-      spacesLoaded &&
-      configuredRepo &&
-      !spaces.some((space) => sameSpace(space, configuredRepo))
-    ) {
-      visibleActiveRepo = null;
     }
 
     if (visibleActiveRepo) {
       setActiveSpace(visibleActiveRepo);
     } else if (loadSpaces || spacesLoaded) {
       setActiveSpace(null);
+      globalThis.localStorage?.removeItem("lios.lastSpaceName");
       setCatalogTree(null);
       setCatalogStatus("idle");
       setCurrentFolderId(null);
     }
-    return scopedConfiguredRepo;
+    return visibleActiveRepo;
   }
 
   async function run(label: string, action: () => Promise<unknown>) {
@@ -360,6 +336,7 @@ function App() {
   async function loadSpace(space: SpaceSummary) {
     setView("drive");
     setActiveSpace(space);
+    globalThis.localStorage?.setItem("lios.lastSpaceName", space.space_name);
     setCatalogStatus("loading");
     setCatalogTree(null);
     setCurrentFolderId(null);
@@ -369,7 +346,7 @@ function App() {
     await catalogLoads.run(async (request) => {
       try {
         const outcome = await loadCatalogState(() =>
-          appInvoke<CatalogLoadResult>("load_space_catalog", { space })
+          appInvoke<CatalogLoadResult>("load_space_catalog", { spaceName: space.space_name })
         );
         if (!request.isCurrent()) return;
         if (outcome.status === "missing") {
@@ -400,7 +377,7 @@ function App() {
       await initializeWithExistingCatalog(
         async () => {
           const result = await appInvoke<CatalogLoadResult>("initialize_space", {
-            space: activeSpace
+            spaceName: activeSpace.space_name
           });
           setCatalogTree(result.tree);
           setCurrentFolderId(result.tree.id);
@@ -425,7 +402,9 @@ function App() {
     return catalogLoads.run(async (request) => {
       try {
         const outcome = await loadCatalogState(() =>
-          appInvoke<CatalogLoadResult>("load_space_catalog", { space: targetSpace })
+          appInvoke<CatalogLoadResult>("load_space_catalog", {
+            spaceName: targetSpace.space_name
+          })
         );
         if (!request.isCurrent()) return;
         if (outcome.status === "missing") {
@@ -442,7 +421,10 @@ function App() {
         setMessage(result.warnings.join("; "));
         const trimmedQuery = query.trim();
         if (trimmedQuery) {
-          const results = await appInvoke<DriveItem[]>("search_catalog", { query: trimmedQuery });
+          const results = await appInvoke<DriveItem[]>("search_catalog", {
+            spaceName: targetSpace.space_name,
+            query: trimmedQuery
+          });
           if (!request.isCurrent()) return;
           setSearchResults(results);
         }
@@ -478,6 +460,7 @@ function App() {
   }
 
   async function pickUpload(directory: boolean) {
+    if (!activeSpace) return;
     const selected = await open({ directory, multiple: !directory });
     const paths = Array.isArray(selected)
       ? selected.filter((item): item is string => typeof item === "string")
@@ -486,6 +469,7 @@ function App() {
         : [];
     if (paths.length === 0 || !currentFolderId) return;
     const found = await appInvoke<UploadConflict[]>("preview_upload_conflicts", {
+      spaceName: activeSpace.space_name,
       parentNodeId: currentFolderId,
       paths
     });
@@ -501,9 +485,10 @@ function App() {
   }
 
   async function startUpload(paths: string[], resolutions: ConflictResolution[]) {
-    if (!currentFolderId) return;
+    if (!currentFolderId || !activeSpace) return;
     await run("上传", async () => {
       const task = await appInvoke<TaskSummary>("enqueue_upload_to_folder", {
+        spaceName: activeSpace.space_name,
         parentNodeId: currentFolderId,
         paths,
         conflictResolutions: resolutions
@@ -525,11 +510,12 @@ function App() {
   }
 
   async function createFolder() {
-    if (!currentFolderId) return;
+    if (!currentFolderId || !activeSpace) return;
     const name = window.prompt("文件夹名称");
     if (!name) return;
     await run("新建文件夹", async () => {
       const result = await appInvoke<CatalogLoadResult>("create_folder", {
+        spaceName: activeSpace.space_name,
         parentNodeId: currentFolderId,
         name
       });
@@ -540,13 +526,18 @@ function App() {
   }
 
   async function renameSelected() {
+    if (!activeSpace) return;
     const [nodeId] = [...selectedIds];
     if (!nodeId) return;
     const node = findNode(catalogTree, nodeId);
     const newName = window.prompt("新名称", node?.name ?? "");
     if (!newName) return;
     await run("重命名", async () => {
-      const result = await appInvoke<CatalogLoadResult>("rename_node", { nodeId, newName });
+      const result = await appInvoke<CatalogLoadResult>("rename_node", {
+        spaceName: activeSpace.space_name,
+        nodeId,
+        newName
+      });
       setCatalogTree(result.tree);
       setCatalogStatus("ready");
       setSelectedIds(new Set());
@@ -555,25 +546,33 @@ function App() {
   }
 
   async function deleteSelected() {
-    if (selectedIds.size === 0) return;
+    if (selectedIds.size === 0 || !activeSpace) return;
     const ok = window.confirm(
       `从 Lios 目录中删除 ${selectedIds.size} 个项目？此操作不会进入回收站。\n\nModelScope 的令牌接口目前不支持物理删除远端文件；如需释放远端空间，请在 ModelScope 网页端删除或重建这个空间。`
     );
     if (!ok) return;
     const nodeIds = [...selectedIds];
     await run("删除", async () => {
-      const task = await appInvoke<TaskSummary>("enqueue_delete_nodes", { nodeIds });
+      const task = await appInvoke<TaskSummary>("enqueue_delete_nodes", {
+        spaceName: activeSpace.space_name,
+        nodeIds
+      });
       upsertTask(task);
     });
   }
 
   async function downloadSelected() {
+    if (!activeSpace) return;
     const nodeIds = [...selectedIds];
     if (nodeIds.length === 0) return;
     const output = await open({ directory: true, multiple: false });
     if (typeof output !== "string") return;
     await run("下载", async () => {
-      const task = await appInvoke<TaskSummary>("enqueue_download", { nodeIds, outputDir: output });
+      const task = await appInvoke<TaskSummary>("enqueue_download", {
+        spaceName: activeSpace.space_name,
+        nodeIds,
+        outputDir: output
+      });
       upsertTask(task);
     });
   }
@@ -585,7 +584,11 @@ function App() {
       setSearchResults([]);
       return;
     }
-    const results = await appInvoke<DriveItem[]>("search_catalog", { query: trimmed });
+    if (!activeSpace) return;
+    const results = await appInvoke<DriveItem[]>("search_catalog", {
+      spaceName: activeSpace.space_name,
+      query: trimmed
+    });
     setSearchResults(results);
   }
 
@@ -637,11 +640,11 @@ function App() {
     }
   }
 
-  async function refreshVerifiedCatalog(space: RepoConfig) {
+  async function refreshVerifiedCatalog(space: SpaceSummary) {
     return catalogLoads.run(async (request) => {
       try {
         const outcome = await loadCatalogState(() =>
-          appInvoke<CatalogLoadResult>("load_space_catalog", { space })
+          appInvoke<CatalogLoadResult>("load_space_catalog", { spaceName: space.space_name })
         );
         if (!request.isCurrent()) return;
         if (outcome.status === "missing") {
@@ -688,9 +691,10 @@ function App() {
       if (
         verification.catalog_checked &&
         verification.checked_space &&
+        selectedSpace &&
         sameSpace(selectedSpace, verification.checked_space)
       ) {
-        await refreshVerifiedCatalog(verification.checked_space);
+        await refreshVerifiedCatalog(selectedSpace);
         setMessage("恢复密钥已导入，并已刷新验证过的空间。");
       } else {
         setMessage("恢复密钥已导入。外部密钥文件必须保持可用。");
@@ -709,20 +713,22 @@ function App() {
     }
     await run(full ? "完整检查" : "快速检查", async () => {
       const task = await appInvoke<TaskSummary>("enqueue_verify_space", {
-        space: selectedSpace,
+        spaceName: selectedSpace.space_name,
         full
       });
       upsertTask(task);
     });
   }
 
-  async function loadCatalogRebuildPreview(space: RepoConfig) {
+  async function loadCatalogRebuildPreview(space: SpaceSummary) {
     const requestId = rebuildPreviewRequest.current + 1;
     rebuildPreviewRequest.current = requestId;
     setMessage("");
     setRebuildDialog({ space, status: "loading", preview: null, error: "" });
     try {
-      const preview = await appInvoke<CatalogRebuildPreview>("preview_rebuild_catalog", { space });
+      const preview = await appInvoke<CatalogRebuildPreview>("preview_rebuild_catalog", {
+        spaceName: space.space_name
+      });
       if (rebuildPreviewRequest.current !== requestId) return;
       setRebuildDialog({ space, status: "ready", preview, error: "" });
     } catch (error) {
@@ -746,12 +752,7 @@ function App() {
       return;
     }
     if (busy !== null || rebuildDialog) return;
-    const space: RepoConfig = {
-      namespace: selectedSpace.namespace,
-      dataset: selectedSpace.dataset,
-      endpoint: selectedSpace.endpoint
-    };
-    await loadCatalogRebuildPreview(space);
+    await loadCatalogRebuildPreview(selectedSpace);
   }
 
   function closeCatalogRebuildDialog() {
@@ -777,7 +778,7 @@ function App() {
     let task: TaskSummary;
     try {
       task = await appInvoke<TaskSummary>("enqueue_rebuild_catalog", {
-        space: dialog.space,
+        spaceName: dialog.space.space_name,
         expectedRevision: preview.revision
       });
     } catch (error) {
@@ -833,16 +834,21 @@ function App() {
       setCreateSpaceError("输入空间名称");
       return;
     }
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(trimmed)) {
+      setCreateSpaceError("Space Name 必须以小写字母开头，只能包含小写字母、数字、_ 和 -，最长 32 个字符");
+      return;
+    }
     setBusy("创建空间");
     setMessage("");
     setCreateSpaceError("");
     try {
-      const space: SpaceSummary = {
+      await appInvoke("create_dataset_repo", {
+        name: trimmed,
         namespace: modelscopeUser.username,
         dataset: trimmed,
         endpoint: manualEndpoint
-      };
-      await appInvoke("create_dataset_repo", space);
+      });
+      globalThis.localStorage?.setItem("lios.lastSpaceName", trimmed);
       const scopedSpace = await refreshSetup(true);
       setCreateSpaceOpen(false);
       setNewSpaceName("");

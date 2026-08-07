@@ -1,6 +1,8 @@
 use lios_core::{
     catalog::{ConflictAction, ConflictResolution, SourceSnapshotReport},
-    config::{ensure_default_key_configured, LiosConfig, LiosPaths, RepoConfig},
+    config::{
+        ensure_default_key_configured, LiosConfig, LiosPaths, RepoConfig, CONFIG_SCHEMA_VERSION,
+    },
     credentials::{protect_to_file, unprotect_from_file},
     crypto::KeyFile,
     tasks::{
@@ -103,26 +105,36 @@ fn config_roundtrips_as_yaml_without_token_material() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("config.yaml");
     let config = LiosConfig {
-        active_repo: Some(RepoConfig {
-            namespace: "novix".to_string(),
-            dataset: "cold-backup".to_string(),
-            endpoint: "https://www.modelscope.cn".to_string(),
-        }),
+        spaces: [(
+            "archive".to_string(),
+            RepoConfig {
+                namespace: "novix".to_string(),
+                dataset: "cold-backup".to_string(),
+                endpoint: "https://www.modelscope.cn".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect(),
         key_file_path: Some(tmp.path().join("recovery.key")),
         backup_path: Some(tmp.path().join("backups/recovery.key")),
         chunk_size: Some(128 * 1024 * 1024),
+        ..LiosConfig::default()
     };
 
     config.save(&path).unwrap();
     let raw_yaml = std::fs::read_to_string(&path).unwrap();
     let loaded = LiosConfig::load(&path).unwrap();
 
-    assert_eq!(loaded.active_repo.unwrap().dataset, "cold-backup");
+    assert_eq!(loaded.schema_version, CONFIG_SCHEMA_VERSION);
+    assert_eq!(loaded.spaces["archive"].dataset, "cold-backup");
     assert_eq!(
         loaded.backup_path.as_deref(),
         Some(tmp.path().join("backups/recovery.key").as_path())
     );
     assert!(raw_yaml.contains("backup_path:"));
+    assert!(raw_yaml.contains("schema_version: 2"));
+    assert!(raw_yaml.contains("spaces:"));
+    assert!(!raw_yaml.contains("active_repo"));
     assert!(!raw_yaml.contains("token"));
     assert!(!raw_yaml.contains("secret"));
 }

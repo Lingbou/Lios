@@ -29,6 +29,7 @@ pub struct RecoveryKeyVerification {
     pub format_valid: bool,
     pub catalog_checked: bool,
     pub checked_space: Option<RepoConfig>,
+    pub checked_spaces: Vec<RepoConfig>,
 }
 
 struct VerifiedRecoveryKey {
@@ -127,6 +128,7 @@ async fn verify_candidate_material_with_adapter<A: StorageAdapter + ?Sized>(
                 format_valid: true,
                 catalog_checked: false,
                 checked_space: None,
+                checked_spaces: Vec::new(),
             },
         });
     };
@@ -152,6 +154,7 @@ async fn verify_candidate_material_with_adapter<A: StorageAdapter + ?Sized>(
                     format_valid: true,
                     catalog_checked: false,
                     checked_space: Some(repo.clone()),
+                    checked_spaces: vec![repo.clone()],
                 },
             });
         }
@@ -167,6 +170,7 @@ async fn verify_candidate_material_with_adapter<A: StorageAdapter + ?Sized>(
             format_valid: true,
             catalog_checked: true,
             checked_space: Some(repo.clone()),
+            checked_spaces: vec![repo.clone()],
         },
     })
 }
@@ -188,19 +192,47 @@ async fn runtime_verification(
     candidate_path: &Path,
 ) -> ServiceResult<RecoveryKeyVerification> {
     let config = LiosConfig::load(&paths.config)?;
-    let Some(repo) = config.active_repo else {
-        return verify_candidate_with_adapter::<ModelScopeAdapter>(candidate_path, None, None)
-            .await;
-    };
-    if !paths.credentials.exists() {
-        return verify_candidate_with_adapter::<ModelScopeAdapter>(candidate_path, None, None)
-            .await;
+    if !config.spaces.is_empty() {
+        let candidate = load_key(candidate_path, "recovery key file is invalid")?;
+        if !paths.credentials.exists() {
+            return Err(CommandError::new(
+                CommandErrorCode::Authentication,
+                "all registered Spaces must be reachable before verifying a Recovery Key",
+                false,
+                None,
+            ));
+        }
+        let token = unprotect_from_file(&paths.credentials)?;
+        let mut checked_spaces = Vec::with_capacity(config.spaces.len());
+        for repo in config.spaces.values() {
+            let repo = validate_repo(repo.clone())?;
+            let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token.clone());
+            let staging = tempfile::tempdir().map_err(|_| {
+                CommandError::new(
+                    CommandErrorCode::Storage,
+                    "temporary Recovery Key verification storage could not be created",
+                    false,
+                    None,
+                )
+            })?;
+            let catalog_path = staging.path().join(CATALOG_FILE);
+            adapter
+                .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
+                .await
+                .map_err(CommandError::from)?;
+            Catalog::from_staging(staging.path())
+                .decrypt_tree(&candidate)
+                .map_err(map_catalog_verification_error)?;
+            checked_spaces.push(repo);
+        }
+        return Ok(RecoveryKeyVerification {
+            format_valid: true,
+            catalog_checked: true,
+            checked_space: checked_spaces.first().cloned(),
+            checked_spaces,
+        });
     }
-
-    let repo = validate_repo(repo)?;
-    let token = unprotect_from_file(&paths.credentials)?;
-    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
-    verify_candidate_with_adapter(candidate_path, Some(&repo), Some(&adapter)).await
+    verify_candidate_with_adapter::<ModelScopeAdapter>(candidate_path, None, None).await
 }
 
 pub async fn verify_recovery_key_for_paths(
@@ -266,10 +298,10 @@ async fn import_candidate_with_context<A: StorageAdapter + ?Sized, F: FnOnce()>(
     after_verification();
     let _config_guard = config_gate.lock()?;
     let mut config = LiosConfig::load(&paths.config)?;
-    if config.active_repo.as_ref() != expected_repo {
+    if expected_repo.is_some_and(|repo| !config.spaces.values().any(|saved| saved == repo)) {
         return Err(CommandError::new(
             CommandErrorCode::RemoteConflict,
-            "active space changed during recovery key verification",
+            "Space registry changed during Recovery Key verification",
             false,
             None,
         ));
@@ -294,42 +326,41 @@ pub async fn import_recovery_key_for_paths(
     candidate_path: &Path,
 ) -> ServiceResult<RecoveryKeyVerification> {
     let config = LiosConfig::load(&paths.config)?;
-    let expected_repo = config.active_repo;
-    let Some(repo) = expected_repo.as_ref() else {
-        return import_candidate_with_context::<ModelScopeAdapter, _>(
-            paths,
-            config_gate,
-            candidate_path,
-            None,
-            None,
-            None,
-            || {},
-        )
-        .await;
-    };
-    if !paths.credentials.exists() {
-        return import_candidate_with_context::<ModelScopeAdapter, _>(
-            paths,
-            config_gate,
-            candidate_path,
-            Some(repo),
-            None,
-            None,
-            || {},
-        )
-        .await;
+    if !config.spaces.is_empty() {
+        let expected_spaces = config.spaces.clone();
+        let verification = runtime_verification(paths, candidate_path).await?;
+        let verified_key = load_key(candidate_path, "recovery key file is invalid")?;
+        let _config_guard = config_gate.lock()?;
+        let _process_guard = paths.try_lock_config().map_err(CommandError::from)?;
+        let mut current = LiosConfig::load(&paths.config)?;
+        if current.spaces != expected_spaces {
+            return Err(CommandError::new(
+                CommandErrorCode::RemoteConflict,
+                "Space registry changed during Recovery Key verification",
+                true,
+                None,
+            ));
+        }
+        let current_candidate = load_key(candidate_path, "recovery key file is invalid")?;
+        if !verified_key.same_material(&current_candidate) {
+            return Err(CommandError::new(
+                CommandErrorCode::WrongKey,
+                "Recovery Key file changed during verification",
+                false,
+                None,
+            ));
+        }
+        current.key_file_path = Some(candidate_path.to_path_buf());
+        persist_config(paths, &mut current)?;
+        return Ok(verification);
     }
-
-    let verification_repo = validate_repo(repo.clone())?;
-    let token = unprotect_from_file(&paths.credentials)?;
-    let adapter = ModelScopeAdapter::new(verification_repo.endpoint.clone(), token);
-    import_candidate_with_context(
+    import_candidate_with_context::<ModelScopeAdapter, _>(
         paths,
         config_gate,
         candidate_path,
-        Some(repo),
-        Some(&verification_repo),
-        Some(&adapter),
+        None,
+        None,
+        None,
         || {},
     )
     .await

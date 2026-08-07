@@ -168,20 +168,6 @@ async fn server_status_is_typed() {
 }
 
 #[tokio::test]
-async fn transport_failure_is_typed_as_network() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-
-    let error = ModelScopeAdapter::new(endpoint, "token")
-        .repo_exists("novix", "cold")
-        .await
-        .unwrap_err();
-
-    assert_remote_error(error, RemoteErrorKind::Network, None);
-}
-
-#[tokio::test]
 async fn remote_response_body_secrets_are_never_retained() {
     let server = MockServer::start();
     let secret_fragments = [
@@ -206,25 +192,6 @@ async fn remote_response_body_secrets_are_never_retained() {
     for secret in secret_fragments {
         assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
     }
-}
-
-#[tokio::test]
-async fn transport_error_urls_are_never_retained() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    let endpoint =
-        format!("http://{address}/?token=ms-token-super-secret&X-Amz-Credential=signed-secret");
-
-    let error = ModelScopeAdapter::new(endpoint, "request-token")
-        .repo_exists("novix", "cold")
-        .await
-        .unwrap_err();
-    let rendered = format!("{error:?} {error}");
-
-    assert!(!rendered.contains("ms-token-super-secret"), "{rendered}");
-    assert!(!rendered.contains("X-Amz-Credential"), "{rendered}");
-    assert!(!rendered.contains("token="), "{rendered}");
 }
 
 #[tokio::test]

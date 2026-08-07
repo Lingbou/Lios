@@ -85,16 +85,18 @@ test("created space loading uses the scoped setup result", async () => {
   assert.doesNotMatch(body, /await loadSpace\(space\)/);
 });
 
-test("setup refresh returns the backend-scoped configured space despite a stale repo list", async () => {
+test("setup refresh keeps the registered Space selected by its local alias despite a stale discovery result", async () => {
   const app = await readFile(new URL("src/App.tsx", root), "utf8");
   const body = app.match(/async function refreshSetup[\s\S]*?\n  async function run/)?.[0];
 
   assert.ok(body);
-  const scopedResult = body.match(
-    /const\s+([A-Za-z_$][\w$]*)\s*:\s*SpaceSummary\s*\|\s*null\s*=\s*configuredRepo[\s\S]*?task_space_id:\s*next\.active_task_space_id\s*\?\?\s*undefined[\s\S]*?:\s*null;/
+  assert.match(body, /setSpaces\(next\.spaces\)/);
+  assert.doesNotMatch(body, /setSpaces\(result\.repositories\)/);
+  const selectedSpace = body.match(
+    /const\s+([A-Za-z_$][\w$]*)\s*=\s*preferredName\s*\?[\s\S]*?next\.spaces\.find\(\(space\)\s*=>\s*space\.space_name\s*===\s*preferredName\)[\s\S]*?:\s*null;/
   );
-  assert.ok(scopedResult);
-  assert.match(body, new RegExp(`return ${scopedResult[1]};`));
+  assert.ok(selectedSpace);
+  assert.match(body, new RegExp(`return ${selectedSpace[1]};`));
 });
 
 test("catalog mutation baseline is seeded from the initial task query before completions are handled", async () => {

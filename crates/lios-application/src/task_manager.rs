@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use lios_core::catalog::{snapshot_source_files, SourceFileSnapshot, SourceSnapshotReport};
 use lios_core::config::{LiosPaths, RepoConfig};
 use lios_core::tasks::{
-    TaskCatalogCheckpoint, TaskItem, TaskItemState, TaskRecord, TaskSpec, TaskStore,
+    PersistedTransferAction, TaskCatalogCheckpoint, TaskItem, TaskItemState, TaskRecord, TaskSpec,
+    TaskStore, TransferActionKind,
 };
 use lios_core::{LiosError, Result as CoreResult};
 use sha2::{Digest, Sha256};
@@ -178,6 +179,50 @@ pub fn persist_submission(
     task.bytes_total = task.items.iter().try_fold(0u64, |total, item| {
         total.checked_add(item.size).ok_or_else(|| {
             LiosError::DataCorruption("task source byte total overflowed".to_string())
+        })
+    })?;
+    let mut store = TaskStore::open(&paths.database)?;
+    store.insert_with_spec_and_items(&task, spec, &task.items)?;
+    Ok(task)
+}
+
+pub fn persist_transfer_submission(
+    paths: &LiosPaths,
+    spec: &TaskSpec,
+    actions: &[PersistedTransferAction],
+) -> CoreResult<TaskRecord> {
+    let mut task = TaskRecord::queued_for_spec(spec);
+    task.items = actions
+        .iter()
+        .map(|action| TaskItem {
+            id: Uuid::new_v4(),
+            task_id: task.id,
+            name: action.relative_path.clone(),
+            relative_path: Some(action.relative_path.clone().into()),
+            source_path: action.source_path.clone(),
+            source_modified_at_ns: None,
+            size: action.size,
+            state: if action.kind == TransferActionKind::Skip {
+                TaskItemState::Skipped
+            } else {
+                TaskItemState::Queued
+            },
+            phase: None,
+            bytes_done: if action.kind == TransferActionKind::Skip {
+                action.size
+            } else {
+                0
+            },
+            bytes_total: action.size,
+            error: None,
+        })
+        .collect();
+    task.progress_total = u64::try_from(task.items.len()).map_err(|_| {
+        LiosError::DataCorruption("transfer action count exceeds the supported range".to_string())
+    })?;
+    task.bytes_total = task.items.iter().try_fold(0u64, |total, item| {
+        total.checked_add(item.size).ok_or_else(|| {
+            LiosError::DataCorruption("transfer action byte total overflowed".to_string())
         })
     })?;
     let mut store = TaskStore::open(&paths.database)?;

@@ -17,6 +17,68 @@ const DEFAULT_TASK_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const TERMINAL_TASK_RETENTION_DAYS: i64 = 30;
 const MAX_TERMINAL_TASKS: usize = 500;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    Push,
+    Pull,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferActionKind {
+    Create,
+    Update,
+    Skip,
+    Delete,
+    ReplaceType,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferActionState {
+    Pending,
+    Downloaded,
+    Applied,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedTransferAction {
+    pub relative_path: String,
+    pub source_path: Option<PathBuf>,
+    pub remote_node_id: Option<String>,
+    pub local_destination_path: Option<PathBuf>,
+    pub kind: TransferActionKind,
+    pub entry_kind: TransferEntryKind,
+    pub source_sha256: Option<String>,
+    pub source_fingerprint: Option<String>,
+    pub size: u64,
+    pub destination_fingerprint: Option<String>,
+    pub state: TransferActionState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedTransferPlan {
+    pub direction: TransferDirection,
+    pub source_operand: String,
+    pub destination_operand: String,
+    pub source_trailing_slash: bool,
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    pub remote_catalog_baseline: Option<String>,
+    pub delete_scope: Option<String>,
+    pub actions: Vec<PersistedTransferAction>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskState {
     Queued,
@@ -66,6 +128,18 @@ impl TaskState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskSpec {
+    Copy {
+        account_id: String,
+        space_id: String,
+        repo: RepoConfig,
+        plan: PersistedTransferPlan,
+    },
+    Sync {
+        account_id: String,
+        space_id: String,
+        repo: RepoConfig,
+        plan: PersistedTransferPlan,
+    },
     Upload {
         account_id: String,
         space_id: String,
@@ -109,7 +183,9 @@ pub enum TaskSpec {
 impl TaskSpec {
     pub fn account_id(&self) -> &str {
         match self {
-            Self::Upload { account_id, .. }
+            Self::Copy { account_id, .. }
+            | Self::Sync { account_id, .. }
+            | Self::Upload { account_id, .. }
             | Self::Delete { account_id, .. }
             | Self::Download { account_id, .. }
             | Self::VerifySpace { account_id, .. }
@@ -119,7 +195,9 @@ impl TaskSpec {
 
     pub fn space_id(&self) -> &str {
         match self {
-            Self::Upload { space_id, .. }
+            Self::Copy { space_id, .. }
+            | Self::Sync { space_id, .. }
+            | Self::Upload { space_id, .. }
             | Self::Delete { space_id, .. }
             | Self::Download { space_id, .. }
             | Self::VerifySpace { space_id, .. }
@@ -129,6 +207,8 @@ impl TaskSpec {
 
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Copy { .. } => "copy",
+            Self::Sync { .. } => "sync",
             Self::Upload { .. } => "upload",
             Self::Delete { .. } => "delete",
             Self::Download { .. } => "download",
@@ -674,9 +754,15 @@ impl TaskStore {
                 r#"
                 UPDATE task_items
                 SET state = ?2, phase = NULL, bytes_done = 0, error = NULL
-                WHERE task_id = ?1
+                WHERE task_id = ?1 AND state IN (?3, ?4, ?5)
                 "#,
-                rusqlite::params![id.to_string(), TaskItemState::Queued.as_str()],
+                rusqlite::params![
+                    id.to_string(),
+                    TaskItemState::Queued.as_str(),
+                    TaskItemState::Queued.as_str(),
+                    TaskItemState::Running.as_str(),
+                    TaskItemState::Failed.as_str(),
+                ],
             )?;
         }
         transaction.commit()?;
@@ -1115,6 +1201,23 @@ impl TaskStore {
                 phase,
                 error,
                 complete_bytes,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_active_items(&self, task_id: Uuid) -> Result<()> {
+        self.connection.execute(
+            r#"
+            UPDATE task_items
+            SET state = ?2, phase = NULL, error = NULL, bytes_done = bytes_total
+            WHERE task_id = ?1 AND state IN (?3, ?4)
+            "#,
+            rusqlite::params![
+                task_id.to_string(),
+                TaskItemState::Completed.as_str(),
+                TaskItemState::Queued.as_str(),
+                TaskItemState::Running.as_str(),
             ],
         )?;
         Ok(())

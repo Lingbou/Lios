@@ -1,5 +1,7 @@
 mod atomic;
 
+pub use atomic::copy_file_atomic;
+
 pub mod cache;
 pub mod catalog;
 pub mod catalog_transaction;

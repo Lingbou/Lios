@@ -181,28 +181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_failure_does_not_initialize() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-        let probe_dir = tempdir().unwrap();
-
-        let error = ensure_space_can_initialize(
-            &ModelScopeAdapter::new(endpoint, "token"),
-            "novix",
-            "cold",
-            probe_dir.path(),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.code, CommandErrorCode::Network);
-        assert!(error.retryable);
-        assert_eq!(probe_dir.path().read_dir().unwrap().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn interrupted_probe_removes_download_sidecar() {
+    async fn network_failure_does_not_initialize_and_cleans_probe() {
         let probe_dir = tempdir().unwrap();
 
         let error =
@@ -211,6 +190,7 @@ mod tests {
                 .unwrap_err();
 
         assert_eq!(error.code, CommandErrorCode::Network);
+        assert!(error.retryable);
         assert_eq!(probe_dir.path().read_dir().unwrap().count(), 0);
     }
 

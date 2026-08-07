@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use lios_core::catalog::{
     Catalog, CatalogIntegrityReport, CatalogRemoteIntegrityReport, CatalogSelection,
-    ConflictResolution, SourceFileSnapshot, CATALOG_FILE,
+    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution, SourceFileSnapshot,
+    CATALOG_FILE,
 };
 use lios_core::catalog_transaction::{
     probe_catalog_sha256, CatalogBlobCheckpointState, CatalogTransactionOutcome,
@@ -15,8 +16,9 @@ use lios_core::pack::PackOptions;
 use lios_core::restore::{RestoreConflictPolicy, RestoreOptions};
 use lios_core::storage::StorageAdapter;
 use lios_core::tasks::{
-    CheckpointState, TaskItemState, TaskObjectCheckpoint, TaskRecord, TaskSpec, TaskState,
-    TaskStore, TaskSummary,
+    CheckpointState, PersistedTransferAction, PersistedTransferPlan, TaskItem, TaskItemState,
+    TaskObjectCheckpoint, TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary,
+    TransferActionKind, TransferDirection, TransferEntryKind,
 };
 use uuid::Uuid;
 
@@ -27,9 +29,10 @@ use crate::service::{
     existing_absolute_directory, existing_absolute_paths, key_from_config, Application,
 };
 use crate::task_manager::{
-    apply_pack_progress, persist_submission, reconcile_catalog_hash, snapshot_upload_sources,
-    validate_task_sources, CatalogReconcileDecision, TaskScope,
+    apply_pack_progress, persist_submission, persist_transfer_submission, reconcile_catalog_hash,
+    snapshot_upload_sources, validate_task_sources, CatalogReconcileDecision, TaskScope,
 };
+use crate::transfer_request::fingerprint_path;
 use crate::{remote_to_staging_path, to_err, CommandError, CommandErrorCode, CommandResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,8 +66,9 @@ impl Application {
             .map_err(to_err)
     }
 
-    pub fn queue_upload(
+    pub fn queue_upload_for(
         &self,
+        repo: RepoConfig,
         parent_node_id: String,
         source_paths: Vec<PathBuf>,
         mut conflict_resolutions: Vec<ConflictResolution>,
@@ -78,7 +82,6 @@ impl Application {
         }
         let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
         key_from_config(&config)?;
-        let repo = self.active_repo()?;
         let scope = TaskScope::from_repo(&repo);
         let source_snapshot = snapshot_upload_sources(&source_paths).map_err(to_err)?;
         let spec = TaskSpec::Upload {
@@ -96,9 +99,12 @@ impl Application {
         summary_for(&self.paths, task.id)
     }
 
-    pub fn queue_delete(&self, node_ids: Vec<String>) -> CommandResult<TaskSummary> {
+    pub fn queue_delete_for(
+        &self,
+        repo: RepoConfig,
+        node_ids: Vec<String>,
+    ) -> CommandResult<TaskSummary> {
         let node_ids = clean_ids(node_ids, "delete selection cannot be empty")?;
-        let repo = self.active_repo()?;
         let scope = TaskScope::from_repo(&repo);
         let spec = TaskSpec::Delete {
             account_id: scope.account_id,
@@ -110,14 +116,14 @@ impl Application {
         summary_for(&self.paths, task.id)
     }
 
-    pub fn queue_download(
+    pub fn queue_download_for(
         &self,
+        repo: RepoConfig,
         node_ids: Vec<String>,
         output_dir: PathBuf,
     ) -> CommandResult<TaskSummary> {
         let node_ids = clean_ids(node_ids, "download selection cannot be empty")?;
         let output_dir = existing_absolute_directory(&output_dir)?;
-        let repo = self.active_repo()?;
         let scope = TaskScope::from_repo(&repo);
         let spec = TaskSpec::Download {
             account_id: scope.account_id,
@@ -130,8 +136,9 @@ impl Application {
         summary_for(&self.paths, task.id)
     }
 
-    pub fn queue_verify(&self, full: bool) -> CommandResult<TaskSummary> {
-        let repo = self.active_repo()?;
+    pub fn queue_verify_for(&self, repo: RepoConfig, full: bool) -> CommandResult<TaskSummary> {
+        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
+        key_from_config(&config)?;
         let scope = TaskScope::from_repo(&repo);
         let spec = TaskSpec::VerifySpace {
             account_id: scope.account_id,
@@ -140,6 +147,51 @@ impl Application {
             full,
         };
         let task = persist_submission(&self.paths, &spec, &[]).map_err(to_err)?;
+        summary_for(&self.paths, task.id)
+    }
+
+    pub fn queue_copy(
+        &self,
+        repo: RepoConfig,
+        plan: PersistedTransferPlan,
+    ) -> CommandResult<TaskSummary> {
+        self.queue_transfer(repo, plan, false)
+    }
+
+    pub fn queue_sync(
+        &self,
+        repo: RepoConfig,
+        plan: PersistedTransferPlan,
+    ) -> CommandResult<TaskSummary> {
+        self.queue_transfer(repo, plan, true)
+    }
+
+    fn queue_transfer(
+        &self,
+        repo: RepoConfig,
+        plan: PersistedTransferPlan,
+        sync: bool,
+    ) -> CommandResult<TaskSummary> {
+        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
+        key_from_config(&config)?;
+        let scope = TaskScope::from_repo(&repo);
+        let actions = plan.actions.clone();
+        let spec = if sync {
+            TaskSpec::Sync {
+                account_id: scope.account_id,
+                space_id: scope.space_id,
+                repo,
+                plan,
+            }
+        } else {
+            TaskSpec::Copy {
+                account_id: scope.account_id,
+                space_id: scope.space_id,
+                repo,
+                plan,
+            }
+        };
+        let task = persist_transfer_submission(&self.paths, &spec, &actions).map_err(to_err)?;
         summary_for(&self.paths, task.id)
     }
 
@@ -215,9 +267,7 @@ impl Application {
                         (!notices.is_empty()).then(|| notices.join("; ")),
                     )
                     .map_err(to_err)?;
-                store
-                    .update_items_state(task_id, TaskItemState::Completed, None, None, false)
-                    .map_err(to_err)?;
+                store.complete_active_items(task_id).map_err(to_err)?;
                 Ok(TaskRunResult {
                     summary: summary_for(&self.paths, task_id)?,
                     notices,
@@ -249,7 +299,96 @@ impl Application {
     where
         F: FnMut(ForegroundProgress),
     {
+        self.requeue_paused_task(task_id)?;
         self.run_task(task_id, on_progress).await
+    }
+
+    pub fn requeue_paused_task(&self, task_id: Uuid) -> CommandResult<TaskSummary> {
+        let store = TaskStore::open(&self.paths.database).map_err(to_err)?;
+        let summary = store
+            .get_summary(task_id)
+            .map_err(to_err)?
+            .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
+        if summary.state != TaskState::Paused {
+            return Err(CommandError::invalid_input(
+                "only paused or interrupted tasks can resume",
+            ));
+        }
+        if !store
+            .transition_state(task_id, TaskState::Paused, TaskState::Queued)
+            .map_err(to_err)?
+        {
+            return Err(CommandError::new(
+                CommandErrorCode::RemoteConflict,
+                "task state changed before resume",
+                true,
+                None,
+            ));
+        }
+        summary_for(&self.paths, task_id)
+    }
+
+    pub async fn retry_task<F>(&self, task_id: Uuid, on_progress: F) -> CommandResult<TaskRunResult>
+    where
+        F: FnMut(ForegroundProgress),
+    {
+        self.requeue_failed_task(task_id)?;
+        self.run_task(task_id, on_progress).await
+    }
+
+    pub fn requeue_failed_task(&self, task_id: Uuid) -> CommandResult<TaskSummary> {
+        let mut store = TaskStore::open(&self.paths.database).map_err(to_err)?;
+        if !store.requeue_failed(task_id).map_err(to_err)? {
+            return Err(CommandError::invalid_input(
+                "only failed tasks with a saved specification can retry",
+            ));
+        }
+        summary_for(&self.paths, task_id)
+    }
+
+    pub async fn pause_task(&self, task_id: Uuid) -> CommandResult<TaskSummary> {
+        let store = TaskStore::open(&self.paths.database).map_err(to_err)?;
+        if !store
+            .interrupt_task(task_id, TaskState::Paused)
+            .map_err(to_err)?
+        {
+            return Err(CommandError::invalid_input(
+                "only queued or running tasks can pause",
+            ));
+        }
+        self.task_manager.cancel(task_id).await;
+        summary_for(&self.paths, task_id)
+    }
+
+    pub async fn cancel_task(&self, task_id: Uuid) -> CommandResult<TaskSummary> {
+        let store = TaskStore::open(&self.paths.database).map_err(to_err)?;
+        if !store
+            .interrupt_task(task_id, TaskState::Canceled)
+            .map_err(to_err)?
+        {
+            return Err(CommandError::invalid_input(
+                "only non-terminal tasks can be canceled",
+            ));
+        }
+        self.task_manager.cancel(task_id).await;
+        summary_for(&self.paths, task_id)
+    }
+
+    pub fn clear_task(&self, task_id: Uuid) -> CommandResult<()> {
+        let store = TaskStore::open(&self.paths.database).map_err(to_err)?;
+        let summary = store
+            .get_summary(task_id)
+            .map_err(to_err)?
+            .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
+        if !matches!(
+            summary.state,
+            TaskState::Failed | TaskState::Completed | TaskState::Canceled
+        ) {
+            return Err(CommandError::invalid_input(
+                "only terminal task records can be cleared",
+            ));
+        }
+        store.delete(task_id).map_err(to_err)
     }
 
     async fn prepare_task_for_run<F>(
@@ -377,6 +516,10 @@ impl Application {
         F: FnMut(ForegroundProgress),
     {
         match spec {
+            TaskSpec::Copy { repo, plan, .. } | TaskSpec::Sync { repo, plan, .. } => {
+                self.run_persisted_transfer(task_paths, task, repo, plan, on_progress)
+                    .await
+            }
             TaskSpec::Upload {
                 repo,
                 parent_node_id,
@@ -423,6 +566,369 @@ impl Application {
                 "catalog rebuild is not available in the first CLI release",
             )),
         }
+    }
+
+    async fn run_persisted_transfer<F>(
+        &self,
+        paths: &LiosPaths,
+        task: &mut TaskRecord,
+        repo: RepoConfig,
+        plan: PersistedTransferPlan,
+        on_progress: &mut F,
+    ) -> CommandResult<Vec<String>>
+    where
+        F: FnMut(ForegroundProgress),
+    {
+        if plan.direction == TransferDirection::Pull {
+            return self
+                .run_persisted_pull(paths, task, repo, plan, on_progress)
+                .await;
+        }
+        let config = LiosConfig::load(&paths.config).map_err(to_err)?;
+        let key = key_from_config(&config)?;
+        let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
+        let (catalog, baseline) = download_catalog_baseline(paths, &key, &adapter, &repo).await?;
+        if baseline.catalog_sha256 != plan.remote_catalog_baseline {
+            return Err(CommandError::new(
+                CommandErrorCode::RemoteConflict,
+                "remote Catalog changed after the transfer plan was confirmed",
+                true,
+                None,
+            ));
+        }
+
+        let total = u64::try_from(plan.actions.len()).map_err(|_| {
+            CommandError::new(
+                CommandErrorCode::CorruptedData,
+                "transfer action count is invalid",
+                false,
+                None,
+            )
+        })?;
+        let bytes_total = plan.actions.iter().try_fold(0u64, |sum, action| {
+            sum.checked_add(action.size).ok_or_else(|| {
+                CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    "transfer byte count overflowed",
+                    false,
+                    None,
+                )
+            })
+        })?;
+        TaskStore::open(&paths.database)
+            .map_err(to_err)?
+            .update_transfer(task.id, 0, total, 0, bytes_total, 0)
+            .map_err(to_err)?;
+
+        let mut journal = transfer_journal(paths, task.id)?;
+        let mut bytes_done = 0u64;
+        for (index, action) in plan.actions.iter().enumerate() {
+            let skipped = action.kind == TransferActionKind::Skip;
+            mark_transfer_item(
+                paths,
+                &mut journal,
+                action,
+                if skipped {
+                    TaskItemState::Skipped
+                } else {
+                    TaskItemState::Running
+                },
+                Some("applying_plan"),
+                skipped,
+                None,
+            )?;
+            let applied = (|| -> CommandResult<()> {
+                if let (Some(source), Some(expected)) =
+                    (&action.source_path, &action.source_fingerprint)
+                {
+                    if fingerprint_path(source)? != *expected {
+                        return Err(CommandError::new(
+                            CommandErrorCode::RemoteConflict,
+                            format!(
+                                "local source changed after planning: {}",
+                                action.relative_path
+                            ),
+                            true,
+                            None,
+                        ));
+                    }
+                }
+
+                match action.kind {
+                    TransferActionKind::Skip => {}
+                    TransferActionKind::Delete => {
+                        let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
+                        if let Some(node) = resolve_relative_node(&tree, &action.relative_path) {
+                            catalog
+                                .delete_nodes(std::slice::from_ref(&node.id), &key)
+                                .map_err(to_err)?;
+                        }
+                    }
+                    TransferActionKind::ReplaceType => {
+                        let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
+                        if let Some(node) = resolve_relative_node(&tree, &action.relative_path) {
+                            catalog
+                                .delete_nodes(std::slice::from_ref(&node.id), &key)
+                                .map_err(to_err)?;
+                        }
+                        apply_push_create_or_update(
+                            &catalog,
+                            paths,
+                            &key,
+                            &baseline.remote_objects,
+                            action,
+                            config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
+                        )?;
+                    }
+                    TransferActionKind::Create | TransferActionKind::Update => {
+                        apply_push_create_or_update(
+                            &catalog,
+                            paths,
+                            &key,
+                            &baseline.remote_objects,
+                            action,
+                            config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
+                        )?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = applied {
+                mark_transfer_item(
+                    paths,
+                    &mut journal,
+                    action,
+                    TaskItemState::Failed,
+                    Some("applying_plan"),
+                    false,
+                    Some(error.message.clone()),
+                )?;
+                return Err(error);
+            }
+            if !skipped {
+                mark_transfer_item(
+                    paths,
+                    &mut journal,
+                    action,
+                    TaskItemState::Completed,
+                    Some("catalog_pending"),
+                    true,
+                    None,
+                )?;
+            }
+            bytes_done = bytes_done.checked_add(action.size).ok_or_else(|| {
+                CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    "transfer byte progress overflowed",
+                    false,
+                    None,
+                )
+            })?;
+            let done = u64::try_from(index + 1).unwrap_or(total);
+            TaskStore::open(&paths.database)
+                .map_err(to_err)?
+                .update_transfer(task.id, done, total, bytes_done, bytes_total, 0)
+                .map_err(to_err)?;
+            on_progress(ForegroundProgress {
+                task_id: task.id,
+                phase: "applying_plan".to_string(),
+                completed: done,
+                total,
+                bytes_done,
+                bytes_total,
+            });
+        }
+
+        let work = plan_catalog_sync(paths, &catalog, &key, baseline)?;
+        persist_sync_checkpoints(paths, task.id, &work)?;
+        self.publish_sync(paths, task.id, &adapter, &repo, work, on_progress)
+            .await
+    }
+
+    async fn run_persisted_pull<F>(
+        &self,
+        paths: &LiosPaths,
+        task: &mut TaskRecord,
+        repo: RepoConfig,
+        plan: PersistedTransferPlan,
+        on_progress: &mut F,
+    ) -> CommandResult<Vec<String>>
+    where
+        F: FnMut(ForegroundProgress),
+    {
+        let config = LiosConfig::load(&paths.config).map_err(to_err)?;
+        let key = key_from_config(&config)?;
+        let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
+        let catalog_path = paths.staging.join(CATALOG_FILE);
+        adapter
+            .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
+            .await
+            .map_err(to_err)?;
+        let current_baseline = crate::sha256_hex_file(&catalog_path)?;
+        if plan.remote_catalog_baseline.as_deref() != Some(current_baseline.as_str()) {
+            return Err(CommandError::new(
+                CommandErrorCode::RemoteConflict,
+                "remote Catalog changed after the transfer plan was confirmed",
+                true,
+                None,
+            ));
+        }
+        let catalog = Catalog::from_staging(paths.staging.clone());
+        let mut journal = transfer_journal(paths, task.id)?;
+        let node_ids = plan
+            .actions
+            .iter()
+            .filter(|action| !transfer_action_finished(&journal, action))
+            .filter(|action| action.entry_kind == TransferEntryKind::File)
+            .filter(|action| {
+                !matches!(
+                    action.kind,
+                    TransferActionKind::Skip | TransferActionKind::Delete
+                )
+            })
+            .filter_map(|action| action.remote_node_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let selection = CatalogSelection::Nodes(node_ids);
+        let remote_files = catalog
+            .remote_files_for_selection(&selection, &key)
+            .map_err(to_err)?;
+        for file in &remote_files {
+            let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
+            adapter
+                .download_object(&repo.namespace, &repo.dataset, &file.path, &local_path)
+                .await
+                .map_err(to_err)?;
+        }
+
+        let total = u64::try_from(plan.actions.len()).map_err(|_| {
+            CommandError::new(
+                CommandErrorCode::CorruptedData,
+                "transfer action count is invalid",
+                false,
+                None,
+            )
+        })?;
+        let bytes_total = plan.actions.iter().try_fold(0u64, |sum, action| {
+            sum.checked_add(action.size).ok_or_else(|| {
+                CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    "transfer byte count overflowed",
+                    false,
+                    None,
+                )
+            })
+        })?;
+        let ordered_actions = plan
+            .actions
+            .iter()
+            .filter(|action| action.kind != TransferActionKind::Delete)
+            .chain(
+                plan.actions
+                    .iter()
+                    .filter(|action| action.kind == TransferActionKind::Delete),
+            )
+            .collect::<Vec<_>>();
+        let mut bytes_done = ordered_actions
+            .iter()
+            .filter(|action| transfer_action_finished(&journal, action))
+            .try_fold(0u64, |sum, action| {
+                sum.checked_add(action.size).ok_or_else(|| {
+                    CommandError::new(
+                        CommandErrorCode::CorruptedData,
+                        "transfer byte progress overflowed",
+                        false,
+                        None,
+                    )
+                })
+            })?;
+        let mut completed = ordered_actions
+            .iter()
+            .filter(|action| transfer_action_finished(&journal, action))
+            .count();
+        for action in ordered_actions {
+            if transfer_action_finished(&journal, action) {
+                continue;
+            }
+            let skipped = action.kind == TransferActionKind::Skip;
+            mark_transfer_item(
+                paths,
+                &mut journal,
+                action,
+                if skipped {
+                    TaskItemState::Skipped
+                } else {
+                    TaskItemState::Running
+                },
+                Some(if action.kind == TransferActionKind::Delete {
+                    "deleting"
+                } else {
+                    "applying_plan"
+                }),
+                skipped,
+                None,
+            )?;
+            let applied = (|| -> CommandResult<()> {
+                validate_local_destination_fingerprint(action)?;
+                match action.kind {
+                    TransferActionKind::Skip => {}
+                    TransferActionKind::Delete => delete_local_destination(action)?,
+                    TransferActionKind::Create
+                    | TransferActionKind::Update
+                    | TransferActionKind::ReplaceType => {
+                        apply_pull_action(&catalog, paths, &key, action)?;
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = applied {
+                mark_transfer_item(
+                    paths,
+                    &mut journal,
+                    action,
+                    TaskItemState::Failed,
+                    Some("applying_plan"),
+                    false,
+                    Some(error.message.clone()),
+                )?;
+                return Err(error);
+            }
+            if !skipped {
+                mark_transfer_item(
+                    paths,
+                    &mut journal,
+                    action,
+                    TaskItemState::Completed,
+                    Some("applied"),
+                    true,
+                    None,
+                )?;
+            }
+            bytes_done = bytes_done.checked_add(action.size).ok_or_else(|| {
+                CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    "transfer byte progress overflowed",
+                    false,
+                    None,
+                )
+            })?;
+            completed += 1;
+            let done = u64::try_from(completed).unwrap_or(total);
+            TaskStore::open(&paths.database)
+                .map_err(to_err)?
+                .update_transfer(task.id, done, total, bytes_done, bytes_total, 0)
+                .map_err(to_err)?;
+            on_progress(ForegroundProgress {
+                task_id: task.id,
+                phase: "applying_plan".to_string(),
+                completed: done,
+                total,
+                bytes_done,
+                bytes_total,
+            });
+        }
+        Ok(Vec::new())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -749,6 +1255,415 @@ impl Application {
     }
 }
 
+fn transfer_journal(paths: &LiosPaths, task_id: Uuid) -> CommandResult<HashMap<String, TaskItem>> {
+    TaskStore::open(&paths.database)
+        .map_err(to_err)?
+        .list_items(task_id)
+        .map_err(to_err)
+        .map(|items| {
+            items
+                .into_iter()
+                .filter_map(|item| {
+                    item.relative_path
+                        .as_ref()
+                        .map(|path| (path.to_string_lossy().into_owned(), item.clone()))
+                })
+                .collect()
+        })
+}
+
+fn transfer_action_finished(
+    journal: &HashMap<String, TaskItem>,
+    action: &PersistedTransferAction,
+) -> bool {
+    journal.get(&action.relative_path).is_some_and(|item| {
+        matches!(
+            item.state,
+            TaskItemState::Completed | TaskItemState::Skipped
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_transfer_item(
+    paths: &LiosPaths,
+    journal: &mut HashMap<String, TaskItem>,
+    action: &PersistedTransferAction,
+    state: TaskItemState,
+    phase: Option<&str>,
+    complete_bytes: bool,
+    error: Option<String>,
+) -> CommandResult<()> {
+    let item = journal.get_mut(&action.relative_path).ok_or_else(|| {
+        CommandError::new(
+            CommandErrorCode::CorruptedData,
+            format!("transfer journal item is missing: {}", action.relative_path),
+            false,
+            None,
+        )
+    })?;
+    item.state = state;
+    item.phase = phase.map(str::to_string);
+    item.error = error;
+    if complete_bytes {
+        item.bytes_done = item.bytes_total;
+    }
+    TaskStore::open(&paths.database)
+        .map_err(to_err)?
+        .upsert_item(item)
+        .map_err(to_err)
+}
+
+fn apply_push_create_or_update(
+    catalog: &Catalog,
+    paths: &LiosPaths,
+    key: &lios_core::crypto::KeyFile,
+    remote_objects: &[lios_core::storage::StorageObject],
+    action: &PersistedTransferAction,
+    chunk_size: usize,
+) -> CommandResult<()> {
+    let (parent_path, name) = action
+        .relative_path
+        .rsplit_once('/')
+        .map_or(("", action.relative_path.as_str()), |(parent, name)| {
+            (parent, name)
+        });
+    let tree = catalog.decrypt_tree(key).map_err(to_err)?;
+    let parent = if parent_path.is_empty() {
+        &tree
+    } else {
+        resolve_relative_node(&tree, parent_path).ok_or_else(|| {
+            CommandError::new(
+                CommandErrorCode::RemoteConflict,
+                format!("planned parent directory is missing: {parent_path}"),
+                true,
+                None,
+            )
+        })?
+    };
+    if !matches!(parent.kind, CatalogTreeNodeKind::Directory { .. }) {
+        return Err(CommandError::new(
+            CommandErrorCode::RemoteConflict,
+            format!("planned parent is no longer a directory: {parent_path}"),
+            true,
+            None,
+        ));
+    }
+
+    match action.entry_kind {
+        TransferEntryKind::Directory => {
+            if resolve_relative_node(&tree, &action.relative_path).is_none() {
+                catalog
+                    .create_folder(&parent.id, name, key)
+                    .map_err(to_err)?;
+            }
+            Ok(())
+        }
+        TransferEntryKind::File => {
+            let source = action.source_path.as_ref().ok_or_else(|| {
+                CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    "planned file action has no local source",
+                    false,
+                    None,
+                )
+            })?;
+            let input_dir = paths
+                .staging
+                .join("transfer-input")
+                .join(Uuid::new_v4().simple().to_string());
+            std::fs::create_dir_all(&input_dir).map_err(to_err)?;
+            let staged_source = input_dir.join(name);
+            if std::fs::hard_link(source, &staged_source).is_err() {
+                std::fs::copy(source, &staged_source).map_err(to_err)?;
+            }
+            if action.source_sha256.as_deref().is_some_and(|expected| {
+                crate::sha256_hex_file(&staged_source).ok().as_deref() != Some(expected)
+            }) {
+                return Err(CommandError::new(
+                    CommandErrorCode::RemoteConflict,
+                    format!("local source content changed: {}", action.relative_path),
+                    true,
+                    None,
+                ));
+            }
+            let resolutions = if resolve_relative_node(&tree, &action.relative_path).is_some() {
+                vec![ConflictResolution {
+                    source_path: staged_source.display().to_string(),
+                    action: ConflictAction::Replace,
+                }]
+            } else {
+                Vec::new()
+            };
+            catalog
+                .add_paths_to_folder_with_remote_inventory(
+                    &parent.id,
+                    std::slice::from_ref(&staged_source),
+                    &resolutions,
+                    key,
+                    PackOptions {
+                        chunk_size,
+                        staging_dir: paths.staging.clone(),
+                    },
+                    remote_objects,
+                )
+                .map_err(to_err)
+        }
+    }
+}
+
+fn resolve_relative_node<'a>(
+    root: &'a CatalogTreeNode,
+    relative_path: &str,
+) -> Option<&'a CatalogTreeNode> {
+    if relative_path.is_empty() {
+        return Some(root);
+    }
+    let mut current = root;
+    for segment in relative_path.split('/') {
+        let CatalogTreeNodeKind::Directory { children } = &current.kind else {
+            return None;
+        };
+        current = children
+            .iter()
+            .find(|child| child.name.eq_ignore_ascii_case(segment))?;
+    }
+    Some(current)
+}
+
+fn validate_local_destination_fingerprint(action: &PersistedTransferAction) -> CommandResult<()> {
+    let Some(path) = action.local_destination_path.as_deref() else {
+        return Ok(());
+    };
+    if action.kind == TransferActionKind::Delete {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(to_err(error)),
+            Ok(metadata) if action.entry_kind == TransferEntryKind::Directory => {
+                // Child deletions intentionally change their parent directory's
+                // length and modification time. Revalidate link/reparse safety,
+                // but let remove_dir provide the final non-empty safety check.
+                fingerprint_path(path).map_err(|_| local_destination_changed(action))?;
+                if !metadata.is_dir() {
+                    return Err(local_destination_changed(action));
+                }
+                return Ok(());
+            }
+            Ok(_) => {}
+        }
+    }
+    match action.destination_fingerprint.as_deref() {
+        Some(expected) => {
+            let actual = fingerprint_path(path).map_err(|_| local_destination_changed(action))?;
+            if actual != expected {
+                return Err(local_destination_changed(action));
+            }
+        }
+        None if path.exists() => {
+            return Err(CommandError::new(
+                CommandErrorCode::RemoteConflict,
+                format!(
+                    "local destination appeared after planning: {}",
+                    action.relative_path
+                ),
+                true,
+                None,
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn local_destination_changed(action: &PersistedTransferAction) -> CommandError {
+    CommandError::new(
+        CommandErrorCode::RemoteConflict,
+        format!(
+            "local destination changed after planning: {}",
+            action.relative_path
+        ),
+        true,
+        None,
+    )
+}
+
+fn apply_pull_action(
+    catalog: &Catalog,
+    paths: &LiosPaths,
+    key: &lios_core::crypto::KeyFile,
+    action: &PersistedTransferAction,
+) -> CommandResult<()> {
+    let destination = action.local_destination_path.as_deref().ok_or_else(|| {
+        CommandError::new(
+            CommandErrorCode::CorruptedData,
+            "pull action has no local destination",
+            false,
+            None,
+        )
+    })?;
+    ensure_safe_local_parents(destination)?;
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(to_err)?;
+        ensure_safe_local_parents(destination)?;
+    }
+
+    match action.entry_kind {
+        TransferEntryKind::Directory => {
+            if action.kind == TransferActionKind::ReplaceType {
+                replace_local_type(destination, || {
+                    std::fs::create_dir(destination).map_err(to_err)
+                })?;
+            } else if !destination.exists() {
+                std::fs::create_dir(destination).map_err(to_err)?;
+            }
+            Ok(())
+        }
+        TransferEntryKind::File => {
+            let node_id = action.remote_node_id.as_ref().ok_or_else(|| {
+                CommandError::new(
+                    CommandErrorCode::CorruptedData,
+                    "pull file action has no remote node ID",
+                    false,
+                    None,
+                )
+            })?;
+            let tree = catalog.decrypt_tree(key).map_err(to_err)?;
+            let node = find_node_by_id(&tree, node_id).ok_or_else(|| {
+                CommandError::new(
+                    CommandErrorCode::RemoteConflict,
+                    "planned remote file no longer exists",
+                    true,
+                    None,
+                )
+            })?;
+            let restore_dir = paths
+                .staging
+                .join("pull-ready")
+                .join(Uuid::new_v4().simple().to_string());
+            std::fs::create_dir_all(&restore_dir).map_err(to_err)?;
+            catalog
+                .restore(
+                    CatalogSelection::Node(node_id.clone()),
+                    key,
+                    RestoreOptions {
+                        output_dir: restore_dir.clone(),
+                        conflict_policy: RestoreConflictPolicy::Rename,
+                    },
+                )
+                .map_err(to_err)?;
+            let restored = restore_dir.join(&node.name);
+            if action.kind == TransferActionKind::ReplaceType {
+                replace_local_type(destination, || {
+                    lios_core::copy_file_atomic(&restored, destination, false).map_err(to_err)
+                })?;
+            } else {
+                lios_core::copy_file_atomic(
+                    &restored,
+                    destination,
+                    action.kind == TransferActionKind::Update,
+                )
+                .map_err(to_err)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn replace_local_type(
+    destination: &std::path::Path,
+    apply: impl FnOnce() -> CommandResult<()>,
+) -> CommandResult<()> {
+    let backup = destination.with_file_name(format!(
+        ".{}.lios-backup-{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("item"),
+        Uuid::new_v4().simple()
+    ));
+    std::fs::rename(destination, &backup).map_err(to_err)?;
+    match apply() {
+        Ok(()) => {
+            if backup.is_dir() {
+                std::fs::remove_dir_all(backup).map_err(to_err)?;
+            } else {
+                std::fs::remove_file(backup).map_err(to_err)?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = if destination.is_dir() {
+                std::fs::remove_dir_all(destination)
+            } else {
+                std::fs::remove_file(destination)
+            };
+            let _ = std::fs::rename(&backup, destination);
+            Err(error)
+        }
+    }
+}
+
+fn delete_local_destination(action: &PersistedTransferAction) -> CommandResult<()> {
+    let destination = action.local_destination_path.as_deref().ok_or_else(|| {
+        CommandError::new(
+            CommandErrorCode::CorruptedData,
+            "delete action has no local destination",
+            false,
+            None,
+        )
+    })?;
+    if !destination.exists() {
+        return Ok(());
+    }
+    let metadata = std::fs::symlink_metadata(destination).map_err(to_err)?;
+    if metadata.file_type().is_symlink() {
+        return Err(CommandError::invalid_input(
+            "restore destination contains unsupported symbolic links or junctions",
+        ));
+    }
+    if metadata.is_dir() {
+        std::fs::remove_dir(destination).map_err(to_err)
+    } else {
+        std::fs::remove_file(destination).map_err(to_err)
+    }
+}
+
+fn ensure_safe_local_parents(destination: &std::path::Path) -> CommandResult<()> {
+    let mut current = destination.parent();
+    while let Some(path) = current {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(CommandError::invalid_input(
+                    "restore destination contains unsupported symbolic links or junctions",
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(CommandError::new(
+                    CommandErrorCode::RemoteConflict,
+                    "restore destination parent is not a directory",
+                    true,
+                    None,
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(to_err(error)),
+        }
+        current = path.parent();
+    }
+    Ok(())
+}
+
+fn find_node_by_id<'a>(root: &'a CatalogTreeNode, id: &str) -> Option<&'a CatalogTreeNode> {
+    if root.id == id {
+        return Some(root);
+    }
+    let CatalogTreeNodeKind::Directory { children } = &root.kind else {
+        return None;
+    };
+    children.iter().find_map(|child| find_node_by_id(child, id))
+}
+
 fn clean_ids(values: Vec<String>, empty_message: &'static str) -> CommandResult<Vec<String>> {
     let values = values
         .into_iter()
@@ -771,7 +1686,9 @@ fn summary_for(paths: &LiosPaths, task_id: Uuid) -> CommandResult<TaskSummary> {
 
 fn task_repo(spec: &TaskSpec) -> &RepoConfig {
     match spec {
-        TaskSpec::Upload { repo, .. }
+        TaskSpec::Copy { repo, .. }
+        | TaskSpec::Sync { repo, .. }
+        | TaskSpec::Upload { repo, .. }
         | TaskSpec::Delete { repo, .. }
         | TaskSpec::Download { repo, .. }
         | TaskSpec::VerifySpace { repo, .. }
@@ -871,10 +1788,16 @@ mod tests {
         CatalogTransactionProgress,
     };
     use lios_core::config::LiosPaths;
-    use lios_core::tasks::{CheckpointState, TaskRecord, TaskStore};
+    use lios_core::tasks::{
+        CheckpointState, PersistedTransferAction, TaskRecord, TaskStore, TransferActionKind,
+        TransferActionState, TransferEntryKind,
+    };
     use tempfile::tempdir;
 
-    use super::persist_transaction_progress;
+    use super::{
+        delete_local_destination, fingerprint_path, persist_transaction_progress,
+        validate_local_destination_fingerprint,
+    };
 
     #[test]
     fn transaction_progress_persists_uploaded_and_committed_checkpoints() {
@@ -919,5 +1842,37 @@ mod tests {
             store.list_checkpoints(task.id).unwrap()[0].state,
             CheckpointState::Committed
         );
+    }
+
+    #[test]
+    fn planned_child_deletion_does_not_invalidate_parent_directory_deletion() {
+        let temp = tempdir().unwrap();
+        let parent = temp.path().join("old");
+        std::fs::create_dir(&parent).unwrap();
+        let child = parent.join("file.txt");
+        std::fs::write(&child, b"stale").unwrap();
+
+        let action = |relative_path: &str,
+                      path: std::path::PathBuf,
+                      entry_kind: TransferEntryKind| PersistedTransferAction {
+            relative_path: relative_path.to_string(),
+            source_path: None,
+            remote_node_id: None,
+            local_destination_path: Some(path.clone()),
+            kind: TransferActionKind::Delete,
+            entry_kind,
+            source_sha256: None,
+            source_fingerprint: None,
+            size: 0,
+            destination_fingerprint: Some(fingerprint_path(&path).unwrap()),
+            state: TransferActionState::Pending,
+        };
+        let child_action = action("old/file.txt", child, TransferEntryKind::File);
+        let parent_action = action("old", parent, TransferEntryKind::Directory);
+
+        validate_local_destination_fingerprint(&child_action).unwrap();
+        delete_local_destination(&child_action).unwrap();
+        validate_local_destination_fingerprint(&parent_action).unwrap();
+        delete_local_destination(&parent_action).unwrap();
     }
 }

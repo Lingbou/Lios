@@ -1,78 +1,136 @@
-# Lios CLI
+# Lios CLI 0.2
 
-`lios-cli` is the headless command-line edition of Lios. Its installed binary is named `lios`;
-the Cargo package remains `lios-cli` so Desktop and CLI release assets stay distinct.
+`lios` is the headless, rsync-style client for encrypted Lios Spaces. Desktop and CLI share the
+same `DIR/.lios` configuration, Space registry, Recovery Key, durable task database, and
+`lios-worker` process.
 
-Build it from the repository root:
-
-```bash
-cargo build -p lios-cli --release
-```
-
-Run it without installing:
+Build both installed executables from the repository root:
 
 ```bash
-cargo run -p lios-cli -- --help
+cargo build --release --locked -p lios-cli
 ```
 
 ## First use
 
-Run `lios setup`. Lios creates the local state directory and recovery key, then asks for the
-ModelScope token with hidden terminal input. Run `lios auth` later to replace the saved token.
+```bash
+lios setup
+lios auth login
+lios space add photos allen/photos
+lios ls photos:
+```
 
-The first packaged release targets Linux. On Linux, the token is stored as plaintext in a local
-credentials file whose permissions are restricted to the current user (`0600`). The CLI does not
-use an environment-variable token path.
+`setup` is idempotent. It creates missing local state and a Recovery Key, but never logs in or
+replaces an existing key. `auth login` reads the token with hidden terminal input; automation must
+use `auth login --token-stdin`. Tokens are not accepted through argv or ordinary environment
+variables.
 
-The code also uses Windows DPAPI when built on Windows and shares `%USERPROFILE%\.lios` with
-Desktop, but a Windows CLI package is not part of the first release.
+Use global `--home DIR` to isolate state under `DIR/.lios`. Use global `--json` to emit one stable
+JSON document and disable interaction and progress output.
 
-Use global `--home DIR` for an isolated `DIR/.lios` state directory.
+## Space paths
+
+A Space is always explicit:
+
+```text
+photos:          Space root
+photos:/docs     absolute Catalog path
+./photos:        local file whose name contains a colon
+```
+
+Space Names match `[a-z][a-z0-9_-]{0,31}`. A Space Name is a local alias; the remote identity is
+still its ModelScope Repository Address `(endpoint, namespace, dataset)`. There is no Active
+Repository or Active Space.
 
 ## Commands
 
 ```text
-lios setup
-lios auth
-lios status [--remote]
-lios repos list
-lios repos create --namespace NAME --dataset NAME
-lios space open --namespace NAME --dataset NAME
-lios space init --namespace NAME --dataset NAME
-lios ls [/PATH]
-lios search QUERY
-lios mkdir --parent NODE_ID NAME
-lios rename NODE_ID NEW_NAME
-lios upload --parent NODE_ID PATH...
-lios download --output DIR NODE_ID...
-lios delete NODE_ID...
-lios verify [--full]
-lios task list
-lios task resume TASK_ID
+lios [--home DIR] [--json] COMMAND
+
+setup
+status
+
+auth login [--token-stdin]
+auth status
+auth logout
+
+key status
+key backup DEST
+key verify PATH
+key import PATH
+
+space create NAME [--namespace N] [--dataset D] [--endpoint URL]
+space init NAME OWNER/DATASET [--endpoint URL]
+space add NAME OWNER/DATASET [--endpoint URL]
+space discover [--endpoint URL]
+space list
+space show NAME [--remote]
+space rename OLD NEW
+space remove NAME [--force]
+
+ls SPACE_PATH [--long]
+search SPACE_PATH QUERY
+mkdir SPACE_PATH... [--parents]
+cp SOURCE... DESTINATION
+sync SOURCE DESTINATION
+mv SOURCE DESTINATION
+rm SPACE_PATH... --recursive
+verify SPACE: [--full]
+
+task list
+task show ID
+task wait ID
+task pause ID
+task resume ID
+task retry ID
+task cancel ID
+task clear ID|--completed|--failed|--all-terminal
+
+worker status
+worker stop
 ```
 
-This first release is designed for people at an interactive terminal. It deliberately has no JSON
-output mode. Upload conflicts and destructive deletes require an interactive choice.
+`cp` copies and `sync` computes a source-wins difference. Direction comes only from operand order;
+0.2 supports local-to-Space and Space-to-local transfers, not Space-to-Space. Directory operands
+use rsync trailing-slash semantics: `dir` copies the directory itself and `dir/` copies its
+contents.
 
-All catalog and transfer operations call `lios-application`, the same Tauri-independent service
-layer used by Desktop. Upload, download, delete, verify, and task resume run the durable task in the
-foreground and do not report success merely because work was queued.
+SHA-256 identifies unchanged files. Same-type differences are replaced by default. File/directory
+type changes require `--replace-type --yes`. `sync --delete --yes` removes destination-only Catalog
+entries inside the selected target subtree; excluded paths are protected from deletion. Remote
+deletion removes Catalog references and does not promise ModelScope capacity reclamation.
+`--exclude` and `--exclude-from` patterns are matched relative to the selected source root.
 
-## Concurrency boundary
+Symlinks and junctions are rejected. Lios 0.2 does not preserve permissions, ownership, or
+modification times.
 
-On one computer, Desktop and CLI share `~/.lios`; an operating-system lock serializes writes to the
-same space. This is local-process protection, not distributed locking. ModelScope does not provide
-the atomic parent-commit compare-and-swap needed to make concurrent writers on different computers
-safe. In the first release, only one computer may write to a given space at a time.
+## Durable worker
+
+Every transfer is persisted before execution. `lios-worker` is started automatically, remains the
+sole worker for one Lios Home, recovers tasks after restart, and exits after five idle minutes.
+Foreground commands wait for their task; `--detach` returns its task ID immediately.
+
+The first Ctrl-C requests a safe pause and exits with 130. If the task is already publishing an
+atomic Catalog transaction, the worker finishes reconciliation before entering a terminal state.
+A second Ctrl-C stops only the waiting client immediately.
+
+## Output and exit codes
+
+TTY clients receive stderr progress. Non-TTY clients print only the final result unless
+`--progress` is requested. JSON mode writes exactly one envelope to stdout:
+
+```json
+{"schema_version":1,"ok":true,"command":"sync","result":{}}
+```
+
+Exit codes are stable: `0` success, `2` input, `3` authentication/key/initialization, `4`
+network/remote, `5` conflict/lock, `6` corruption/storage, `7` task/internal failure, and `130`
+interruption.
 
 ## Linux packages
 
-`Cargo.toml` contains `cargo-deb` and `cargo-generate-rpm` metadata. After building the release
-binary, package with:
+The DEB and RPM metadata install both `/usr/bin/lios` and `/usr/bin/lios-worker`:
 
 ```bash
 cargo deb -p lios-cli --no-build
 cargo generate-rpm -p crates/lios-cli
 ```
-
-The resulting package installs `/usr/bin/lios` and the CLI README.

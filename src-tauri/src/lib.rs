@@ -10,52 +10,52 @@ mod task_center;
 #[path = "../build_support.rs"]
 mod build_support;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 
 use app_log::AppLogger;
 use catalog_mutation_gate::CatalogMutationGate;
-use catalog_probe::{ensure_space_can_initialize, map_catalog_load_error};
+use catalog_probe::ensure_space_can_initialize;
 #[cfg(test)]
-use catalog_sync::{catalog_baseline_from_downloaded_catalog, plan_catalog_sync_with_baseline};
 use catalog_sync::{
-    download_catalog_baseline, execute_sync_work, persist_sync_checkpoints, plan_catalog_sync,
-    sync_current_catalog, CatalogBaseline, SyncWork,
+    catalog_baseline_from_downloaded_catalog, persist_sync_checkpoints, plan_catalog_sync,
+    plan_catalog_sync_with_baseline, SyncWork,
 };
+use catalog_sync::{sync_current_catalog, CatalogBaseline};
 use command_error::{CommandError, CommandErrorCode};
 use command_surface::with_registered_commands;
 use config_mutation_gate::ConfigMutationGate;
 use download_service::prepare_download_task;
+use lios_application::service::Application;
+use lios_application::space_registry::SpaceRegistry;
 use lios_core::cache::{cleanup_temporary_staging, prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
-    Catalog, CatalogIntegrityOutcome, CatalogRebuildOutcome, CatalogRebuildReport,
-    CatalogRemoteFile, CatalogRemoteIntegrityReport, CatalogSelection, CatalogTreeNode,
-    ConflictAction, ConflictResolution, DriveItem, SourceFileSnapshot, SourceSnapshotReport,
+    Catalog, CatalogRebuildOutcome, CatalogRebuildReport, CatalogRemoteFile, CatalogSelection,
+    CatalogTreeNode, ConflictAction, ConflictResolution, DriveItem, SourceFileSnapshot,
     UploadConflict, CATALOG_FILE,
 };
+#[cfg(test)]
 use lios_core::catalog_transaction::{
-    probe_catalog_sha256, CatalogBlobCheckpointState, CatalogTransactionOutcome,
-    CatalogTransactionPhase, CatalogTransactionProgress,
+    CatalogBlobCheckpointState, CatalogTransactionPhase, CatalogTransactionProgress,
 };
 use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
 use lios_core::credentials::{protect_to_file, unprotect_from_file};
 use lios_core::crypto::KeyFile;
 use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUserSummary};
 use lios_core::pack::PackOptions;
-use lios_core::restore::{RestoreConflictPolicy, RestoreOptions};
 use lios_core::space_lock::SpaceLockError;
 #[cfg(test)]
 use lios_core::storage::CatalogSyncFile;
 use lios_core::storage::{RepoRevision, StorageAdapter, StorageObject};
-use lios_core::tasks::{
-    CheckpointState, TaskItemState, TaskObjectCheckpoint, TaskRecord, TaskSpec, TaskState,
-    TaskStore, TaskSummary,
-};
-use production_config::{
-    configured_endpoint, persist_config, prepare_startup_config, validate_repo, SetupWarning,
-};
+#[cfg(test)]
+use lios_core::tasks::{CheckpointState, TaskItemState, TaskObjectCheckpoint};
+use lios_core::tasks::{TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary};
+use production_config::{configured_endpoint, prepare_startup_config, validate_repo, SetupWarning};
 use recovery_key_service::{
     export_recovery_key_for_paths, import_recovery_key_for_paths, recovery_key_status,
     verify_recovery_key_for_paths, RecoveryKeyStatus, RecoveryKeyVerification,
@@ -68,11 +68,9 @@ use task_center::{
     emit_removed_tasks, emit_task, list_task_items_for_paths, task_summaries_for_paths,
     task_summary_for_paths, webview_safe_task_summary, TaskItemsPageDto,
 };
-use task_manager::{
-    apply_pack_progress, next_retry_attempt, persist_submission, reconcile_catalog_hash,
-    retry_backoff, snapshot_upload_sources, validate_task_sources, CatalogReconcileDecision,
-    TaskExecutionPermit, TaskManager, TaskScope, TransferMetrics,
-};
+use task_manager::{persist_submission, snapshot_upload_sources, TaskManager, TaskScope};
+#[cfg(test)]
+use task_manager::{retry_backoff, TransferMetrics};
 use tauri::Manager;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -82,7 +80,6 @@ type CommandResult<T> = std::result::Result<T, CommandError>;
 
 struct AppContext {
     paths: LiosPaths,
-    read_staging: tempfile::TempDir,
     app_log: AppLogger,
     catalog_mutation_gate: CatalogMutationGate,
     config_mutation_gate: ConfigMutationGate,
@@ -101,10 +98,6 @@ impl AppContext {
     }
 
     fn from_paths(paths: LiosPaths) -> Self {
-        let read_staging = tempfile::Builder::new()
-            .prefix("lios-desktop-catalog-read-")
-            .tempdir()
-            .expect("failed to create private catalog read staging");
         let app_log = AppLogger::new(&paths);
         app_log.log(
             "info",
@@ -113,22 +106,12 @@ impl AppContext {
         );
         Self {
             paths,
-            read_staging,
             app_log,
             catalog_mutation_gate: CatalogMutationGate::default(),
             config_mutation_gate: ConfigMutationGate::default(),
             task_lifecycle_gate: Mutex::new(TaskLifecycleState::default()),
             task_manager: TaskManager::default(),
         }
-    }
-
-    fn fresh_read_staging(&self) -> CommandResult<PathBuf> {
-        let path = self
-            .read_staging
-            .path()
-            .join(Uuid::new_v4().simple().to_string());
-        fs::create_dir(&path).map_err(to_err)?;
-        Ok(path)
     }
 }
 
@@ -148,8 +131,30 @@ struct SetupSnapshot {
     config: LiosConfig,
     recovery_key: RecoveryKeyStatus,
     has_token: bool,
-    active_task_space_id: Option<String>,
+    spaces: Vec<RegisteredSpaceDto>,
     warning: Option<SetupWarning>,
+}
+
+#[derive(Serialize)]
+struct RegisteredSpaceDto {
+    space_name: String,
+    namespace: String,
+    dataset: String,
+    endpoint: String,
+    task_space_id: String,
+}
+
+impl RegisteredSpaceDto {
+    fn new(space_name: String, repo: RepoConfig) -> Self {
+        let task_space_id = TaskScope::from_repo(&repo).space_id;
+        Self {
+            space_name,
+            namespace: repo.namespace,
+            dataset: repo.dataset,
+            endpoint: repo.endpoint,
+            task_space_id,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -240,15 +245,7 @@ fn task_store(paths: &LiosPaths) -> CommandResult<TaskStore> {
     TaskStore::open(&paths.database).map_err(to_err)
 }
 
-struct TaskTransferUpdate {
-    done: u64,
-    total: u64,
-    bytes_done: u64,
-    bytes_total: u64,
-    speed_bps: u64,
-    eta_seconds: Option<u64>,
-}
-
+#[cfg(test)]
 fn task_interrupt_core(paths: &LiosPaths, id: Uuid) -> lios_core::Result<Option<TaskState>> {
     let state = TaskStore::open(&paths.database)?
         .get_summary(id)?
@@ -265,29 +262,12 @@ fn insert_task(paths: &LiosPaths, task: &TaskRecord) -> CommandResult<()> {
     task_store(paths)?.insert(task).map_err(to_err)
 }
 
-fn update_task_transfer(
-    paths: &LiosPaths,
-    id: Uuid,
-    update: TaskTransferUpdate,
-) -> CommandResult<()> {
-    let store = task_store(paths)?;
-    store
-        .update_transfer(
-            id,
-            update.done,
-            update.total,
-            update.bytes_done,
-            update.bytes_total,
-            update.speed_bps,
-        )
-        .map_err(to_err)?;
-    store.update_eta(id, update.eta_seconds).map_err(to_err)
-}
-
+#[cfg(test)]
 fn update_task_phase(paths: &LiosPaths, id: Uuid, phase: Option<String>) -> CommandResult<()> {
     task_store(paths)?.update_phase(id, phase).map_err(to_err)
 }
 
+#[cfg(test)]
 fn transaction_phase_label(phase: CatalogTransactionPhase) -> &'static str {
     match phase {
         CatalogTransactionPhase::ValidateBlobs => "validating",
@@ -299,6 +279,7 @@ fn transaction_phase_label(phase: CatalogTransactionPhase) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn persist_transaction_progress(
     paths: &LiosPaths,
     app: Option<&tauri::AppHandle>,
@@ -383,6 +364,7 @@ fn persist_transaction_progress(
     Ok(())
 }
 
+#[cfg(test)]
 fn update_task_state(
     paths: &LiosPaths,
     id: Uuid,
@@ -394,79 +376,7 @@ fn update_task_state(
         .map_err(to_err)
 }
 
-fn safe_task_kind(label: &str) -> &'static str {
-    match label {
-        "upload" => "upload",
-        "delete" => "delete",
-        "download" => "download",
-        "verify_quick" => "verify_quick",
-        "verify_full" => "verify_full",
-        "rebuild" => "rebuild",
-        _ => "unknown",
-    }
-}
-
-struct TaskLogFields<'a> {
-    id: Uuid,
-    kind: &'a str,
-    state: &'a TaskState,
-    attempt: u32,
-}
-
-fn log_task_event(
-    app: &tauri::AppHandle,
-    level: &str,
-    event: &str,
-    task: TaskLogFields<'_>,
-    error: Option<(CommandErrorCode, bool)>,
-) {
-    let mut details = serde_json::json!({
-        "task_id": task.id,
-        "task_kind": safe_task_kind(task.kind),
-        "state": task.state,
-        "attempt": task.attempt,
-    });
-    if let Some((code, retryable)) = error {
-        if let Some(details) = details.as_object_mut() {
-            details.insert("error_code".to_string(), serde_json::json!(code));
-            details.insert("retryable".to_string(), serde_json::json!(retryable));
-        }
-    }
-    app.state::<AppContext>().app_log.log(level, event, details);
-}
-
-fn log_persisted_task_outcome(
-    app: &tauri::AppHandle,
-    paths: &LiosPaths,
-    task_id: Uuid,
-    error: Option<(CommandErrorCode, bool)>,
-) {
-    let Some(task) = TaskStore::open(&paths.database)
-        .ok()
-        .and_then(|store| store.get_summary(task_id).ok().flatten())
-    else {
-        return;
-    };
-    let (level, event) = match &task.state {
-        TaskState::Completed => ("info", "task_finished"),
-        TaskState::Failed => ("error", "task_failed"),
-        TaskState::Paused | TaskState::Canceled => ("warn", "task_interrupted"),
-        _ => return,
-    };
-    log_task_event(
-        app,
-        level,
-        event,
-        TaskLogFields {
-            id: task.id,
-            kind: &task.label,
-            state: &task.state,
-            attempt: task.attempt,
-        },
-        error,
-    );
-}
-
+#[cfg(test)]
 fn update_terminal_task_items(
     paths: &LiosPaths,
     task_id: Uuid,
@@ -502,19 +412,6 @@ fn update_terminal_task_items(
 
 fn read_token(paths: &LiosPaths) -> CommandResult<String> {
     unprotect_from_file(&paths.credentials).map_err(to_err)
-}
-
-fn adapter_from_config(
-    paths: &LiosPaths,
-    config: &LiosConfig,
-) -> CommandResult<(ModelScopeAdapter, RepoConfig)> {
-    let repo = config
-        .active_repo
-        .clone()
-        .ok_or_else(|| CommandError::invalid_input("dataset repo is not configured"))?;
-    let repo = validate_repo(repo)?;
-    let token = read_token(paths)?;
-    Ok((ModelScopeAdapter::new(repo.endpoint.clone(), token), repo))
 }
 
 fn key_from_config(config: &LiosConfig) -> CommandResult<KeyFile> {
@@ -717,6 +614,7 @@ async fn set_task_state(
     update_task_state(paths, task_id, state, error)
 }
 
+#[cfg(test)]
 async fn interrupt_task_state(
     paths: &LiosPaths,
     gate: &Mutex<TaskLifecycleState>,
@@ -759,6 +657,7 @@ async fn cleanup_if_idle<T>(
     cleanup().map(Some)
 }
 
+#[cfg(test)]
 async fn finish_active_worker(
     paths: &LiosPaths,
     gate: &Mutex<TaskLifecycleState>,
@@ -779,6 +678,7 @@ async fn finish_active_worker(
     .await
 }
 
+#[cfg(test)]
 async fn finish_worker(
     paths: &LiosPaths,
     gate: &Mutex<TaskLifecycleState>,
@@ -922,7 +822,11 @@ fn terminal_staging_cleanup_label(spec: &TaskSpec) -> Option<&'static str> {
     match spec {
         TaskSpec::VerifySpace { .. } => Some("verification"),
         TaskSpec::RebuildCatalog { .. } => Some("catalog rebuild"),
-        TaskSpec::Upload { .. } | TaskSpec::Delete { .. } | TaskSpec::Download { .. } => None,
+        TaskSpec::Copy { .. }
+        | TaskSpec::Sync { .. }
+        | TaskSpec::Upload { .. }
+        | TaskSpec::Delete { .. }
+        | TaskSpec::Download { .. } => None,
     }
 }
 
@@ -1080,22 +984,14 @@ fn metadata_is_link_or_junction(metadata: &fs::Metadata) -> bool {
     false
 }
 
-enum TaskWorkerOutcome {
-    Committed { warnings: Vec<String> },
-    Completed,
-    CompletedWithWarnings { warnings: Vec<String> },
-    Interrupted(TaskState),
-    NeedsReconciliation,
-}
-
 struct StartupTaskRecovery {
     queued: Vec<Uuid>,
     reconcile: Vec<Uuid>,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct StartupSpaceWork {
-    space_id: String,
     reconcile: Vec<Uuid>,
     queued: Vec<Uuid>,
 }
@@ -1140,8 +1036,47 @@ fn submit_and_spawn(
     let task = persist_submission(&state.paths, &spec, source_files).map_err(to_err)?;
     let summary = submission_summary(&task)?;
     emit_task(app, &state.paths, task.id);
-    spawn_persisted_task(app.clone(), task.id);
+    start_shared_worker(&state.paths)?;
     Ok(summary)
+}
+
+fn start_shared_worker(paths: &LiosPaths) -> CommandResult<()> {
+    if paths.worker_running().map_err(CommandError::from)? {
+        return Ok(());
+    }
+    let _ = fs::remove_file(paths.worker_stop_path());
+    paths.ensure_worker_control_dir()?;
+    let current = std::env::current_exe().map_err(to_err)?;
+    let extension = current.extension().map(|value| value.to_os_string());
+    let mut worker = current.with_file_name("lios-worker");
+    if let Some(extension) = extension {
+        worker.set_extension(extension);
+    }
+    if !worker.is_file() {
+        return Err(CommandError::new(
+            CommandErrorCode::Storage,
+            "lios-worker is missing from the Desktop installation",
+            false,
+            None,
+        ));
+    }
+    let home_root = paths.home.parent().ok_or_else(|| {
+        CommandError::new(
+            CommandErrorCode::Storage,
+            "Lios Home has no parent directory for worker startup",
+            false,
+            None,
+        )
+    })?;
+    ProcessCommand::new(worker)
+        .arg("--home")
+        .arg(home_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(to_err)?;
+    Ok(())
 }
 
 fn recover_startup_tasks(paths: &LiosPaths) -> CommandResult<StartupTaskRecovery> {
@@ -1186,6 +1121,7 @@ fn recover_startup_tasks(paths: &LiosPaths) -> CommandResult<StartupTaskRecovery
     Ok(StartupTaskRecovery { queued, reconcile })
 }
 
+#[cfg(test)]
 fn group_startup_tasks(
     paths: &LiosPaths,
     recovery: StartupTaskRecovery,
@@ -1206,10 +1142,7 @@ fn group_startup_tasks(
         })?;
         let space_id = spec.space_id().to_string();
         let position = *positions.entry(space_id.clone()).or_insert_with(|| {
-            groups.push(StartupSpaceWork {
-                space_id,
-                ..StartupSpaceWork::default()
-            });
+            groups.push(StartupSpaceWork::default());
             groups.len() - 1
         });
         if needs_reconciliation {
@@ -1221,6 +1154,7 @@ fn group_startup_tasks(
     Ok(groups)
 }
 
+#[cfg(test)]
 fn reconciliation_error_should_wait(error: &CommandError) -> bool {
     matches!(
         error.code,
@@ -1232,16 +1166,7 @@ fn reconciliation_error_should_wait(error: &CommandError) -> bool {
     )
 }
 
-fn task_spec_repo(spec: &TaskSpec) -> &RepoConfig {
-    match spec {
-        TaskSpec::Upload { repo, .. }
-        | TaskSpec::Delete { repo, .. }
-        | TaskSpec::Download { repo, .. }
-        | TaskSpec::VerifySpace { repo, .. }
-        | TaskSpec::RebuildCatalog { repo, .. } => repo,
-    }
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupReconciliationOutcome {
     Continue,
@@ -1249,6 +1174,7 @@ enum StartupReconciliationOutcome {
     Stop,
 }
 
+#[cfg(test)]
 fn startup_reconciliation_terminal_error(
     outcome: StartupReconciliationOutcome,
 ) -> Option<Option<(CommandErrorCode, bool)>> {
@@ -1259,6 +1185,7 @@ fn startup_reconciliation_terminal_error(
     }
 }
 
+#[cfg(test)]
 async fn retry_storage_operation<T>(
     mut operation: impl FnMut() -> CommandResult<T>,
 ) -> CommandResult<T> {
@@ -1275,947 +1202,7 @@ async fn retry_storage_operation<T>(
     }
 }
 
-async fn reconcile_catalog_checkpoint_loop(
-    app: &tauri::AppHandle,
-    paths: &LiosPaths,
-    task_paths: &LiosPaths,
-    task_id: Uuid,
-    repo: &RepoConfig,
-    starting_attempt: u32,
-) -> CommandResult<CatalogReconcileDecision> {
-    let checkpoint = retry_storage_operation(|| {
-        TaskStore::open(&paths.database)
-            .map_err(to_err)?
-            .load_catalog_checkpoint(task_id)
-            .map_err(to_err)
-    })
-    .await?
-    .ok_or_else(|| {
-        CommandError::new(
-            CommandErrorCode::CorruptedData,
-            "committing task has no catalog checkpoint",
-            false,
-            None,
-        )
-    })?;
-    retry_storage_operation(|| {
-        TaskStore::open(&paths.database)
-            .map_err(to_err)?
-            .update_phase(task_id, Some("reconciling".to_string()))
-            .map_err(to_err)
-    })
-    .await?;
-    emit_task(app, paths, task_id);
-
-    let mut attempt = starting_attempt.max(1);
-    loop {
-        let current_state = retry_storage_operation(|| {
-            TaskStore::open(&paths.database)
-                .map_err(to_err)?
-                .get_summary(task_id)
-                .map_err(to_err)
-        })
-        .await?
-        .map(|task| task.state);
-        if current_state != Some(TaskState::Committing) {
-            return Err(CommandError::new(
-                CommandErrorCode::CorruptedData,
-                "committing task changed state during catalog reconciliation",
-                false,
-                None,
-            ));
-        }
-        let remote_catalog = match read_token(paths) {
-            Ok(token) => {
-                let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
-                probe_catalog_sha256(
-                    &adapter,
-                    &repo.namespace,
-                    &repo.dataset,
-                    &task_paths.staging,
-                )
-                .await
-                .map_err(to_err)
-            }
-            Err(error) => Err(error),
-        };
-        match remote_catalog {
-            Ok(remote_catalog) => {
-                return Ok(reconcile_catalog_hash(
-                    &checkpoint,
-                    remote_catalog.as_deref(),
-                ));
-            }
-            Err(error) if reconciliation_error_should_wait(&error) => {
-                retry_storage_operation(|| {
-                    TaskStore::open(&paths.database)
-                        .map_err(to_err)?
-                        .record_reconciliation_wait(task_id, attempt, &error.message)
-                        .map_err(to_err)
-                })
-                .await?;
-                emit_task(app, paths, task_id);
-                tokio::time::sleep(retry_backoff(attempt)).await;
-                attempt = attempt.saturating_add(1);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn apply_catalog_reconciliation(
-    paths: &LiosPaths,
-    task_id: Uuid,
-    decision: CatalogReconcileDecision,
-) -> CommandResult<()> {
-    let mut store = TaskStore::open(&paths.database).map_err(to_err)?;
-    let conflict_message = "remote catalog changed while reconciling a committed task";
-    let changed = match decision {
-        CatalogReconcileDecision::Committed => {
-            store.complete_reconciled_commit(task_id).map_err(to_err)?
-        }
-        CatalogReconcileDecision::Replay => store.requeue_committing(task_id).map_err(to_err)?,
-        CatalogReconcileDecision::Conflict => store
-            .fail_reconciled_commit(task_id, conflict_message)
-            .map_err(to_err)?,
-    };
-    if changed {
-        Ok(())
-    } else {
-        Err(CommandError::new(
-            CommandErrorCode::CorruptedData,
-            "catalog reconciliation lost ownership of the committing task",
-            false,
-            None,
-        ))
-    }
-}
-
-async fn apply_catalog_reconciliation_with_retry(
-    paths: &LiosPaths,
-    task_id: Uuid,
-    decision: CatalogReconcileDecision,
-) -> CommandResult<()> {
-    let mut attempt = 1;
-    loop {
-        match apply_catalog_reconciliation(paths, task_id, decision) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.code == CommandErrorCode::Storage => {
-                tokio::time::sleep(retry_backoff(attempt)).await;
-                attempt = attempt.saturating_add(1);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn fail_unrecoverable_reconciliation(
-    paths: &LiosPaths,
-    task_id: Uuid,
-    message: &str,
-) -> CommandResult<bool> {
-    let mut store = TaskStore::open(&paths.database).map_err(to_err)?;
-    let changed = store
-        .fail_reconciled_commit(task_id, message)
-        .map_err(to_err)?;
-    Ok(changed)
-}
-
-async fn fail_unrecoverable_reconciliation_with_retry(
-    paths: &LiosPaths,
-    task_id: Uuid,
-    message: &str,
-) -> CommandResult<bool> {
-    let mut attempt = 1;
-    loop {
-        match fail_unrecoverable_reconciliation(paths, task_id, message) {
-            Ok(changed) => return Ok(changed),
-            Err(error) if error.code == CommandErrorCode::Storage => {
-                tokio::time::sleep(retry_backoff(attempt)).await;
-                attempt = attempt.saturating_add(1);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-async fn release_reconciliation_worker(
-    paths: &LiosPaths,
-    gate: &Mutex<TaskLifecycleState>,
-    catalog_mutation_gate: &CatalogMutationGate,
-    task_id: Uuid,
-) {
-    let _shared_staging_guard = catalog_mutation_gate.lock_shared_staging().await;
-    let mut lifecycle = gate.lock().await;
-    lifecycle.active_workers.remove(&task_id);
-    if cleanup_is_safe(paths, &lifecycle).unwrap_or(false) {
-        let _ = cleanup_current_staging_cache(paths, true, false);
-    }
-}
-
-async fn run_catalog_reconciliation_locked(
-    app: tauri::AppHandle,
-    task_id: Uuid,
-) -> CommandResult<StartupReconciliationOutcome> {
-    let paths = app.state::<AppContext>().paths.clone();
-    let context = retry_storage_operation(|| {
-        let store = TaskStore::open(&paths.database).map_err(to_err)?;
-        let task = store
-            .get_summary(task_id)
-            .map_err(to_err)?
-            .ok_or_else(|| CommandError::invalid_input("reconciliation task was not found"))?;
-        if task.state != TaskState::Committing {
-            return Ok(None);
-        }
-        let spec = store.load_spec(task_id).map_err(to_err)?.ok_or_else(|| {
-            CommandError::new(
-                CommandErrorCode::CorruptedData,
-                "committing task has no persisted specification",
-                false,
-                None,
-            )
-        })?;
-        Ok(Some((task, spec)))
-    })
-    .await?;
-    let Some((task, spec)) = context else {
-        return Ok(StartupReconciliationOutcome::Stop);
-    };
-    if task.account_id != spec.account_id() || task.space_id != spec.space_id() {
-        return Err(CommandError::new(
-            CommandErrorCode::CorruptedData,
-            "committing task ownership does not match its specification",
-            false,
-            None,
-        ));
-    }
-    let repo = validate_repo(task_spec_repo(&spec).clone())?;
-    let task_paths = paths
-        .for_task(spec.account_id(), spec.space_id(), task_id)
-        .map_err(to_err)?;
-    retry_storage_operation(|| task_paths.ensure_dirs().map_err(to_err)).await?;
-    if retry_storage_operation(|| {
-        TaskStore::open(&paths.database)
-            .map_err(to_err)?
-            .get_summary(task_id)
-            .map_err(to_err)
-    })
-    .await?
-    .is_none_or(|current| current.state != TaskState::Committing)
-    {
-        return Ok(StartupReconciliationOutcome::Stop);
-    }
-    {
-        let state = app.state::<AppContext>();
-        state
-            .task_lifecycle_gate
-            .lock()
-            .await
-            .active_workers
-            .insert(task_id);
-    }
-    let decision = reconcile_catalog_checkpoint_loop(
-        &app,
-        &paths,
-        &task_paths,
-        task_id,
-        &repo,
-        task.attempt.saturating_add(1),
-    )
-    .await;
-    let result = match decision {
-        Ok(decision) => {
-            match apply_catalog_reconciliation_with_retry(&task_paths, task_id, decision).await {
-                Ok(()) => Ok(match decision {
-                    CatalogReconcileDecision::Committed => StartupReconciliationOutcome::Continue,
-                    CatalogReconcileDecision::Replay => StartupReconciliationOutcome::Replay,
-                    CatalogReconcileDecision::Conflict => StartupReconciliationOutcome::Stop,
-                }),
-                Err(error) => Err(error),
-            }
-        }
-        Err(error) => Err(error),
-    };
-    let state = app.state::<AppContext>();
-    release_reconciliation_worker(
-        &task_paths,
-        &state.task_lifecycle_gate,
-        &state.catalog_mutation_gate,
-        task_id,
-    )
-    .await;
-    if let Ok(outcome) = &result {
-        if let Some(error) = startup_reconciliation_terminal_error(*outcome) {
-            log_persisted_task_outcome(&app, &paths, task_id, error);
-        }
-    }
-    emit_task(&app, &paths, task_id);
-    result
-}
-
-async fn run_startup_catalog_reconciliation(
-    app: tauri::AppHandle,
-    task_id: Uuid,
-    space_id: &str,
-) -> CommandResult<StartupReconciliationOutcome> {
-    let paths = app.state::<AppContext>().paths.clone();
-    let _process_space_lock = paths.try_lock_space(space_id).map_err(CommandError::from)?;
-    run_catalog_reconciliation_locked(app, task_id).await
-}
-
-fn start_startup_tasks(
-    app: &tauri::AppHandle,
-    paths: &LiosPaths,
-    recovery: StartupTaskRecovery,
-) -> CommandResult<()> {
-    let groups = group_startup_tasks(paths, recovery).map_err(to_err)?;
-    let mut ready = Vec::new();
-    for group in groups {
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let handle = app.clone();
-        tauri::async_runtime::spawn(run_startup_space_work(handle, group, ready_tx));
-        ready.push(ready_rx);
-    }
-    for receiver in ready {
-        receiver
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .map_err(|_| {
-                CommandError::new(
-                    CommandErrorCode::Internal,
-                    "startup task reconciliation could not reserve its space",
-                    false,
-                    None,
-                )
-            })?;
-    }
-    Ok(())
-}
-
-async fn run_startup_space_work(
-    app: tauri::AppHandle,
-    group: StartupSpaceWork,
-    ready: std::sync::mpsc::SyncSender<()>,
-) {
-    let manager = app.state::<AppContext>().task_manager.clone();
-    let space_id = group.space_id.clone();
-    let space_permit = manager.acquire_space(space_id.clone()).await;
-    if ready.send(()).is_err() {
-        return;
-    }
-
-    let mut transfer_tasks = VecDeque::new();
-    for task_id in group.reconcile {
-        match run_startup_catalog_reconciliation(app.clone(), task_id, &space_id).await {
-            Ok(StartupReconciliationOutcome::Continue) => {}
-            Ok(StartupReconciliationOutcome::Replay) => transfer_tasks.push_back(task_id),
-            Ok(StartupReconciliationOutcome::Stop) => return,
-            Err(error) if error.code == CommandErrorCode::Busy => return,
-            Err(error) => {
-                let state = app.state::<AppContext>();
-                let _ = fail_unrecoverable_reconciliation_with_retry(
-                    &state.paths,
-                    task_id,
-                    &error.message,
-                )
-                .await;
-                log_persisted_task_outcome(
-                    &app,
-                    &state.paths,
-                    task_id,
-                    Some((error.code, error.retryable)),
-                );
-                emit_task(&app, &state.paths, task_id);
-                return;
-            }
-        }
-    }
-    transfer_tasks.extend(group.queued);
-    if transfer_tasks.is_empty() {
-        return;
-    }
-    let Ok(mut execution_permit) = manager.promote_space(space_permit).await else {
-        return;
-    };
-    while let Some(task_id) = transfer_tasks.pop_front() {
-        if manager
-            .restore_transfer(&mut execution_permit)
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let result = run_persisted_task_locked(
-            app.clone(),
-            task_id,
-            space_id.clone(),
-            &mut execution_permit,
-        )
-        .await;
-        let Err(error) = result else {
-            continue;
-        };
-        if error.code == CommandErrorCode::Busy {
-            return;
-        }
-        let state = app.state::<AppContext>();
-        let task_state = TaskStore::open(&state.paths.database)
-            .and_then(|store| store.get_summary(task_id))
-            .ok()
-            .flatten()
-            .map(|task| task.state);
-        if task_state == Some(TaskState::Committing) {
-            execution_permit.release_transfer();
-            match run_catalog_reconciliation_locked(app.clone(), task_id).await {
-                Ok(StartupReconciliationOutcome::Continue) => continue,
-                Ok(StartupReconciliationOutcome::Replay) => {
-                    if manager
-                        .restore_transfer(&mut execution_permit)
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    transfer_tasks.push_front(task_id);
-                    continue;
-                }
-                Ok(StartupReconciliationOutcome::Stop) => return,
-                Err(reconcile_error) => {
-                    let _ = fail_unrecoverable_reconciliation_with_retry(
-                        &state.paths,
-                        task_id,
-                        &reconcile_error.message,
-                    )
-                    .await;
-                    log_persisted_task_outcome(
-                        &app,
-                        &state.paths,
-                        task_id,
-                        Some((reconcile_error.code, reconcile_error.retryable)),
-                    );
-                    emit_task(&app, &state.paths, task_id);
-                    return;
-                }
-            }
-        }
-        if let Ok(store) = TaskStore::open(&state.paths.database) {
-            if task_state.as_ref().is_some_and(task_state_is_active) {
-                let _ = store.update_state(task_id, TaskState::Failed, Some(error.message.clone()));
-                let _ = store.update_items_state(
-                    task_id,
-                    TaskItemState::Failed,
-                    None,
-                    Some(error.message.clone()),
-                    false,
-                );
-                log_persisted_task_outcome(
-                    &app,
-                    &state.paths,
-                    task_id,
-                    Some((error.code, error.retryable)),
-                );
-            }
-        }
-        state
-            .task_lifecycle_gate
-            .lock()
-            .await
-            .active_workers
-            .remove(&task_id);
-        emit_task(&app, &state.paths, task_id);
-        return;
-    }
-}
-
-fn spawn_persisted_task(app: tauri::AppHandle, task_id: Uuid) {
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = run_persisted_task(app.clone(), task_id).await {
-            if error.code == CommandErrorCode::Busy {
-                emit_task(&app, &app.state::<AppContext>().paths, task_id);
-                return;
-            }
-            let state = app.state::<AppContext>();
-            if let Ok(store) = TaskStore::open(&state.paths.database) {
-                if let Some(task) = store.get_summary(task_id).ok().flatten() {
-                    if task.state == TaskState::Committing {
-                        let _ = store.record_reconciliation_wait(
-                            task_id,
-                            task.attempt.saturating_add(1),
-                            &error.message,
-                        );
-                    } else if task_state_is_active(&task.state) {
-                        let _ = store.update_state(
-                            task_id,
-                            TaskState::Failed,
-                            Some(error.message.clone()),
-                        );
-                        let _ = store.update_items_state(
-                            task_id,
-                            TaskItemState::Failed,
-                            None,
-                            Some(error.message.clone()),
-                            false,
-                        );
-                        log_persisted_task_outcome(
-                            &app,
-                            &state.paths,
-                            task_id,
-                            Some((error.code, error.retryable)),
-                        );
-                    }
-                }
-            }
-            state
-                .task_lifecycle_gate
-                .lock()
-                .await
-                .active_workers
-                .remove(&task_id);
-            emit_task(&app, &state.paths, task_id);
-        }
-    });
-}
-
-async fn run_persisted_task(app: tauri::AppHandle, task_id: Uuid) -> CommandResult<()> {
-    let (paths, manager) = {
-        let state = app.state::<AppContext>();
-        (state.paths.clone(), state.task_manager.clone())
-    };
-    let preview_spec = TaskStore::open(&paths.database)
-        .map_err(to_err)?
-        .load_spec(task_id)
-        .map_err(to_err)?
-        .ok_or_else(|| CommandError::invalid_input("queued task has no specification"))?;
-    let preview_space_id = preview_spec.space_id().to_string();
-    let mut execution_permit = manager
-        .acquire(preview_space_id.clone())
-        .await
-        .map_err(|_| CommandError::invalid_input("task manager is shutting down"))?;
-    run_persisted_task_locked(app, task_id, preview_space_id, &mut execution_permit).await
-}
-
-async fn run_persisted_task_locked(
-    app: tauri::AppHandle,
-    task_id: Uuid,
-    preview_space_id: String,
-    execution_permit: &mut TaskExecutionPermit,
-) -> CommandResult<()> {
-    let (paths, manager) = {
-        let state = app.state::<AppContext>();
-        (state.paths.clone(), state.task_manager.clone())
-    };
-    let _process_space_lock = paths
-        .try_lock_space(&preview_space_id)
-        .map_err(CommandError::from)?;
-    let mut spec = {
-        let mut store = TaskStore::open(&paths.database).map_err(to_err)?;
-        let Some(spec) = store.claim_queued(task_id).map_err(to_err)? else {
-            return Ok(());
-        };
-        spec
-    };
-    if spec.space_id() != preview_space_id {
-        return Err(CommandError::new(
-            CommandErrorCode::CorruptedData,
-            "queued task space changed before execution",
-            false,
-            None,
-        ));
-    }
-    let task_paths = paths
-        .for_task(spec.account_id(), spec.space_id(), task_id)
-        .map_err(to_err)?;
-    task_paths.ensure_dirs().map_err(to_err)?;
-    let mut task = TaskStore::open(&paths.database)
-        .map_err(to_err)?
-        .get(task_id)
-        .map_err(to_err)?
-        .ok_or_else(|| CommandError::invalid_input("claimed task disappeared"))?;
-    log_task_event(
-        &app,
-        "info",
-        "task_started",
-        TaskLogFields {
-            id: task.id,
-            kind: spec.label(),
-            state: &task.state,
-            attempt: task.attempt,
-        },
-        None,
-    );
-    {
-        let state = app.state::<AppContext>();
-        state
-            .task_lifecycle_gate
-            .lock()
-            .await
-            .active_workers
-            .insert(task_id);
-    }
-    let control = manager.register(task_id).await;
-    emit_task(&app, &paths, task_id);
-    let mut terminal_error = None;
-    let finalization = async {
-        loop {
-            let execution = execute_task_with_retries(
-                &app,
-                &task_paths,
-                task.clone(),
-                spec.clone(),
-                control.token(),
-            )
-            .await;
-            let state = app.state::<AppContext>();
-            match execution {
-                Ok(TaskWorkerOutcome::Committed { warnings }) => {
-                    let applied = apply_catalog_reconciliation_with_retry(
-                        &task_paths,
-                        task_id,
-                        CatalogReconcileDecision::Committed,
-                    )
-                    .await;
-                    release_reconciliation_worker(
-                        &task_paths,
-                        &state.task_lifecycle_gate,
-                        &state.catalog_mutation_gate,
-                        task_id,
-                    )
-                    .await;
-                    if applied.is_ok() && !warnings.is_empty() {
-                        TaskStore::open(&paths.database)
-                            .map_err(to_err)?
-                            .update_state(task_id, TaskState::Completed, Some(warnings.join("; ")))
-                            .map_err(to_err)?;
-                    }
-                    break applied;
-                }
-                Ok(TaskWorkerOutcome::Completed) => {
-                    let result = finish_active_worker(
-                        &task_paths,
-                        &state.task_lifecycle_gate,
-                        &state.catalog_mutation_gate,
-                        task_id,
-                        TaskState::Completed,
-                        None,
-                    )
-                    .await
-                    .map(|_| ());
-                    break result;
-                }
-                Ok(TaskWorkerOutcome::CompletedWithWarnings { warnings }) => {
-                    let result = finish_active_worker(
-                        &task_paths,
-                        &state.task_lifecycle_gate,
-                        &state.catalog_mutation_gate,
-                        task_id,
-                        TaskState::Completed,
-                        (!warnings.is_empty()).then(|| warnings.join("; ")),
-                    )
-                    .await
-                    .map(|_| ());
-                    break result;
-                }
-                Ok(TaskWorkerOutcome::Interrupted(interrupted)) => {
-                    let result = finish_active_worker(
-                        &task_paths,
-                        &state.task_lifecycle_gate,
-                        &state.catalog_mutation_gate,
-                        task_id,
-                        interrupted,
-                        None,
-                    )
-                    .await
-                    .map(|_| ());
-                    break result;
-                }
-                Ok(TaskWorkerOutcome::NeedsReconciliation) => {
-                    execution_permit.release_transfer();
-                    let repo = validate_repo(task_spec_repo(&spec).clone())?;
-                    let decision = reconcile_catalog_checkpoint_loop(
-                        &app,
-                        &paths,
-                        &task_paths,
-                        task_id,
-                        &repo,
-                        task.attempt.saturating_add(1),
-                    )
-                    .await;
-                    let decision = match decision {
-                        Ok(decision) => decision,
-                        Err(error) => {
-                            terminal_error = Some((error.code, error.retryable));
-                            let applied = fail_unrecoverable_reconciliation_with_retry(
-                                &paths,
-                                task_id,
-                                &error.message,
-                            )
-                            .await?;
-                            release_reconciliation_worker(
-                                &task_paths,
-                                &state.task_lifecycle_gate,
-                                &state.catalog_mutation_gate,
-                                task_id,
-                            )
-                            .await;
-                            break if applied { Ok(()) } else { Err(error) };
-                        }
-                    };
-                    if decision == CatalogReconcileDecision::Conflict {
-                        terminal_error = Some((CommandErrorCode::RemoteConflict, false));
-                    }
-                    if decision == CatalogReconcileDecision::Replay {
-                        manager
-                            .restore_transfer(execution_permit)
-                            .await
-                            .map_err(|_| {
-                                CommandError::invalid_input("task manager is shutting down")
-                            })?;
-                        apply_catalog_reconciliation_with_retry(&task_paths, task_id, decision)
-                            .await?;
-                        let mut store = TaskStore::open(&paths.database).map_err(to_err)?;
-                        let replay_spec =
-                            store
-                                .claim_queued(task_id)
-                                .map_err(to_err)?
-                                .ok_or_else(|| {
-                                    CommandError::new(
-                                        CommandErrorCode::CorruptedData,
-                                        "reconciled task could not be reclaimed for replay",
-                                        false,
-                                        None,
-                                    )
-                                })?;
-                        if replay_spec.space_id() != preview_space_id {
-                            return Err(CommandError::new(
-                                CommandErrorCode::CorruptedData,
-                                "reconciled task changed space before replay",
-                                false,
-                                None,
-                            ));
-                        }
-                        spec = replay_spec;
-                        task = store.get(task_id).map_err(to_err)?.ok_or_else(|| {
-                            CommandError::invalid_input("reconciled task disappeared before replay")
-                        })?;
-                        emit_task(&app, &paths, task_id);
-                        continue;
-                    }
-                    let applied =
-                        apply_catalog_reconciliation_with_retry(&task_paths, task_id, decision)
-                            .await;
-                    release_reconciliation_worker(
-                        &task_paths,
-                        &state.task_lifecycle_gate,
-                        &state.catalog_mutation_gate,
-                        task_id,
-                    )
-                    .await;
-                    break applied;
-                }
-                Err(error) => {
-                    terminal_error = Some((error.code, error.retryable));
-                    let result = finish_active_worker(
-                        &task_paths,
-                        &state.task_lifecycle_gate,
-                        &state.catalog_mutation_gate,
-                        task_id,
-                        TaskState::Failed,
-                        Some(error.message.clone()),
-                    )
-                    .await
-                    .map(|_| ());
-                    break result;
-                }
-            }
-        }
-    }
-    .await;
-    manager.remove(&control).await;
-    let staging_cleanup = cleanup_terminal_task_staging_and_record(&task_paths, &spec, task_id);
-    let removed = task_store(&paths)
-        .and_then(|mut store| store.prune_terminal_history().map_err(to_err))
-        .unwrap_or_default();
-    emit_task(&app, &paths, task_id);
-    emit_removed_tasks(&app, removed);
-    let result = match finalization {
-        Ok(()) => staging_cleanup,
-        Err(error) => Err(error),
-    };
-    log_persisted_task_outcome(&app, &paths, task_id, terminal_error);
-    result
-}
-
-async fn execute_task_with_retries(
-    app: &tauri::AppHandle,
-    paths: &LiosPaths,
-    mut task: TaskRecord,
-    spec: TaskSpec,
-    cancellation: &CancellationToken,
-) -> CommandResult<TaskWorkerOutcome> {
-    loop {
-        if let Some(interrupted) =
-            observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
-        {
-            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-        }
-        match execute_task_spec(app, paths, task.clone(), spec.clone(), cancellation).await {
-            Ok(outcome) => return Ok(outcome),
-            Err(error) => {
-                let store = TaskStore::open(&paths.database).map_err(to_err)?;
-                if store
-                    .get_summary(task.id)
-                    .map_err(to_err)?
-                    .is_some_and(|persisted| persisted.state == TaskState::Committing)
-                {
-                    store
-                        .record_reconciliation_wait(
-                            task.id,
-                            task.attempt.saturating_add(1),
-                            &error.message,
-                        )
-                        .map_err(to_err)?;
-                    emit_task(app, paths, task.id);
-                    return Ok(TaskWorkerOutcome::NeedsReconciliation);
-                }
-                drop(store);
-                if let Some(interrupted) =
-                    observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
-                {
-                    return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-                }
-                let Some(next_attempt) = next_retry_attempt(task.attempt, error.retryable) else {
-                    return Err(error);
-                };
-                let store = TaskStore::open(&paths.database).map_err(to_err)?;
-                if !store
-                    .schedule_retry(task.id, next_attempt, &error.message)
-                    .map_err(to_err)?
-                {
-                    if let Some(interrupted) =
-                        observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
-                    {
-                        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-                    }
-                    return Err(CommandError::new(
-                        CommandErrorCode::CorruptedData,
-                        "task changed state before retry could be scheduled",
-                        false,
-                        None,
-                    ));
-                }
-                log_task_event(
-                    app,
-                    "warn",
-                    "task_retry_scheduled",
-                    TaskLogFields {
-                        id: task.id,
-                        kind: spec.label(),
-                        state: &TaskState::Retrying,
-                        attempt: next_attempt,
-                    },
-                    Some((error.code, error.retryable)),
-                );
-                store
-                    .update_items_state(
-                        task.id,
-                        TaskItemState::Running,
-                        Some("retrying".to_string()),
-                        Some(error.message.clone()),
-                        false,
-                    )
-                    .map_err(to_err)?;
-                emit_task(app, paths, task.id);
-                drop(store);
-                tokio::select! {
-                    _ = tokio::time::sleep(retry_backoff(next_attempt)) => {}
-                    _ = cancellation.cancelled() => {
-                        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                            .map_err(to_err)?
-                            .unwrap_or(TaskState::Canceled);
-                        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-                    }
-                }
-                task.state = TaskState::Preparing;
-                task.phase = Some("preparing".to_string());
-                task.progress_done = 0;
-                task.bytes_done = 0;
-                task.speed_bps = 0;
-                task.eta_seconds = None;
-                task.attempt = next_attempt;
-                task.error = None;
-                let store = TaskStore::open(&paths.database).map_err(to_err)?;
-                store.insert(&task).map_err(to_err)?;
-                for item in &mut task.items {
-                    item.state = TaskItemState::Queued;
-                    item.phase = None;
-                    item.bytes_done = 0;
-                    item.error = None;
-                    store.upsert_item(item).map_err(to_err)?;
-                }
-                emit_task(app, paths, task.id);
-            }
-        }
-    }
-}
-
-async fn execute_task_spec(
-    app: &tauri::AppHandle,
-    paths: &LiosPaths,
-    task: TaskRecord,
-    spec: TaskSpec,
-    cancellation: &CancellationToken,
-) -> CommandResult<TaskWorkerOutcome> {
-    match spec {
-        TaskSpec::Upload {
-            repo,
-            parent_node_id,
-            source_paths,
-            source_snapshot,
-            chunk_size,
-            conflict_resolutions,
-            ..
-        } => {
-            let source_snapshot = source_snapshot.ok_or_else(|| {
-                CommandError::invalid_input(
-                    "upload task has no persisted source snapshot and cannot resume safely",
-                )
-            })?;
-            run_upload_worker(
-                app,
-                paths,
-                task,
-                repo,
-                parent_node_id,
-                source_paths,
-                source_snapshot,
-                chunk_size,
-                conflict_resolutions,
-                cancellation,
-            )
-            .await
-        }
-        TaskSpec::Delete { repo, node_ids, .. } => {
-            run_delete_worker(app, paths, task, repo, node_ids, cancellation).await
-        }
-        TaskSpec::Download {
-            repo,
-            node_ids,
-            output_dir,
-            ..
-        } => run_download_worker(app, paths, task, repo, node_ids, output_dir, cancellation).await,
-        TaskSpec::VerifySpace { repo, full, .. } => {
-            run_verify_space_worker(app, paths, task, repo, full, cancellation).await
-        }
-        TaskSpec::RebuildCatalog {
-            repo,
-            expected_revision,
-            ..
-        } => {
-            run_rebuild_catalog_worker(app, paths, task, repo, expected_revision, cancellation)
-                .await
-        }
-    }
-}
-
+#[cfg(test)]
 fn observed_task_interrupt(
     paths: &LiosPaths,
     task_id: Uuid,
@@ -2226,423 +1213,6 @@ fn observed_task_interrupt(
         return Ok(persisted);
     }
     Ok(cancellation.is_cancelled().then_some(TaskState::Canceled))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_upload_worker(
-    app: &tauri::AppHandle,
-    paths: &LiosPaths,
-    mut task: TaskRecord,
-    repo: RepoConfig,
-    parent_node_id: String,
-    source_paths: Vec<PathBuf>,
-    source_snapshot: SourceSnapshotReport,
-    chunk_size: usize,
-    conflict_resolutions: Vec<ConflictResolution>,
-    cancellation: &CancellationToken,
-) -> CommandResult<TaskWorkerOutcome> {
-    if source_paths.is_empty() || chunk_size == 0 {
-        return Err(CommandError::invalid_input(
-            "upload task has invalid source paths or chunk size",
-        ));
-    }
-    validate_task_sources(&source_paths, &source_snapshot, &task.items).map_err(to_err)?;
-    let config = load_config(paths)?;
-    let key = key_from_config(&config)?;
-    let repo = validate_repo(repo)?;
-    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(paths)?);
-    let (catalog, baseline) = download_catalog_baseline(paths, &key, &adapter, &repo).await?;
-    validate_task_sources(&source_paths, &source_snapshot, &task.items).map_err(to_err)?;
-    update_task_phase(paths, task.id, Some("preparing".to_string()))?;
-    emit_task(app, paths, task.id);
-    let mut preparing_metrics = TransferMetrics::new();
-    let item_store = TaskStore::open(&paths.database).map_err(to_err)?;
-    let mut item_progress_error = None;
-    let report = catalog
-        .add_paths_to_folder_with_remote_inventory_and_progress_and_report(
-            &parent_node_id,
-            &source_paths,
-            &conflict_resolutions,
-            &key,
-            PackOptions {
-                chunk_size,
-                staging_dir: paths.staging.clone(),
-            },
-            &baseline.remote_objects,
-            |progress| {
-                if item_progress_error.is_none() {
-                    let persisted = apply_pack_progress(
-                        &mut task.items,
-                        progress.completed_chunks,
-                        progress.completed_bytes,
-                        chunk_size,
-                    )
-                    .and_then(|changed| {
-                        for item in changed {
-                            item_store.upsert_item(&item)?;
-                        }
-                        Ok(())
-                    });
-                    if let Err(error) = persisted {
-                        item_progress_error = Some(error);
-                    }
-                }
-                task.progress_done = progress.completed_chunks;
-                task.progress_total = progress.total_chunks;
-                let observation = preparing_metrics.observe(
-                    progress.completed_bytes,
-                    progress.total_bytes,
-                    progress.completed_chunks >= progress.total_chunks,
-                );
-                if observation.should_publish {
-                    let _ = update_task_transfer(
-                        paths,
-                        task.id,
-                        TaskTransferUpdate {
-                            done: progress.completed_chunks,
-                            total: progress.total_chunks,
-                            bytes_done: progress.completed_bytes,
-                            bytes_total: progress.total_bytes,
-                            speed_bps: observation.speed_bps,
-                            eta_seconds: observation.eta_seconds,
-                        },
-                    );
-                    emit_task(app, paths, task.id);
-                }
-            },
-        )
-        .map_err(to_err)?;
-    if let Some(error) = item_progress_error {
-        return Err(to_err(error));
-    }
-    report.ensure_no_skipped_paths().map_err(to_err)?;
-    if report.source_snapshot() != source_snapshot {
-        return Err(CommandError::invalid_input(
-            "source tree changed while it was being packed",
-        ));
-    }
-    validate_task_sources(&source_paths, &source_snapshot, &task.items).map_err(to_err)?;
-    if let Some(interrupted) =
-        observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
-    {
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    }
-    let work = plan_catalog_sync(paths, &catalog, &key, baseline)?;
-    persist_sync_checkpoints(paths, task.id, &work)?;
-    let mut transaction_metrics = TransferMetrics::new();
-    let task_id = task.id;
-    let mut interrupted_state = None;
-    let outcome = execute_sync_work(
-        &adapter,
-        &repo,
-        work,
-        || {
-            interrupted_state = observed_task_interrupt(paths, task_id, cancellation)?;
-            Ok(interrupted_state.is_some())
-        },
-        |progress| {
-            persist_transaction_progress(
-                paths,
-                Some(app),
-                &mut task,
-                &mut transaction_metrics,
-                progress,
-            )
-        },
-    )
-    .await?;
-    match outcome {
-        CatalogTransactionOutcome::Completed { warnings } => {
-            Ok(TaskWorkerOutcome::Committed { warnings })
-        }
-        CatalogTransactionOutcome::Canceled => Ok(TaskWorkerOutcome::Interrupted(
-            interrupted_state.unwrap_or(TaskState::Canceled),
-        )),
-    }
-}
-
-async fn run_delete_worker(
-    app: &tauri::AppHandle,
-    paths: &LiosPaths,
-    mut task: TaskRecord,
-    repo: RepoConfig,
-    node_ids: Vec<String>,
-    cancellation: &CancellationToken,
-) -> CommandResult<TaskWorkerOutcome> {
-    if node_ids.is_empty() {
-        return Err(CommandError::invalid_input(
-            "delete selection cannot be empty",
-        ));
-    }
-    let config = load_config(paths)?;
-    let key = key_from_config(&config)?;
-    let repo = validate_repo(repo)?;
-    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(paths)?);
-    let (catalog, baseline) = download_catalog_baseline(paths, &key, &adapter, &repo).await?;
-    if let Some(interrupted) =
-        observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
-    {
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    }
-    update_task_state(paths, task.id, TaskState::Running, None)?;
-    task.state = TaskState::Running;
-    catalog.delete_nodes(&node_ids, &key).map_err(to_err)?;
-    let work = plan_catalog_sync(paths, &catalog, &key, baseline)?;
-    persist_sync_checkpoints(paths, task.id, &work)?;
-    let mut transaction_metrics = TransferMetrics::new();
-    let task_id = task.id;
-    let mut interrupted_state = None;
-    let outcome = execute_sync_work(
-        &adapter,
-        &repo,
-        work,
-        || {
-            interrupted_state = observed_task_interrupt(paths, task_id, cancellation)?;
-            Ok(interrupted_state.is_some())
-        },
-        |progress| {
-            persist_transaction_progress(
-                paths,
-                Some(app),
-                &mut task,
-                &mut transaction_metrics,
-                progress,
-            )
-        },
-    )
-    .await?;
-    match outcome {
-        CatalogTransactionOutcome::Completed { warnings } => {
-            Ok(TaskWorkerOutcome::Committed { warnings })
-        }
-        CatalogTransactionOutcome::Canceled => Ok(TaskWorkerOutcome::Interrupted(
-            interrupted_state.unwrap_or(TaskState::Canceled),
-        )),
-    }
-}
-
-async fn run_download_worker(
-    app: &tauri::AppHandle,
-    paths: &LiosPaths,
-    mut task: TaskRecord,
-    repo: RepoConfig,
-    node_ids: Vec<String>,
-    output_dir: PathBuf,
-    cancellation: &CancellationToken,
-) -> CommandResult<TaskWorkerOutcome> {
-    if node_ids.is_empty() || !output_dir.is_absolute() || !output_dir.is_dir() {
-        return Err(CommandError::invalid_input(
-            "download task has an invalid selection or output directory",
-        ));
-    }
-    let config = load_config(paths)?;
-    let key = key_from_config(&config)?;
-    let repo = validate_repo(repo)?;
-    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(paths)?);
-    let catalog_path = paths.staging.join(CATALOG_FILE);
-    let catalog_download =
-        adapter.download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path);
-    tokio::select! {
-        result = catalog_download => result.map_err(to_err)?,
-        _ = cancellation.cancelled() => {
-            let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                .map_err(to_err)?
-                .unwrap_or(TaskState::Canceled);
-            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-        }
-    }
-    let catalog = Catalog::from_staging(paths.staging.clone());
-    let selection = CatalogSelection::Nodes(node_ids);
-    let remote_files = catalog
-        .remote_files_for_selection(&selection, &key)
-        .map_err(to_err)?;
-    let remote_sizes = adapter
-        .list_objects(&repo.namespace, &repo.dataset, "")
-        .await
-        .map_err(to_err)?
-        .into_iter()
-        .map(|object| (object.path, object.size))
-        .collect::<HashMap<_, _>>();
-    let mut download_plan = Vec::new();
-    let mut download_total_bytes = 0u64;
-    for file in &remote_files {
-        let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
-        let was_cached = match validate_local_remote_file(&local_path, file, cancellation).await? {
-            LocalRemoteFileValidation::Valid => true,
-            LocalRemoteFileValidation::Invalid => false,
-            LocalRemoteFileValidation::Canceled => {
-                let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                    .map_err(to_err)?
-                    .unwrap_or(TaskState::Canceled);
-                return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-            }
-        };
-        let size = remote_sizes.get(&file.path).copied().unwrap_or(0);
-        if !was_cached {
-            download_total_bytes = download_total_bytes.saturating_add(size);
-        }
-        download_plan.push((file, local_path, was_cached));
-    }
-    update_task_state(paths, task.id, TaskState::Running, None)?;
-    update_task_phase(paths, task.id, Some("downloading".to_string()))?;
-    task.state = TaskState::Running;
-    task.progress_total = remote_files.len() as u64 + 1;
-    task.progress_done = 0;
-    task.bytes_done = 0;
-    let mut download_metrics = TransferMetrics::new();
-    let initial_observation = download_metrics.observe(0, download_total_bytes, true);
-    update_task_transfer(
-        paths,
-        task.id,
-        TaskTransferUpdate {
-            done: task.progress_done,
-            total: task.progress_total,
-            bytes_done: task.bytes_done,
-            bytes_total: download_total_bytes,
-            speed_bps: initial_observation.speed_bps,
-            eta_seconds: initial_observation.eta_seconds,
-        },
-    )?;
-    emit_task(app, paths, task.id);
-    for (index, (file, local_path, was_cached)) in download_plan.iter().enumerate() {
-        if let Some(interrupted) =
-            observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
-        {
-            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-        }
-        if !was_cached {
-            let completed_before_object = task.bytes_done;
-            let download = adapter.download_object_with_progress(
-                &repo.namespace,
-                &repo.dataset,
-                &file.path,
-                local_path,
-                |object_bytes_done| {
-                    let bytes_done = completed_before_object.saturating_add(object_bytes_done);
-                    let observation =
-                        download_metrics.observe(bytes_done, download_total_bytes, false);
-                    if observation.should_publish {
-                        let _ = update_task_transfer(
-                            paths,
-                            task.id,
-                            TaskTransferUpdate {
-                                done: index as u64,
-                                total: task.progress_total,
-                                bytes_done,
-                                bytes_total: download_total_bytes,
-                                speed_bps: observation.speed_bps,
-                                eta_seconds: observation.eta_seconds,
-                            },
-                        );
-                        emit_task(app, paths, task.id);
-                    }
-                },
-            );
-            tokio::select! {
-                result = download => result.map_err(to_err)?,
-                _ = cancellation.cancelled() => {
-                    let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                        .map_err(to_err)?
-                        .unwrap_or(TaskState::Canceled);
-                    return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-                }
-            }
-        }
-        let downloaded_is_valid =
-            match validate_local_remote_file(local_path, file, cancellation).await? {
-                LocalRemoteFileValidation::Valid => true,
-                LocalRemoteFileValidation::Invalid => false,
-                LocalRemoteFileValidation::Canceled => {
-                    let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                        .map_err(to_err)?
-                        .unwrap_or(TaskState::Canceled);
-                    return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-                }
-            };
-        if !downloaded_is_valid {
-            return Err(CommandError::new(
-                CommandErrorCode::CorruptedData,
-                format!("downloaded object failed hash verification: {}", file.path),
-                false,
-                Some(serde_json::json!({ "path": file.path })),
-            ));
-        }
-        task.progress_done = (index + 1) as u64;
-        if !was_cached {
-            task.bytes_done = task.bytes_done.saturating_add(
-                std::fs::metadata(local_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0),
-            );
-        }
-        let observation = download_metrics.observe(task.bytes_done, download_total_bytes, true);
-        update_task_transfer(
-            paths,
-            task.id,
-            TaskTransferUpdate {
-                done: task.progress_done,
-                total: task.progress_total,
-                bytes_done: task.bytes_done,
-                bytes_total: download_total_bytes,
-                speed_bps: observation.speed_bps,
-                eta_seconds: observation.eta_seconds,
-            },
-        )?;
-        emit_task(app, paths, task.id);
-    }
-    if let Some(interrupted) =
-        observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
-    {
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    }
-    update_task_phase(paths, task.id, Some("restoring".to_string()))?;
-    emit_task(app, paths, task.id);
-    catalog
-        .restore(
-            selection,
-            &key,
-            RestoreOptions {
-                output_dir,
-                conflict_policy: RestoreConflictPolicy::Rename,
-            },
-        )
-        .map_err(to_err)?;
-    task.progress_done = task.progress_total;
-    let observation = download_metrics.observe(task.bytes_done, download_total_bytes, true);
-    update_task_transfer(
-        paths,
-        task.id,
-        TaskTransferUpdate {
-            done: task.progress_done,
-            total: task.progress_total,
-            bytes_done: task.bytes_done,
-            bytes_total: download_total_bytes,
-            speed_bps: observation.speed_bps,
-            eta_seconds: observation.eta_seconds,
-        },
-    )?;
-    emit_task(app, paths, task.id);
-    Ok(TaskWorkerOutcome::Completed)
-}
-
-fn remote_integrity_warnings(
-    report: &CatalogRemoteIntegrityReport,
-    include_metadata_limit: bool,
-) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if include_metadata_limit && report.metadata_limited_objects > 0 {
-        warnings.push(format!(
-            "{} 个旧分片没有密文大小元数据，已校验 LFS OID；请运行完整检查验证内容",
-            report.metadata_limited_objects
-        ));
-    }
-    if report.unreferenced_managed_objects > 0 {
-        warnings.push(format!(
-            "发现 {} 个未被当前 catalog 引用的远端对象",
-            report.unreferenced_managed_objects
-        ));
-    }
-    warnings
 }
 
 fn recovery_metadata_objects(
@@ -2661,6 +1231,7 @@ fn recovery_metadata_objects(
     Ok(selected)
 }
 
+#[cfg(test)]
 fn validate_rebuild_revision(
     expected_revision: Option<&str>,
     current: &RepoRevision,
@@ -2686,6 +1257,7 @@ fn validate_rebuild_revision(
     Ok(expected.to_string())
 }
 
+#[cfg(test)]
 fn plan_catalog_rebuild_sync(
     paths: &LiosPaths,
     catalog: &Catalog,
@@ -2719,6 +1291,7 @@ fn catalog_rebuild_warnings(report: &CatalogRebuildReport) -> Vec<String> {
     }
 }
 
+#[cfg(test)]
 fn discard_staged_catalog_for_rebuild(paths: &LiosPaths) -> CommandResult<()> {
     let catalog_path = paths.staging.join(CATALOG_FILE);
     let metadata = match fs::symlink_metadata(&catalog_path) {
@@ -2896,6 +1469,7 @@ async fn rebuild_staged_catalog(
     }
 }
 
+#[cfg(test)]
 fn map_remote_integrity_error(error: lios_core::LiosError) -> CommandError {
     match error {
         lios_core::LiosError::DataCorruption(reason) => CommandError::new(
@@ -2970,593 +1544,6 @@ async fn head_revision_with_cancellation(
     }
 }
 
-async fn run_verify_space_worker(
-    app: &tauri::AppHandle,
-    paths: &LiosPaths,
-    mut task: TaskRecord,
-    repo: RepoConfig,
-    full: bool,
-    cancellation: &CancellationToken,
-) -> CommandResult<TaskWorkerOutcome> {
-    let config = load_config(paths)?;
-    let key = key_from_config(&config)?;
-    let repo = validate_repo(repo)?;
-    let branch_adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(paths)?);
-    let Some(started_revision) =
-        head_revision_with_cancellation(&branch_adapter, &repo, cancellation).await?
-    else {
-        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-            .map_err(to_err)?
-            .unwrap_or(TaskState::Canceled);
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    };
-    let pinned_commit = verification_commit_id(&started_revision)?.to_string();
-    let adapter = branch_adapter.clone().with_revision(pinned_commit);
-
-    update_task_state(paths, task.id, TaskState::Running, None)?;
-    update_task_phase(paths, task.id, Some("checking_remote".to_string()))?;
-    task.state = TaskState::Running;
-    task.phase = Some("checking_remote".to_string());
-    task.progress_done = 0;
-    task.progress_total = 1;
-    task.bytes_done = 0;
-    task.speed_bps = 0;
-    task.eta_seconds = None;
-
-    let remote_objects = tokio::select! {
-        result = adapter.list_objects(&repo.namespace, &repo.dataset, "") => {
-            result.map_err(to_err)?
-        }
-        _ = cancellation.cancelled() => {
-            let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                .map_err(to_err)?
-                .unwrap_or(TaskState::Canceled);
-            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-        }
-    };
-    let catalog_remote_size = remote_objects
-        .iter()
-        .find(|object| object.path == CATALOG_FILE)
-        .map(|object| object.size)
-        .ok_or_else(|| {
-            CommandError::new(
-                CommandErrorCode::CorruptedData,
-                "space catalog is missing from remote inventory",
-                false,
-                None,
-            )
-        })?;
-    update_task_transfer(
-        paths,
-        task.id,
-        TaskTransferUpdate {
-            done: 0,
-            total: 1,
-            bytes_done: 0,
-            bytes_total: catalog_remote_size,
-            speed_bps: 0,
-            eta_seconds: None,
-        },
-    )?;
-    emit_task(app, paths, task.id);
-
-    let catalog_path = paths.staging.join(CATALOG_FILE);
-    let mut catalog_metrics = TransferMetrics::new();
-    let catalog_download = adapter.download_object_with_progress(
-        &repo.namespace,
-        &repo.dataset,
-        CATALOG_FILE,
-        &catalog_path,
-        |bytes_done| {
-            let observation = catalog_metrics.observe(bytes_done, catalog_remote_size, false);
-            if observation.should_publish {
-                let _ = update_task_transfer(
-                    paths,
-                    task.id,
-                    TaskTransferUpdate {
-                        done: 0,
-                        total: 1,
-                        bytes_done,
-                        bytes_total: catalog_remote_size,
-                        speed_bps: observation.speed_bps,
-                        eta_seconds: observation.eta_seconds,
-                    },
-                );
-                emit_task(app, paths, task.id);
-            }
-        },
-    );
-    tokio::select! {
-        result = catalog_download => result.map_err(map_catalog_load_error)?,
-        _ = cancellation.cancelled() => {
-            let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                .map_err(to_err)?
-                .unwrap_or(TaskState::Canceled);
-            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-        }
-    }
-
-    let catalog = Catalog::from_staging(paths.staging.clone());
-    let remote_report = catalog
-        .verify_remote_inventory(&key, &remote_objects)
-        .map_err(map_remote_integrity_error)?;
-    if !full {
-        let warnings = remote_integrity_warnings(&remote_report, true);
-        update_task_phase(paths, task.id, Some("checking_complete".to_string()))?;
-        update_task_transfer(
-            paths,
-            task.id,
-            TaskTransferUpdate {
-                done: remote_report
-                    .verified_objects
-                    .saturating_add(remote_report.metadata_limited_objects),
-                total: remote_report.expected_objects,
-                bytes_done: remote_report.encoded_bytes_verified,
-                bytes_total: remote_report.encoded_bytes_verified,
-                speed_bps: 0,
-                eta_seconds: None,
-            },
-        )?;
-        emit_task(app, paths, task.id);
-        if !ensure_verification_snapshot_is_current(
-            &branch_adapter,
-            &repo,
-            &started_revision,
-            cancellation,
-        )
-        .await?
-        {
-            let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                .map_err(to_err)?
-                .unwrap_or(TaskState::Canceled);
-            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-        }
-        return Ok(if warnings.is_empty() {
-            TaskWorkerOutcome::Completed
-        } else {
-            TaskWorkerOutcome::CompletedWithWarnings { warnings }
-        });
-    }
-
-    let remote_files = catalog
-        .remote_files_for_selection(&CatalogSelection::All, &key)
-        .map_err(map_remote_integrity_error)?;
-    let remote_sizes = remote_objects
-        .iter()
-        .map(|object| (object.path.as_str(), object.size))
-        .collect::<HashMap<_, _>>();
-    let mut download_plan = Vec::with_capacity(remote_files.len());
-    let mut download_total_bytes = catalog_remote_size;
-    for file in &remote_files {
-        let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
-        let was_cached = match validate_local_remote_file(&local_path, file, cancellation).await? {
-            LocalRemoteFileValidation::Valid => true,
-            LocalRemoteFileValidation::Invalid => false,
-            LocalRemoteFileValidation::Canceled => {
-                let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                    .map_err(to_err)?
-                    .unwrap_or(TaskState::Canceled);
-                return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-            }
-        };
-        let remote_size = *remote_sizes.get(file.path.as_str()).ok_or_else(|| {
-            CommandError::new(
-                CommandErrorCode::CorruptedData,
-                format!("verified remote object disappeared: {}", file.path),
-                false,
-                None,
-            )
-        })?;
-        if !was_cached {
-            download_total_bytes =
-                download_total_bytes
-                    .checked_add(remote_size)
-                    .ok_or_else(|| {
-                        CommandError::new(
-                            CommandErrorCode::CorruptedData,
-                            "full space check byte total overflowed",
-                            false,
-                            None,
-                        )
-                    })?;
-        }
-        download_plan.push((file, local_path, was_cached, remote_size));
-    }
-
-    task.progress_total = u64::try_from(remote_files.len())
-        .ok()
-        .and_then(|count| count.checked_add(2))
-        .ok_or_else(|| {
-            CommandError::new(
-                CommandErrorCode::CorruptedData,
-                "full space check object count overflowed",
-                false,
-                None,
-            )
-        })?;
-    task.progress_done = 1;
-    task.bytes_done = catalog_remote_size;
-    update_task_phase(
-        paths,
-        task.id,
-        Some("downloading_verification_data".to_string()),
-    )?;
-    update_task_transfer(
-        paths,
-        task.id,
-        TaskTransferUpdate {
-            done: task.progress_done,
-            total: task.progress_total,
-            bytes_done: task.bytes_done,
-            bytes_total: download_total_bytes,
-            speed_bps: 0,
-            eta_seconds: None,
-        },
-    )?;
-    emit_task(app, paths, task.id);
-
-    let mut download_metrics = TransferMetrics::new();
-    let _ = download_metrics.observe(task.bytes_done, download_total_bytes, true);
-    for (index, (file, local_path, was_cached, remote_size)) in download_plan.iter().enumerate() {
-        if let Some(interrupted) =
-            observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
-        {
-            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-        }
-        if !was_cached {
-            let completed_before_object = task.bytes_done;
-            let download = adapter.download_object_with_progress(
-                &repo.namespace,
-                &repo.dataset,
-                &file.path,
-                local_path,
-                |object_bytes_done| {
-                    let bytes_done = completed_before_object.saturating_add(object_bytes_done);
-                    let observation =
-                        download_metrics.observe(bytes_done, download_total_bytes, false);
-                    if observation.should_publish {
-                        let _ = update_task_transfer(
-                            paths,
-                            task.id,
-                            TaskTransferUpdate {
-                                done: index as u64 + 1,
-                                total: task.progress_total,
-                                bytes_done,
-                                bytes_total: download_total_bytes,
-                                speed_bps: observation.speed_bps,
-                                eta_seconds: observation.eta_seconds,
-                            },
-                        );
-                        emit_task(app, paths, task.id);
-                    }
-                },
-            );
-            tokio::select! {
-                result = download => result.map_err(to_err)?,
-                _ = cancellation.cancelled() => {
-                    let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                        .map_err(to_err)?
-                        .unwrap_or(TaskState::Canceled);
-                    return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-                }
-            }
-            let downloaded_is_valid =
-                match validate_local_remote_file(local_path, file, cancellation).await? {
-                    LocalRemoteFileValidation::Valid => true,
-                    LocalRemoteFileValidation::Invalid => false,
-                    LocalRemoteFileValidation::Canceled => {
-                        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                            .map_err(to_err)?
-                            .unwrap_or(TaskState::Canceled);
-                        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-                    }
-                };
-            if !downloaded_is_valid {
-                return Err(CommandError::new(
-                    CommandErrorCode::CorruptedData,
-                    format!("downloaded verification object is invalid: {}", file.path),
-                    false,
-                    None,
-                ));
-            }
-            task.bytes_done = task.bytes_done.checked_add(*remote_size).ok_or_else(|| {
-                CommandError::new(
-                    CommandErrorCode::CorruptedData,
-                    "full space check progress overflowed",
-                    false,
-                    None,
-                )
-            })?;
-        }
-        task.progress_done = u64::try_from(index)
-            .ok()
-            .and_then(|value| value.checked_add(2))
-            .ok_or_else(|| {
-                CommandError::new(
-                    CommandErrorCode::CorruptedData,
-                    "full space check progress overflowed",
-                    false,
-                    None,
-                )
-            })?;
-        let observation = download_metrics.observe(task.bytes_done, download_total_bytes, true);
-        update_task_transfer(
-            paths,
-            task.id,
-            TaskTransferUpdate {
-                done: task.progress_done,
-                total: task.progress_total,
-                bytes_done: task.bytes_done,
-                bytes_total: download_total_bytes,
-                speed_bps: observation.speed_bps,
-                eta_seconds: observation.eta_seconds,
-            },
-        )?;
-        emit_task(app, paths, task.id);
-    }
-
-    update_task_phase(paths, task.id, Some("verifying_content".to_string()))?;
-    update_task_transfer(
-        paths,
-        task.id,
-        TaskTransferUpdate {
-            done: task.progress_total.saturating_sub(1),
-            total: task.progress_total,
-            bytes_done: download_total_bytes,
-            bytes_total: download_total_bytes,
-            speed_bps: 0,
-            eta_seconds: None,
-        },
-    )?;
-    emit_task(app, paths, task.id);
-    let verify_catalog = catalog.clone();
-    let verify_key = key.clone();
-    let verify_cancellation = cancellation.clone();
-    let integrity_outcome = tokio::task::spawn_blocking(move || {
-        verify_catalog
-            .verify_staged_integrity_with_cancel(&verify_key, || verify_cancellation.is_cancelled())
-    })
-    .await
-    .map_err(|error| {
-        CommandError::new(
-            CommandErrorCode::Internal,
-            format!("full space check worker failed: {error}"),
-            false,
-            None,
-        )
-    })?
-    .map_err(to_err)?;
-    if matches!(integrity_outcome, CatalogIntegrityOutcome::Canceled(_)) {
-        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-            .map_err(to_err)?
-            .unwrap_or(TaskState::Canceled);
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    }
-    if let Some(interrupted) =
-        observed_task_interrupt(paths, task.id, cancellation).map_err(to_err)?
-    {
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    }
-    update_task_phase(paths, task.id, Some("checking_complete".to_string()))?;
-    update_task_transfer(
-        paths,
-        task.id,
-        TaskTransferUpdate {
-            done: task.progress_total,
-            total: task.progress_total,
-            bytes_done: download_total_bytes,
-            bytes_total: download_total_bytes,
-            speed_bps: 0,
-            eta_seconds: None,
-        },
-    )?;
-    emit_task(app, paths, task.id);
-    if !ensure_verification_snapshot_is_current(
-        &branch_adapter,
-        &repo,
-        &started_revision,
-        cancellation,
-    )
-    .await?
-    {
-        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-            .map_err(to_err)?
-            .unwrap_or(TaskState::Canceled);
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    }
-    let warnings = remote_integrity_warnings(&remote_report, false);
-    Ok(if warnings.is_empty() {
-        TaskWorkerOutcome::Completed
-    } else {
-        TaskWorkerOutcome::CompletedWithWarnings { warnings }
-    })
-}
-
-async fn run_rebuild_catalog_worker(
-    app: &tauri::AppHandle,
-    paths: &LiosPaths,
-    mut task: TaskRecord,
-    repo: RepoConfig,
-    expected_revision: Option<String>,
-    cancellation: &CancellationToken,
-) -> CommandResult<TaskWorkerOutcome> {
-    let config = load_config(paths)?;
-    let key = key_from_config(&config)?;
-    let repo = validate_repo(repo)?;
-    let branch_adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(paths)?);
-    let Some(started_revision) =
-        head_revision_with_cancellation(&branch_adapter, &repo, cancellation).await?
-    else {
-        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-            .map_err(to_err)?
-            .unwrap_or(TaskState::Canceled);
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    };
-    let pinned_revision =
-        validate_rebuild_revision(expected_revision.as_deref(), &started_revision)?;
-    let adapter = branch_adapter.clone().with_revision(pinned_revision);
-    let remote_objects = tokio::select! {
-        result = adapter.list_objects(&repo.namespace, &repo.dataset, "") => {
-            result.map_err(to_err)?
-        }
-        _ = cancellation.cancelled() => {
-            let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-                .map_err(to_err)?
-                .unwrap_or(TaskState::Canceled);
-            return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-        }
-    };
-    if remote_objects
-        .iter()
-        .any(|object| object.path == CATALOG_FILE)
-    {
-        return Err(CommandError::already_initialized(
-            "remote catalog already exists; rebuild was not published",
-        ));
-    }
-    discard_staged_catalog_for_rebuild(paths)?;
-
-    update_task_state(paths, task.id, TaskState::Running, None)?;
-    update_task_phase(
-        paths,
-        task.id,
-        Some("downloading_recovery_metadata".to_string()),
-    )?;
-    task.state = TaskState::Running;
-    task.phase = Some("downloading_recovery_metadata".to_string());
-    let mut download_metrics = TransferMetrics::new();
-    let downloaded = download_recovery_metadata(
-        &adapter,
-        &repo,
-        &remote_objects,
-        &paths.staging,
-        cancellation,
-        |done, total, bytes_done, bytes_total| {
-            let total_steps = total.checked_add(2).ok_or_else(|| {
-                CommandError::new(
-                    CommandErrorCode::CorruptedData,
-                    "catalog rebuild progress overflowed",
-                    false,
-                    None,
-                )
-            })?;
-            let observation = download_metrics.observe(bytes_done, bytes_total, done == total);
-            if observation.should_publish || done == total {
-                update_task_transfer(
-                    paths,
-                    task.id,
-                    TaskTransferUpdate {
-                        done,
-                        total: total_steps,
-                        bytes_done,
-                        bytes_total,
-                        speed_bps: observation.speed_bps,
-                        eta_seconds: observation.eta_seconds,
-                    },
-                )?;
-                emit_task(app, paths, task.id);
-            }
-            task.progress_done = done;
-            task.progress_total = total_steps;
-            task.bytes_done = bytes_done;
-            task.bytes_total = bytes_total;
-            Ok(())
-        },
-    )
-    .await?;
-    if !downloaded {
-        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-            .map_err(to_err)?
-            .unwrap_or(TaskState::Canceled);
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    }
-
-    update_task_phase(paths, task.id, Some("rebuilding_catalog".to_string()))?;
-    task.phase = Some("rebuilding_catalog".to_string());
-    update_task_transfer(
-        paths,
-        task.id,
-        TaskTransferUpdate {
-            done: task.progress_total.saturating_sub(2),
-            total: task.progress_total,
-            bytes_done: task.bytes_total,
-            bytes_total: task.bytes_total,
-            speed_bps: 0,
-            eta_seconds: None,
-        },
-    )?;
-    emit_task(app, paths, task.id);
-    let Some((catalog, report)) =
-        rebuild_staged_catalog(&key, paths, remote_objects.clone(), cancellation).await?
-    else {
-        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-            .map_err(to_err)?
-            .unwrap_or(TaskState::Canceled);
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    };
-    task.progress_done = task.progress_total.saturating_sub(1);
-    update_task_transfer(
-        paths,
-        task.id,
-        TaskTransferUpdate {
-            done: task.progress_done,
-            total: task.progress_total,
-            bytes_done: task.bytes_total,
-            bytes_total: task.bytes_total,
-            speed_bps: 0,
-            eta_seconds: None,
-        },
-    )?;
-    emit_task(app, paths, task.id);
-    if !ensure_verification_snapshot_is_current(
-        &branch_adapter,
-        &repo,
-        &started_revision,
-        cancellation,
-    )
-    .await?
-    {
-        let interrupted = observed_task_interrupt(paths, task.id, cancellation)
-            .map_err(to_err)?
-            .unwrap_or(TaskState::Canceled);
-        return Ok(TaskWorkerOutcome::Interrupted(interrupted));
-    }
-
-    let work = plan_catalog_rebuild_sync(paths, &catalog, &key, remote_objects, started_revision)?;
-    persist_sync_checkpoints(paths, task.id, &work)?;
-    let mut transaction_metrics = TransferMetrics::new();
-    let task_id = task.id;
-    let mut interrupted_state = None;
-    let outcome = execute_sync_work(
-        &branch_adapter,
-        &repo,
-        work,
-        || {
-            interrupted_state = observed_task_interrupt(paths, task_id, cancellation)?;
-            Ok(interrupted_state.is_some())
-        },
-        |progress| {
-            persist_transaction_progress(
-                paths,
-                Some(app),
-                &mut task,
-                &mut transaction_metrics,
-                progress,
-            )
-        },
-    )
-    .await?;
-    match outcome {
-        CatalogTransactionOutcome::Completed { mut warnings } => {
-            warnings.extend(catalog_rebuild_warnings(&report));
-            Ok(TaskWorkerOutcome::Committed { warnings })
-        }
-        CatalogTransactionOutcome::Canceled => Ok(TaskWorkerOutcome::Interrupted(
-            interrupted_state.unwrap_or(TaskState::Canceled),
-        )),
-    }
-}
-
 #[tauri::command]
 fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnapshot> {
     state.paths.ensure_dirs().map_err(to_err)?;
@@ -3566,16 +1553,17 @@ fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnap
         let warning = prepare_startup_config(&state.paths, &mut config)?;
         (config, warning)
     };
-    let active_task_space_id = config
-        .active_repo
-        .as_ref()
-        .map(|repo| TaskScope::from_repo(repo).space_id);
+    let spaces = config
+        .spaces
+        .iter()
+        .map(|(name, repo)| RegisteredSpaceDto::new(name.clone(), repo.clone()))
+        .collect();
     Ok(SetupSnapshot {
         paths: paths_dto(&state.paths),
         recovery_key: recovery_key_status(&config),
         config,
         has_token: state.paths.credentials.exists(),
-        active_task_space_id,
+        spaces,
         warning,
     })
 }
@@ -3589,6 +1577,7 @@ fn setup_token(state: tauri::State<'_, AppContext>, token: String) -> CommandRes
 #[tauri::command]
 async fn create_dataset_repo(
     state: tauri::State<'_, AppContext>,
+    name: String,
     namespace: String,
     dataset: String,
     endpoint: String,
@@ -3599,16 +1588,21 @@ async fn create_dataset_repo(
         dataset,
         endpoint,
     })?;
-    let token = read_token(&state.paths)?;
-    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
-    adapter
-        .create_repo(&repo.namespace, &repo.dataset)
-        .await
-        .map_err(to_err)?;
-    let _config_guard = state.config_mutation_gate.lock()?;
-    let mut config = load_config(&state.paths)?;
-    config.active_repo = Some(repo);
-    persist_config(&state.paths, &mut config)
+    let application = Application::new(state.paths.clone())?;
+    application.create_dataset_repo(repo.clone()).await?;
+    if let Err(error) = application.initialize_space(repo.clone()).await {
+        return Err(CommandError::new(
+            error.code,
+            format!(
+                "Repository {}/{} was created but not registered; retry with `lios space init {} {}/{}`: {}",
+                repo.namespace, repo.dataset, name, repo.namespace, repo.dataset, error.message
+            ),
+            error.retryable,
+            error.details,
+        ));
+    }
+    SpaceRegistry::new(state.paths.clone()).add(&name, repo)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -3635,10 +1629,10 @@ async fn list_dataset_repos(
 #[tauri::command]
 async fn initialize_space(
     state: tauri::State<'_, AppContext>,
-    space: RepoConfig,
+    space_name: String,
 ) -> CommandResult<CatalogLoadResult> {
     state.paths.ensure_dirs().map_err(to_err)?;
-    let repo = validate_repo(space)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let _process_space_lock = state
         .paths
         .try_lock_space(&TaskScope::from_repo(&repo).space_id)
@@ -3674,13 +1668,7 @@ async fn initialize_space(
             .await
             .map_err(to_err)?,
     };
-    let config = {
-        let _config_guard = state.config_mutation_gate.lock()?;
-        let mut config = load_config(&state.paths)?;
-        config.active_repo = Some(repo.clone());
-        persist_config(&state.paths, &mut config)?;
-        config
-    };
+    let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
     reset_staging(&state.paths)?;
     let catalog = Catalog::initialize_empty(&repo.dataset, &key, state.paths.staging.clone())
@@ -3702,156 +1690,83 @@ async fn initialize_space(
 #[tauri::command]
 async fn load_space_catalog(
     state: tauri::State<'_, AppContext>,
-    space: RepoConfig,
+    space_name: String,
 ) -> CommandResult<CatalogLoadResult> {
     state.paths.ensure_dirs().map_err(to_err)?;
-    let repo = validate_repo(space)?;
-    let token = read_token(&state.paths)?;
-    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
-    if !adapter
-        .repo_exists(&repo.namespace, &repo.dataset)
-        .await
-        .map_err(to_err)?
-    {
-        return Err(CommandError::invalid_input(
-            "space was not found or is not visible",
-        ));
-    }
-    let config = {
-        let _config_guard = state.config_mutation_gate.lock()?;
-        let mut config = load_config(&state.paths)?;
-        config.active_repo = Some(repo.clone());
-        persist_config(&state.paths, &mut config)?;
-        config
-    };
-    let key = key_from_config(&config)?;
-    let staging = state.fresh_read_staging()?;
-    let local_path = staging.join(CATALOG_FILE);
-    adapter
-        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &local_path)
-        .await
-        .map_err(map_catalog_load_error)?;
-    let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
-    let catalog = Catalog::from_staging(staging);
-    let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
+    let snapshot = Application::new(state.paths.clone())?
+        .open_space(repo)
+        .await?;
     Ok(CatalogLoadResult {
-        local_path: local_path.display().to_string(),
-        bytes,
-        tree,
-        warnings: Vec::new(),
+        local_path: snapshot.local_path.display().to_string(),
+        bytes: snapshot.bytes,
+        tree: snapshot.tree,
+        warnings: snapshot.warnings,
     })
 }
 
 #[tauri::command]
 async fn preview_upload_conflicts(
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     parent_node_id: String,
     paths: Vec<String>,
 ) -> CommandResult<Vec<UploadConflict>> {
-    let config = load_config(&state.paths)?;
-    let key = key_from_config(&config)?;
-    let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let staging = state.fresh_read_staging()?;
-    let catalog_path = staging.join(CATALOG_FILE);
-    adapter
-        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
-        .await
-        .map_err(to_err)?;
-    let catalog = Catalog::from_staging(staging);
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-    catalog
-        .preview_upload_conflicts(&parent_node_id, &paths, &key)
-        .map_err(to_err)
+    Application::new(state.paths.clone())?
+        .preview_upload_conflicts_in(repo, &parent_node_id, &paths)
+        .await
 }
 
 #[tauri::command]
 async fn create_folder(
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     parent_node_id: String,
     name: String,
 ) -> CommandResult<CatalogLoadResult> {
-    let config = load_config(&state.paths)?;
-    let key = key_from_config(&config)?;
-    let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let _process_space_lock = state
-        .paths
-        .try_lock_space(&TaskScope::from_repo(&repo).space_id)
-        .map_err(CommandError::from)?;
-    let _space_mutation_guard = state
-        .task_manager
-        .acquire_space(TaskScope::from_repo(&repo).space_id)
-        .await;
-    let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
-    let local_path = state.paths.staging.join(CATALOG_FILE);
-    let (catalog, baseline) =
-        download_catalog_baseline(&state.paths, &key, &adapter, &repo).await?;
-    catalog
-        .create_folder(&parent_node_id, &name, &key)
-        .map_err(to_err)?;
-    let warnings =
-        sync_current_catalog(&state.paths, &catalog, &key, &adapter, &repo, baseline).await?;
-    let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
-    let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
+    let snapshot = Application::new(state.paths.clone())?
+        .create_folder_in(repo, &parent_node_id, &name)
+        .await?;
     Ok(CatalogLoadResult {
-        local_path: local_path.display().to_string(),
-        bytes,
-        tree,
-        warnings,
+        local_path: snapshot.local_path.display().to_string(),
+        bytes: snapshot.bytes,
+        tree: snapshot.tree,
+        warnings: snapshot.warnings,
     })
 }
 
 #[tauri::command]
 async fn rename_node(
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     node_id: String,
     new_name: String,
 ) -> CommandResult<CatalogLoadResult> {
-    let config = load_config(&state.paths)?;
-    let key = key_from_config(&config)?;
-    let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let _process_space_lock = state
-        .paths
-        .try_lock_space(&TaskScope::from_repo(&repo).space_id)
-        .map_err(CommandError::from)?;
-    let _space_mutation_guard = state
-        .task_manager
-        .acquire_space(TaskScope::from_repo(&repo).space_id)
-        .await;
-    let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
-    let local_path = state.paths.staging.join(CATALOG_FILE);
-    let (catalog, baseline) =
-        download_catalog_baseline(&state.paths, &key, &adapter, &repo).await?;
-    catalog
-        .rename_node(&node_id, &new_name, &key)
-        .map_err(to_err)?;
-    let warnings =
-        sync_current_catalog(&state.paths, &catalog, &key, &adapter, &repo, baseline).await?;
-    let bytes = fs::metadata(&local_path).map_err(to_err)?.len();
-    let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
+    let snapshot = Application::new(state.paths.clone())?
+        .rename_node_in(repo, &node_id, &new_name)
+        .await?;
     Ok(CatalogLoadResult {
-        local_path: local_path.display().to_string(),
-        bytes,
-        tree,
-        warnings,
+        local_path: snapshot.local_path.display().to_string(),
+        bytes: snapshot.bytes,
+        tree: snapshot.tree,
+        warnings: snapshot.warnings,
     })
 }
 
 #[tauri::command]
 async fn search_catalog(
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     query: String,
 ) -> CommandResult<Vec<DriveItem>> {
-    let config = load_config(&state.paths)?;
-    let key = key_from_config(&config)?;
-    let (adapter, repo) = adapter_from_config(&state.paths, &config)?;
-    let staging = state.fresh_read_staging()?;
-    let catalog_path = staging.join(CATALOG_FILE);
-    adapter
-        .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
+    Application::new(state.paths.clone())?
+        .search_in(repo, &query)
         .await
-        .map_err(to_err)?;
-    let catalog = Catalog::from_staging(staging);
-    catalog.search(&query, &key).map_err(to_err)
 }
 
 #[tauri::command]
@@ -3864,13 +1779,10 @@ fn export_recovery_key(
         &state.config_mutation_gate,
         Path::new(&destination),
     )?;
-    let active_repo = LiosConfig::load(&state.paths.config)
-        .ok()
-        .and_then(|config| config.active_repo);
     state.app_log.log(
         "info",
         "recovery_key_exported",
-        recovery_log_details(false, active_repo.as_ref()),
+        serde_json::json!({ "catalog_checked": false }),
     );
     Ok(status)
 }
@@ -3906,6 +1818,7 @@ async fn import_recovery_key(
 async fn enqueue_upload_to_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     parent_node_id: String,
     paths: Vec<String>,
     mut conflict_resolutions: Vec<ConflictResolution>,
@@ -3936,7 +1849,7 @@ async fn enqueue_upload_to_folder(
     }
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
-    let (_adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let source_snapshot = snapshot_upload_sources(&upload_paths).map_err(to_err)?;
     let spec = TaskSpec::Upload {
@@ -3956,6 +1869,7 @@ async fn enqueue_upload_to_folder(
 async fn enqueue_delete_nodes(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     node_ids: Vec<String>,
 ) -> CommandResult<TaskSummary> {
     if node_ids.is_empty() {
@@ -3965,7 +1879,7 @@ async fn enqueue_delete_nodes(
     }
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
-    let (_adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let spec = TaskSpec::Delete {
         account_id: scope.account_id,
@@ -3980,6 +1894,7 @@ async fn enqueue_delete_nodes(
 async fn enqueue_download(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
+    space_name: String,
     node_ids: Vec<String>,
     output_dir: String,
 ) -> CommandResult<TaskSummary> {
@@ -3991,7 +1906,7 @@ async fn enqueue_download(
     };
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
-    let (_adapter, repo) = adapter_from_config(&state.paths, &config)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let spec = TaskSpec::Download {
         account_id: scope.account_id,
@@ -4007,13 +1922,13 @@ async fn enqueue_download(
 async fn enqueue_verify_space(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
-    space: RepoConfig,
+    space_name: String,
     full: bool,
 ) -> CommandResult<TaskSummary> {
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
     read_token(&state.paths)?;
-    let repo = validate_repo(space)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let spec = TaskSpec::VerifySpace {
         account_id: scope.account_id,
@@ -4027,11 +1942,11 @@ async fn enqueue_verify_space(
 #[tauri::command]
 async fn preview_rebuild_catalog(
     state: tauri::State<'_, AppContext>,
-    space: RepoConfig,
+    space_name: String,
 ) -> CommandResult<CatalogRebuildPreviewResult> {
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
-    let repo = validate_repo(space)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let _space_permit = state
         .task_manager
@@ -4117,13 +2032,13 @@ async fn preview_rebuild_catalog(
 async fn enqueue_rebuild_catalog(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppContext>,
-    space: RepoConfig,
+    space_name: String,
     expected_revision: String,
 ) -> CommandResult<TaskSummary> {
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
     read_token(&state.paths)?;
-    let repo = validate_repo(space)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let expected_revision = expected_revision.trim();
     if expected_revision.is_empty() {
         return Err(CommandError::invalid_input(
@@ -4186,14 +2101,16 @@ async fn pause_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    interrupt_task_state(
-        &state.paths,
-        &state.task_lifecycle_gate,
-        task_id,
-        TaskState::Paused,
-    )
-    .await?;
-    state.task_manager.cancel(task_id).await;
+    let summary = task_summary_for_paths(&state.paths, task_id)?
+        .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
+    if summary.state == TaskState::Queued {
+        Application::new(state.paths.clone())?
+            .pause_task(task_id)
+            .await?;
+    } else {
+        state.paths.ensure_worker_control_dir()?;
+        fs::write(state.paths.worker_pause_path(task_id), b"pause\n").map_err(to_err)?;
+    }
     emit_task(&app, &state.paths, task_id);
     Ok(())
 }
@@ -4204,17 +2121,8 @@ async fn resume_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    if state.task_manager.is_running(task_id).await {
-        state.task_manager.wait_until_stopped(task_id).await;
-    }
-    if task_store(&state.paths)?
-        .transition_state(task_id, TaskState::Paused, TaskState::Queued)
-        .map_err(to_err)?
-    {
-        spawn_persisted_task(app.clone(), task_id);
-    } else {
-        return Err(CommandError::invalid_input("only paused tasks can resume"));
-    }
+    Application::new(state.paths.clone())?.requeue_paused_task(task_id)?;
+    start_shared_worker(&state.paths)?;
     emit_task(&app, &state.paths, task_id);
     Ok(())
 }
@@ -4225,19 +2133,9 @@ async fn retry_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    if state.task_manager.is_running(task_id).await {
-        return Err(CommandError::invalid_input(
-            "task worker must stop before retrying",
-        ));
-    }
-    let mut store = task_store(&state.paths)?;
-    if !store.requeue_failed(task_id).map_err(to_err)? {
-        return Err(CommandError::invalid_input(
-            "only failed tasks with a saved specification can retry",
-        ));
-    }
+    Application::new(state.paths.clone())?.requeue_failed_task(task_id)?;
     emit_task(&app, &state.paths, task_id);
-    spawn_persisted_task(app.clone(), task_id);
+    start_shared_worker(&state.paths)?;
     Ok(())
 }
 
@@ -4247,14 +2145,16 @@ async fn cancel_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    interrupt_task_state(
-        &state.paths,
-        &state.task_lifecycle_gate,
-        task_id,
-        TaskState::Canceled,
-    )
-    .await?;
-    state.task_manager.cancel(task_id).await;
+    let summary = task_summary_for_paths(&state.paths, task_id)?
+        .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
+    if matches!(summary.state, TaskState::Queued | TaskState::Paused) {
+        Application::new(state.paths.clone())?
+            .cancel_task(task_id)
+            .await?;
+    } else {
+        state.paths.ensure_worker_control_dir()?;
+        fs::write(state.paths.worker_cancel_path(task_id), b"cancel\n").map_err(to_err)?;
+    }
     emit_task(&app, &state.paths, task_id);
     Ok(())
 }
@@ -4297,7 +2197,9 @@ pub fn run() {
                 }),
             );
             start_terminal_task_staging_cleanup(&handle, &paths);
-            start_startup_tasks(&handle, &paths, recovery)?;
+            if !recovery.queued.is_empty() || !recovery.reconcile.is_empty() {
+                start_shared_worker(&paths)?;
+            }
             Ok(())
         })
         .invoke_handler(with_registered_commands!(generate_tauri_handler))
@@ -4399,23 +2301,9 @@ mod task_center_backend_tests {
         std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
         std::fs::write(&sidecar, b"active download").unwrap();
 
-        let context = AppContext::from_paths(paths);
+        AppContext::from_paths(paths);
 
         assert_eq!(std::fs::read(sidecar).unwrap(), b"active download");
-        assert!(context.read_staging.path().is_dir());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            assert_eq!(
-                std::fs::metadata(context.read_staging.path())
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-        }
     }
 
     fn assert_summary_json(value: &serde_json::Value) {
@@ -4437,7 +2325,7 @@ mod task_center_backend_tests {
             recovery_key: recovery_key_status(&config),
             config,
             has_token: false,
-            active_task_space_id: None,
+            spaces: Vec::new(),
             warning: None,
         };
         let event = TaskUpdateEvent::Upsert {
@@ -6447,7 +4335,7 @@ mod recovery_key_service_tests {
         let active_key = KeyFile::load_from_path(&active_key_path).unwrap();
         let target = repo();
         let mut config = LiosConfig::load(&paths.config).unwrap();
-        config.active_repo = Some(target.clone());
+        config.spaces.insert("archive".to_string(), target.clone());
         config.save(&paths.config).unwrap();
         let original_config = fs::read(&paths.config).unwrap();
         let remote = tempdir().unwrap();
@@ -6492,7 +4380,7 @@ mod recovery_key_service_tests {
         let active_key = KeyFile::load_from_path(&active_key_path).unwrap();
         let target = repo();
         let mut config = LiosConfig::load(&paths.config).unwrap();
-        config.active_repo = Some(target.clone());
+        config.spaces.insert("archive".to_string(), target.clone());
         config.save(&paths.config).unwrap();
         let remote = tempdir().unwrap();
         let remote_staging = remote.path().join("remote");
@@ -6514,7 +4402,10 @@ mod recovery_key_service_tests {
         let adapter =
             FakeCatalogAdapter::catalog_with_action(remote_staging.join(CATALOG_FILE), move || {
                 let mut config = LiosConfig::load(&config_path).unwrap();
-                config.active_repo = Some(concurrent_repo_for_action);
+                config.spaces.clear();
+                config
+                    .spaces
+                    .insert("other".to_string(), concurrent_repo_for_action);
                 config.key_file_path = Some(concurrent_key_for_action);
                 config.save(&config_path).unwrap();
                 *concurrent_bytes_for_action.lock().unwrap() =
@@ -6538,7 +4429,7 @@ mod recovery_key_service_tests {
             concurrent_bytes.lock().unwrap().clone().unwrap()
         );
         let saved = LiosConfig::load(&paths.config).unwrap();
-        assert_eq!(saved.active_repo, Some(concurrent_repo));
+        assert_eq!(saved.spaces.get("other"), Some(&concurrent_repo));
         assert_eq!(
             saved.key_file_path.as_deref(),
             Some(concurrent_key_path.as_path())
@@ -6552,7 +4443,7 @@ mod recovery_key_service_tests {
         let active_key = KeyFile::load_from_path(&active_key_path).unwrap();
         let target = repo();
         let mut config = LiosConfig::load(&paths.config).unwrap();
-        config.active_repo = Some(target.clone());
+        config.spaces.insert("archive".to_string(), target.clone());
         config.save(&paths.config).unwrap();
         let remote = tempdir().unwrap();
         let remote_staging = remote.path().join("remote");
@@ -6583,7 +4474,8 @@ mod recovery_key_service_tests {
             gate_held_tx.send(()).unwrap();
             write_rx.recv().unwrap();
             let mut config = LiosConfig::load(&writer_config_path).unwrap();
-            config.active_repo = Some(writer_repo);
+            config.spaces.clear();
+            config.spaces.insert("winner".to_string(), writer_repo);
             config.key_file_path = Some(writer_key_path);
             config.save(&writer_config_path).unwrap();
             written_tx
@@ -6619,7 +4511,7 @@ mod recovery_key_service_tests {
         assert_eq!(error.code, CommandErrorCode::RemoteConflict);
         assert_eq!(fs::read(&paths.config).unwrap(), concurrent_bytes);
         let saved = LiosConfig::load(&paths.config).unwrap();
-        assert_eq!(saved.active_repo, Some(concurrent_repo));
+        assert_eq!(saved.spaces.get("winner"), Some(&concurrent_repo));
         assert_eq!(
             saved.key_file_path.as_deref(),
             Some(concurrent_key_path.as_path())

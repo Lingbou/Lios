@@ -955,4 +955,36 @@ mod tests {
                 .upload_target_receives_credentials(&upload_url)
         );
     }
+
+    #[tokio::test]
+    async fn transport_errors_are_network_and_do_not_retain_request_urls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let endpoint =
+            format!("http://{address}/?token=ms-token-super-secret&X-Amz-Credential=signed-secret");
+
+        // The production adapter honors the user's proxy configuration. This test needs a
+        // socket failure specifically, so keep the test client independent of that process
+        // configuration instead of interpreting a proxy's HTTP response as a transport error.
+        let transport_error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(&endpoint)
+            .send()
+            .await
+            .unwrap_err();
+        let error = ModelScopeAdapter::network_error(transport_error);
+        let LiosError::Remote(error) = error else {
+            panic!("expected typed remote error");
+        };
+
+        assert_eq!(error.kind, RemoteErrorKind::Network);
+        assert_eq!(error.status, None);
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains("ms-token-super-secret"), "{rendered}");
+        assert!(!rendered.contains("X-Amz-Credential"), "{rendered}");
+        assert!(!rendered.contains("token="), "{rendered}");
+    }
 }

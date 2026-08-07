@@ -1,4 +1,5 @@
-use std::fs;
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,7 @@ use crate::{LiosError, Result};
 
 pub const MODELSCOPE_ENDPOINT: &str = "https://modelscope.cn";
 pub const MODELSCOPE_WWW_ENDPOINT: &str = "https://www.modelscope.cn";
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 pub fn validate_modelscope_production_endpoint(endpoint: &str) -> Result<String> {
     match endpoint.trim() {
@@ -39,13 +41,37 @@ pub struct LiosPaths {
     pub credentials: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiosConfig {
-    pub active_repo: Option<RepoConfig>,
+    #[serde(default = "legacy_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub spaces: BTreeMap<String, RepoConfig>,
+    /// Read-only compatibility slot for schema-v1 migration. Schema-v2 saves
+    /// never serialize this value and runtime code must not use it as state.
+    #[serde(default, rename = "active_repo", skip_serializing)]
+    pub legacy_active_repo: Option<RepoConfig>,
     pub key_file_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<PathBuf>,
     pub chunk_size: Option<usize>,
+}
+
+impl Default for LiosConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            spaces: BTreeMap::new(),
+            legacy_active_repo: None,
+            key_file_path: None,
+            backup_path: None,
+            chunk_size: None,
+        }
+    }
+}
+
+const fn legacy_schema_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +79,26 @@ pub struct RepoConfig {
     pub namespace: String,
     pub dataset: String,
     pub endpoint: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigLockError {
+    #[error("Lios configuration is busy in another process")]
+    Busy,
+    #[error("failed to access the Lios configuration lock: {0}")]
+    Io(#[from] io::Error),
+}
+
+#[derive(Debug)]
+#[must_use = "dropping the guard releases the configuration lock"]
+pub struct ConfigLock {
+    file: File,
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 pub fn lios_home() -> PathBuf {
@@ -92,6 +138,75 @@ impl LiosPaths {
         Ok(())
     }
 
+    pub fn try_lock_config(&self) -> std::result::Result<ConfigLock, ConfigLockError> {
+        ensure_private_state_directory(&self.home)?;
+        let locks_dir = self.home.join("locks");
+        ensure_private_state_directory(&locks_dir)?;
+        open_process_lock(&locks_dir.join("config.lock"))
+    }
+
+    pub fn try_lock_worker(&self) -> std::result::Result<ConfigLock, ConfigLockError> {
+        ensure_private_state_directory(&self.home)?;
+        let locks_dir = self.home.join("locks");
+        ensure_private_state_directory(&locks_dir)?;
+        open_process_lock(&locks_dir.join("worker.lock"))
+    }
+
+    pub fn worker_stop_path(&self) -> PathBuf {
+        self.home.join("worker.stop")
+    }
+
+    pub fn worker_pid_path(&self) -> PathBuf {
+        self.home.join("worker.pid")
+    }
+
+    pub fn worker_pause_path(&self, task_id: Uuid) -> PathBuf {
+        self.home
+            .join("worker-control")
+            .join(format!("pause-{task_id}"))
+    }
+
+    pub fn worker_cancel_path(&self, task_id: Uuid) -> PathBuf {
+        self.home
+            .join("worker-control")
+            .join(format!("cancel-{task_id}"))
+    }
+
+    pub fn ensure_worker_control_dir(&self) -> Result<PathBuf> {
+        let path = self.home.join("worker-control");
+        ensure_private_state_directory(&path)?;
+        Ok(path)
+    }
+
+    pub fn worker_running(&self) -> std::result::Result<bool, ConfigLockError> {
+        match self.try_lock_worker() {
+            Ok(lock) => {
+                drop(lock);
+                Ok(false)
+            }
+            Err(ConfigLockError::Busy) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn open_process_lock(path: &Path) -> std::result::Result<ConfigLock, ConfigLockError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(ConfigLock { file }),
+        Err(TryLockError::WouldBlock) => Err(ConfigLockError::Busy),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+impl LiosPaths {
     pub fn append_private_log(&self, date: NaiveDate, contents: &[u8]) -> io::Result<()> {
         append_private(
             &self

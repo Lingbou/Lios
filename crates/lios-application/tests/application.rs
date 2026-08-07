@@ -6,20 +6,21 @@ use lios_core::config::{LiosConfig, LiosPaths, RepoConfig, MODELSCOPE_ENDPOINT};
 use lios_core::tasks::{TaskState, TaskStore};
 use tempfile::tempdir;
 
-fn configured_application() -> (tempfile::TempDir, Application, LiosPaths) {
+fn configured_application() -> (tempfile::TempDir, Application, LiosPaths, RepoConfig) {
     let temp = tempdir().unwrap();
     let paths = LiosPaths::from_home(temp.path());
     let application = Application::new(paths.clone()).unwrap();
     application.setup().unwrap();
     application.set_token("local-test-token").unwrap();
     let mut config = LiosConfig::load(&paths.config).unwrap();
-    config.active_repo = Some(RepoConfig {
+    let repo = RepoConfig {
         namespace: "novix".to_string(),
         dataset: "cold".to_string(),
         endpoint: MODELSCOPE_ENDPOINT.to_string(),
-    });
+    };
+    config.spaces.insert("cold".to_string(), repo.clone());
     config.save(&paths.config).unwrap();
-    (temp, application, paths)
+    (temp, application, paths, repo)
 }
 
 #[test]
@@ -60,9 +61,9 @@ fn application_startup_does_not_delete_another_process_download_sidecar() {
 
 #[test]
 fn foreground_task_is_durable_before_network_execution() {
-    let (_temp, application, paths) = configured_application();
+    let (_temp, application, paths, repo) = configured_application();
 
-    let task = application.queue_verify(false).unwrap();
+    let task = application.queue_verify_for(repo, false).unwrap();
     let persisted = TaskStore::open(&paths.database)
         .unwrap()
         .get_summary(task.id)
@@ -76,8 +77,8 @@ fn foreground_task_is_durable_before_network_execution() {
 
 #[tokio::test]
 async fn second_frontend_gets_a_typed_busy_error_for_the_same_space() {
-    let (_temp, application, paths) = configured_application();
-    let task = application.queue_verify(false).unwrap();
+    let (_temp, application, paths, repo) = configured_application();
+    let task = application.queue_verify_for(repo, false).unwrap();
     let space_id = task.space_id.clone();
     let _first_frontend = paths.try_lock_space(&space_id).unwrap();
 
