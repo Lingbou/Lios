@@ -79,6 +79,53 @@ fn desktop_binary_name_is_reserved_for_the_desktop_product() {
 }
 
 #[test]
+fn linux_desktop_entry_matches_the_wayland_app_id() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let shared = read_json(&manifest.join("tauri.conf.json"));
+    let linux_config_path = manifest.join("tauri.linux.conf.json");
+    assert!(
+        linux_config_path.is_file(),
+        "Linux needs a platform config so its product name can match the Wayland app ID"
+    );
+    let linux = read_json(&linux_config_path);
+    let main_binary_name = shared["mainBinaryName"].as_str().unwrap();
+
+    assert_eq!(linux["productName"], main_binary_name);
+
+    let deb_template = linux["bundle"]["linux"]["deb"]["desktopTemplate"]
+        .as_str()
+        .unwrap();
+    let rpm_template = linux["bundle"]["linux"]["rpm"]["desktopTemplate"]
+        .as_str()
+        .unwrap();
+    assert_eq!(deb_template, rpm_template);
+
+    let template = fs::read_to_string(manifest.join(deb_template)).unwrap();
+    for required in [
+        "[Desktop Entry]",
+        "Exec={{exec}}",
+        "StartupWMClass={{exec}}",
+        "Icon={{icon}}",
+        "Name=Lios",
+    ] {
+        assert!(
+            template.lines().any(|line| line == required),
+            "Linux desktop template must contain {required:?}"
+        );
+    }
+
+    let workflow = fs::read_to_string(
+        manifest
+            .parent()
+            .unwrap()
+            .join(".github/workflows/release.yml"),
+    )
+    .unwrap();
+    assert!(workflow.contains("/usr/share/applications/lios-desktop.desktop"));
+    assert!(workflow.contains("test ! -e \"$deb_root/usr/share/applications/Lios.desktop\""));
+}
+
+#[test]
 fn windows_installer_is_current_user_only_and_does_not_modify_path() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let shared = read_json(&manifest.join("tauri.conf.json"));

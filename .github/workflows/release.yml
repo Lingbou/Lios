@@ -337,7 +337,14 @@ jobs:
             exit 1
           fi
           dpkg-deb --extract "$deb" "$deb_root"
-          desktop-file-validate "$deb_root/usr/share/applications/Lios.desktop"
+          desktop_file="$deb_root/usr/share/applications/lios-desktop.desktop"
+          desktop-file-validate "$desktop_file"
+          grep -Fxq "Exec=lios-desktop" "$desktop_file"
+          grep -Fxq "StartupWMClass=lios-desktop" "$desktop_file"
+          grep -Fxq "Icon=lios-desktop" "$desktop_file"
+          grep -Fxq "Name=Lios" "$desktop_file"
+          test ! -e "$deb_root/usr/share/applications/Lios.desktop"
+          test -f "$deb_root/usr/share/icons/hicolor/128x128/apps/lios-desktop.png"
           test -x "$deb_root/usr/bin/lios-desktop"
           test -x "$deb_root/usr/bin/lios-worker"
           test ! -e "$deb_root/usr/bin/lios"
@@ -371,6 +378,18 @@ jobs:
                 echo "::error::Desktop RPM claims the reserved CLI path /usr/bin/lios"
                 exit 1
               fi
+              if ! grep -Fxq "/usr/share/applications/lios-desktop.desktop" <<<"$rpm_contents"; then
+                echo "::error::Desktop RPM does not install the Wayland-matching desktop entry"
+                exit 1
+              fi
+              if grep -Fxq "/usr/share/applications/Lios.desktop" <<<"$rpm_contents"; then
+                echo "::error::Desktop RPM installs a desktop entry that does not match the Wayland app ID"
+                exit 1
+              fi
+              if ! grep -Fxq "/usr/share/icons/hicolor/128x128/apps/lios-desktop.png" <<<"$rpm_contents"; then
+                echo "::error::Desktop RPM does not install the Lios application icon"
+                exit 1
+              fi
 
               if ! verification="$(rpm --dbpath "$rpm_db" -K --nosignature /input/lios.rpm 2>&1)"; then
                 printf "%s\n" "$verification"
@@ -385,6 +404,11 @@ jobs:
           test -d "$appimage_root/squashfs-root"
           test -x "$appimage_root/squashfs-root/usr/bin/lios-desktop"
           test ! -e "$appimage_root/squashfs-root/usr/bin/lios"
+          desktop_file="$appimage_root/squashfs-root/usr/share/applications/lios-desktop.desktop"
+          desktop-file-validate "$desktop_file"
+          grep -Fxq "StartupWMClass=lios-desktop" "$desktop_file"
+          test ! -e "$appimage_root/squashfs-root/usr/share/applications/Lios.desktop"
+          test -f "$appimage_root/squashfs-root/usr/share/icons/hicolor/128x128/apps/lios-desktop.png"
           if find "$appimage_root/squashfs-root" -type f -iname WebView2Loader.dll -print -quit | grep -q .; then
             echo "::error::AppImage contains the Windows-only WebView2Loader.dll"
             exit 1

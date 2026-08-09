@@ -1,0 +1,13 @@
+{
+  "productName": "lios-desktop",
+  "bundle": {
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/lios-desktop.desktop.hbs"
+      },
+      "rpm": {
+        "desktopTemplate": "linux/lios-desktop.desktop.hbs"
+      }
+    }
+  }
+}
