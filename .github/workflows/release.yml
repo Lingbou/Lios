@@ -680,7 +680,7 @@ jobs:
             --verify-tag
             --generate-notes
             --notes "$notes"
-            --title "Lios ${VERSION}"
+            --title "Lios v${VERSION}"
           )
           if [[ "$VERSION" == *-* ]]; then
             flags+=(--prerelease --latest=false)
