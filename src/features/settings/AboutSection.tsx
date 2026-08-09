@@ -43,7 +43,7 @@ export function AboutSection({ loadVersion }: AboutSectionProps) {
         </div>
         <div className="aboutCopy">
           <h2 id="aboutLiosTitle">关于 Lios</h2>
-          <p>加密的 ModelScope 逻辑云盘</p>
+          <p>干翻百度网盘</p>
         </div>
       </div>
 
@@ -57,8 +57,8 @@ export function AboutSection({ loadVersion }: AboutSectionProps) {
           <dd>MIT</dd>
         </div>
         <div>
-          <dt>组件</dt>
-          <dd>Desktop 与 CLI 使用同一版本号</dd>
+          <dt>GitHub</dt>
+          <dd title="https://github.com/Lingbou">Lingbou</dd>
         </div>
       </dl>
     </section>
