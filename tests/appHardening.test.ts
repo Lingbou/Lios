@@ -34,6 +34,25 @@ test("task panel stays docked and scrolls its own task list", async () => {
   assert.match(resizeHandleRule, /touch-action:\s*none/);
 });
 
+test("narrow desktop navigation leaves a bounded row for the scrollable workspace", async () => {
+  const styles = await readFile(new URL("src/styles.css", root), "utf8");
+  const narrowStart = styles.indexOf("@media (max-width: 980px)");
+  const narrowEnd = styles.indexOf("@media (max-width: 680px)", narrowStart);
+
+  assert.notEqual(narrowStart, -1);
+  assert.notEqual(narrowEnd, -1);
+  const narrowStyles = styles.slice(narrowStart, narrowEnd);
+  const shellRule = narrowStyles.match(/\.driveShell\s*\{([\s\S]*?)\n\s*\}/)?.[1];
+  const railRule = narrowStyles.match(/\.spaceRail\s*\{([\s\S]*?)\n\s*\}/)?.[1];
+
+  assert.ok(shellRule);
+  assert.ok(railRule);
+  assert.match(shellRule, /grid-template-rows:\s*auto minmax\(0,\s*1fr\)/);
+  assert.match(railRule, /height:\s*auto/);
+  assert.match(railRule, /grid-template-columns:\s*minmax\(0,\s*1fr\) auto/);
+  assert.match(narrowStyles, /\.accountListSpacer\s*\{[\s\S]*?display:\s*none/);
+});
+
 test("breadcrumb labels truncate without overlap and retain their full path", async () => {
   const app = await readFile(new URL("src/App.tsx", root), "utf8");
   const styles = await readFile(new URL("src/styles.css", root), "utf8");

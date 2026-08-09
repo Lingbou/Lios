@@ -1698,15 +1698,45 @@ select:focus {
 @media (max-width: 980px) {
   .driveShell {
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   .spaceRail {
+    height: auto;
+    padding: 8px 12px;
     border-right: 0;
     border-bottom: 1px solid var(--line);
-    grid-template-rows: auto auto auto;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: auto;
+    align-items: center;
+    gap: 8px;
   }
 
-  .driveTopbar,
+  .spaceRail .sectionLabel,
+  .accountListSpacer {
+    display: none;
+  }
+
+  .accountSection {
+    min-width: 0;
+    display: block;
+  }
+
+  .accountItem {
+    min-height: 46px;
+  }
+
+  .railFooter {
+    display: flex;
+    align-items: center;
+    padding-top: 0;
+    border-top: 0;
+  }
+
+  .railFooter button {
+    width: auto;
+  }
+
   .connectionGrid,
   .manualGrid,
   .tokenRow {
@@ -1806,6 +1836,10 @@ select:focus {
 
   .driveWorkspace {
     padding: 12px;
+  }
+
+  .driveTopbar {
+    grid-template-columns: 1fr;
   }
 
   .driveToolbar {

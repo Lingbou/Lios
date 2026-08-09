@@ -935,44 +935,46 @@ function App() {
       </aside>
 
       <section className="driveWorkspace">
-        <header className="driveTopbar">
-          <nav className="crumbs" aria-label="当前路径" title={fullBreadcrumbPath}>
-            {crumbs.length > 0 ? (
-              crumbs.map((crumb, index) => (
-                <button
-                  key={crumb.id}
-                  type="button"
-                  onClick={() => setCurrentFolderId(crumb.id)}
-                  className={index === crumbs.length - 1 ? "current" : ""}
-                  title={crumbPaths[index]}
-                  aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
-                  aria-current={index === crumbs.length - 1 ? "page" : undefined}
-                >
-                  {index > 0 && <ChevronRight aria-hidden />}
-                  <span className="crumbLabel">{crumb.name}</span>
-                </button>
-              ))
-            ) : (
-              <span className="crumbFallback" title={crumbFallbackLabel}>
-                {crumbFallbackLabel}
-              </span>
-            )}
-          </nav>
-          <div className="searchBox">
-            <Search aria-hidden />
-            <input
-              value={query}
-              onChange={(event) => {
-                setQuery(event.target.value);
-                if (view === "drive" && !event.target.value.trim()) setSearchResults([]);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && view === "drive") searchCatalog();
-              }}
-              placeholder={view === "spaces" ? "搜索空间" : "搜索当前空间"}
-            />
-          </div>
-        </header>
+        {view !== "settings" && (
+          <header className="driveTopbar">
+            <nav className="crumbs" aria-label="当前路径" title={fullBreadcrumbPath}>
+              {crumbs.length > 0 ? (
+                crumbs.map((crumb, index) => (
+                  <button
+                    key={crumb.id}
+                    type="button"
+                    onClick={() => setCurrentFolderId(crumb.id)}
+                    className={index === crumbs.length - 1 ? "current" : ""}
+                    title={crumbPaths[index]}
+                    aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
+                    aria-current={index === crumbs.length - 1 ? "page" : undefined}
+                  >
+                    {index > 0 && <ChevronRight aria-hidden />}
+                    <span className="crumbLabel">{crumb.name}</span>
+                  </button>
+                ))
+              ) : (
+                <span className="crumbFallback" title={crumbFallbackLabel}>
+                  {crumbFallbackLabel}
+                </span>
+              )}
+            </nav>
+            <div className="searchBox">
+              <Search aria-hidden />
+              <input
+                value={query}
+                onChange={(event) => {
+                  setQuery(event.target.value);
+                  if (view === "drive" && !event.target.value.trim()) setSearchResults([]);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && view === "drive") searchCatalog();
+                }}
+                placeholder={view === "spaces" ? "搜索空间" : "搜索当前空间"}
+              />
+            </div>
+          </header>
+        )}
 
         {message && (
           <div className="noticeBar">
