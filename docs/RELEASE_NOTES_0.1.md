@@ -1,6 +1,7 @@
-# Lios 0.2.0
+# Lios 0.1.0
 
-Lios 0.2 is a breaking CLI release centered on explicit Space paths and rsync-style transfers.
+Lios 0.1 is the first official release of the Desktop and CLI, centered on explicit Space paths
+and rsync-style transfers.
 
 - Removed Active Repository and the legacy `upload`, `download`, `delete`, `rename`, `repos`, and
   `space open` command syntax.

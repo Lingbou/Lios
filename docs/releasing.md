@@ -84,7 +84,7 @@ Repository setup is part of the release boundary:
 1. Change `[workspace.package].version` in the root `Cargo.toml`.
 2. Run `npm run version:sync`.
 3. Run the full local verification suite and commit the version change.
-4. Create and push the matching tag, for example `v0.2.0`.
+4. Create and push the matching tag, for example `v0.1.0`.
 5. The `Unsigned release` workflow tests, builds, inspects, checksums, and finally creates the
    GitHub Release.
 
