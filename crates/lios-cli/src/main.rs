@@ -34,6 +34,10 @@ async fn main() -> ExitCode {
     let cli = match Cli::try_parse_from(raw_args) {
         Ok(cli) => cli,
         Err(error) => {
+            if error.exit_code() == 0 {
+                let _ = error.print();
+                return ExitCode::SUCCESS;
+            }
             if requested_json {
                 let cli_error = CliError::invalid_input(error.to_string());
                 render_error(true, "parse", &cli_error);
