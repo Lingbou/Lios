@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -48,6 +49,7 @@ import {
   loadCatalogState
 } from "./catalogState.ts";
 import { errorText } from "./commandError.ts";
+import { AboutSection } from "./features/settings/AboutSection.tsx";
 import {
   breadcrumb,
   CatalogRecoveryTree,
@@ -115,6 +117,11 @@ function previewSnapshot(): Snapshot {
     spaces: [],
     warning: null
   };
+}
+
+async function loadAppVersion() {
+  if (!hasTauriRuntime()) return "开发预览";
+  return getVersion();
 }
 
 async function appInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
@@ -1118,6 +1125,8 @@ function App() {
                 </div>
               </dl>
             </div>
+
+            <AboutSection loadVersion={loadAppVersion} />
           </section>
         ) : view === "spaces" ? (
           <section className="accountSpacesPage">
