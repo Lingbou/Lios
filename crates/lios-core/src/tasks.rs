@@ -2072,11 +2072,6 @@ fn upsert_task_catalog_checkpoint_on(
 
 fn migrate_task_store(connection: &mut rusqlite::Connection) -> Result<()> {
     let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if version > TASK_SCHEMA_VERSION {
-        return Err(LiosError::DataCorruption(format!(
-            "task database schema version {version} is newer than supported version {TASK_SCHEMA_VERSION}"
-        )));
-    }
     if version == TASK_SCHEMA_VERSION {
         return Ok(());
     }
@@ -2084,11 +2079,6 @@ fn migrate_task_store(connection: &mut rusqlite::Connection) -> Result<()> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let version = transaction.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if version > TASK_SCHEMA_VERSION {
-        return Err(LiosError::DataCorruption(format!(
-            "task database schema version {version} is newer than supported version {TASK_SCHEMA_VERSION}"
-        )));
-    }
     if version == TASK_SCHEMA_VERSION {
         transaction.commit()?;
         return Ok(());
@@ -2115,70 +2105,6 @@ fn migrate_task_store(connection: &mut rusqlite::Connection) -> Result<()> {
             updated_at TEXT NOT NULL DEFAULT '',
             error TEXT
         );
-        "#,
-    )?;
-    ensure_column(&transaction, "tasks", "phase", "TEXT")?;
-    ensure_column(
-        &transaction,
-        "tasks",
-        "bytes_total",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    ensure_column(
-        &transaction,
-        "tasks",
-        "bytes_done",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    ensure_column(
-        &transaction,
-        "tasks",
-        "speed_bps",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    ensure_column(
-        &transaction,
-        "tasks",
-        "account_id",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    ensure_column(
-        &transaction,
-        "tasks",
-        "space_id",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    ensure_column(&transaction, "tasks", "eta_seconds", "INTEGER")?;
-    ensure_column(
-        &transaction,
-        "tasks",
-        "attempt",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    ensure_column(&transaction, "tasks", "spec_json", "TEXT")?;
-    ensure_column(
-        &transaction,
-        "tasks",
-        "created_at",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    ensure_column(
-        &transaction,
-        "tasks",
-        "updated_at",
-        "TEXT NOT NULL DEFAULT ''",
-    )?;
-    let now = now_timestamp();
-    transaction.execute(
-        "UPDATE tasks SET created_at = ?1 WHERE created_at = ''",
-        rusqlite::params![&now],
-    )?;
-    transaction.execute(
-        "UPDATE tasks SET updated_at = ?1 WHERE updated_at = ''",
-        rusqlite::params![&now],
-    )?;
-    transaction.execute_batch(
-        r#"
         CREATE TABLE IF NOT EXISTS task_items (
             id TEXT PRIMARY KEY NOT NULL,
             task_id TEXT NOT NULL,
@@ -2224,13 +2150,6 @@ fn migrate_task_store(connection: &mut rusqlite::Connection) -> Result<()> {
             ON tasks(account_id, space_id, state);
         "#,
     )?;
-    ensure_column(&transaction, "task_items", "relative_path", "TEXT")?;
-    ensure_column(
-        &transaction,
-        "task_items",
-        "source_modified_at_ns",
-        "INTEGER",
-    )?;
     transaction.pragma_update(None, "user_version", TASK_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -2260,30 +2179,6 @@ fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
                 rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             )
     )
-}
-
-fn ensure_column(
-    connection: &rusqlite::Transaction<'_>,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<()> {
-    let columns = {
-        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-        let mut columns = Vec::new();
-        for row in rows {
-            columns.push(row?);
-        }
-        columns
-    };
-    if !columns.iter().any(|existing| existing == column) {
-        connection.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
-            [],
-        )?;
-    }
-    Ok(())
 }
 
 fn sqlite_integer(value: u64, field: &str) -> Result<i64> {

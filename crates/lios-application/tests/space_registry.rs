@@ -50,27 +50,14 @@ fn registry_validates_aliases_and_forbids_duplicate_repository_addresses() {
 }
 
 #[test]
-fn startup_backs_up_v1_and_does_not_auto_register_the_active_repository() {
+fn startup_initializes_clean_spaces_configuration() {
     let temp = tempdir().unwrap();
     let paths = LiosPaths::from_home(temp.path());
     paths.ensure_dirs().unwrap();
-    std::fs::write(
-        &paths.config,
-        "active_repo:\n  namespace: allen\n  dataset: photos\n  endpoint: https://modelscope.cn\nchunk_size: 1024\n",
-    )
-    .unwrap();
     let application = lios_application::service::Application::new(paths.clone()).unwrap();
-
     let snapshot = application.setup().unwrap();
-
     assert!(snapshot.config.spaces.is_empty());
-    assert!(!std::fs::read_to_string(&paths.config)
-        .unwrap()
-        .contains("active_repo"));
-    assert!(paths.home.join("config.yaml.v1.bak").is_file());
-    let warning = snapshot.warning.expect("migration warning");
-    assert!(warning.message.contains("space add"));
-    assert!(warning.message.contains("allen/photos"));
+    assert!(snapshot.warning.is_none());
 }
 
 #[test]

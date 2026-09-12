@@ -3,6 +3,7 @@ macro_rules! with_registered_commands {
         $consumer! {
             current_setup,
             setup_token,
+            register_space,
             create_dataset_repo,
             list_dataset_repos,
             initialize_space,

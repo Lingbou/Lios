@@ -1606,6 +1606,26 @@ async fn create_dataset_repo(
 }
 
 #[tauri::command]
+fn register_space(
+    state: tauri::State<'_, AppContext>,
+    name: String,
+    namespace: String,
+    dataset: String,
+    endpoint: Option<String>,
+) -> CommandResult<()> {
+    state.paths.ensure_dirs().map_err(to_err)?;
+    let config = load_config(&state.paths)?;
+    let endpoint = configured_endpoint(&config, endpoint)?;
+    let repo = validate_repo(RepoConfig {
+        namespace,
+        dataset,
+        endpoint,
+    })?;
+    SpaceRegistry::new(state.paths.clone()).add(&name, repo)?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn list_dataset_repos(
     state: tauri::State<'_, AppContext>,
     endpoint: Option<String>,

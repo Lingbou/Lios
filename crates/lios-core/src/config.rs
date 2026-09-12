@@ -43,18 +43,18 @@ pub struct LiosPaths {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiosConfig {
-    #[serde(default = "legacy_schema_version")]
+    #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     #[serde(default)]
     pub spaces: BTreeMap<String, RepoConfig>,
-    /// Read-only compatibility slot for schema-v1 migration. Schema-v2 saves
-    /// never serialize this value and runtime code must not use it as state.
-    #[serde(default, rename = "active_repo", skip_serializing)]
-    pub legacy_active_repo: Option<RepoConfig>,
     pub key_file_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<PathBuf>,
     pub chunk_size: Option<usize>,
+}
+
+const fn default_schema_version() -> u32 {
+    CONFIG_SCHEMA_VERSION
 }
 
 impl Default for LiosConfig {
@@ -62,16 +62,11 @@ impl Default for LiosConfig {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             spaces: BTreeMap::new(),
-            legacy_active_repo: None,
             key_file_path: None,
             backup_path: None,
             chunk_size: None,
         }
     }
-}
-
-const fn legacy_schema_version() -> u32 {
-    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

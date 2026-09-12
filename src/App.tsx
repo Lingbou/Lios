@@ -311,6 +311,9 @@ async function appInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
   if (command === "cleanup_local_cache") {
     return { files_removed: 4, dirs_removed: 2, bytes_removed: 20971520 } as T;
   }
+  if (command === "register_space") {
+    return null as T;
+  }
   if (command === "create_folder") {
     return { local_path: "", bytes: 0, tree: previewTree(), warnings: [] } as T;
   }
@@ -520,6 +523,38 @@ function App() {
         endpoint: visibleActiveRepo?.endpoint || manualEndpoint
       });
       setModelscopeUser(result.user);
+
+      // Auto-register any discovered ASCII ModelScope dataset into local space registry
+      const registeredSet = new Set(next.spaces.map((s) => `${s.namespace}/${s.dataset}`));
+      let anyRegistered = false;
+      for (const repo of result.repositories) {
+        if (!registeredSet.has(`${repo.namespace}/${repo.dataset}`)) {
+          const defaultAlias = repo.dataset.toLowerCase();
+          if (/^[a-z][a-z0-9_-]{0,31}$/.test(defaultAlias)) {
+            try {
+              await appInvoke("register_space", {
+                name: defaultAlias,
+                namespace: repo.namespace,
+                dataset: repo.dataset,
+                endpoint: repo.endpoint
+              });
+              anyRegistered = true;
+            } catch {
+              // Ignore alias collision or format error
+            }
+          }
+        }
+      }
+      if (anyRegistered) {
+        const updatedSetup = await appInvoke<Snapshot>("current_setup");
+        setSnapshot(updatedSetup);
+        setSpaces(updatedSetup.spaces);
+        const updatedActive = preferredName
+          ? updatedSetup.spaces.find((space) => space.space_name === preferredName) ?? null
+          : null;
+        if (updatedActive) setActiveSpace(updatedActive);
+        return updatedActive;
+      }
     }
 
     if (visibleActiveRepo) {

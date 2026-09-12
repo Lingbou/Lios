@@ -2,7 +2,7 @@
 
 use lios_core::config::{
     ensure_default_key_binding, validate_modelscope_production_endpoint, LiosConfig, LiosPaths,
-    RepoConfig, CONFIG_SCHEMA_VERSION, MODELSCOPE_ENDPOINT,
+    RepoConfig, MODELSCOPE_ENDPOINT,
 };
 use serde::Serialize;
 
@@ -11,7 +11,6 @@ use crate::command_error::CommandError;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum SetupWarningCode {
     ReconnectRequired,
-    LegacyRepositoryNeedsRegistration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -72,53 +71,6 @@ fn validated_config(config: &LiosConfig) -> Result<LiosConfig, CommandError> {
     Ok(validated)
 }
 
-fn migrate_legacy_config(
-    paths: &LiosPaths,
-    config: &LiosConfig,
-) -> Result<(LiosConfig, Option<SetupWarning>, bool), CommandError> {
-    if config.schema_version >= CONFIG_SCHEMA_VERSION {
-        return Ok((config.clone(), None, false));
-    }
-    let backup = paths.home.join("config.yaml.v1.bak");
-    if paths.config.is_file() && !backup.exists() {
-        std::fs::copy(&paths.config, &backup)?;
-    }
-    let mut migrated = config.clone();
-    migrated.schema_version = CONFIG_SCHEMA_VERSION;
-    migrated.spaces.clear();
-    let legacy_repo = migrated.legacy_active_repo.take();
-    let Some(repo) = legacy_repo else {
-        return Ok((migrated, None, true));
-    };
-    if validate_modelscope_production_endpoint(&repo.endpoint).is_err() {
-        return Ok((
-            migrated,
-            Some(SetupWarning {
-                code: SetupWarningCode::ReconnectRequired,
-                message: "The saved ModelScope endpoint is no longer supported; reconnect a space."
-                    .to_string(),
-            }),
-            true,
-        ));
-    }
-
-    let validated = validate_repo(repo.clone())?;
-    Ok((
-        migrated,
-        Some(SetupWarning {
-            code: SetupWarningCode::LegacyRepositoryNeedsRegistration,
-            message: format!(
-                "Previous Repository Address {}/{} was not registered automatically; run `lios space add NAME {}/{}`",
-                validated.namespace,
-                validated.dataset,
-                validated.namespace,
-                validated.dataset
-            ),
-        }),
-        true,
-    ))
-}
-
 pub fn persist_config(paths: &LiosPaths, config: &mut LiosConfig) -> Result<(), CommandError> {
     let validated = validated_config(config)?;
     validated.save(&paths.config)?;
@@ -130,13 +82,11 @@ pub fn prepare_startup_config(
     paths: &LiosPaths,
     config: &mut LiosConfig,
 ) -> Result<Option<SetupWarning>, CommandError> {
-    let (mut prepared, warning, migrated) = migrate_legacy_config(paths, config)?;
-    let key_bound = ensure_default_key_binding(paths, &mut prepared)?;
-    if migrated || key_bound {
-        persist_config(paths, &mut prepared)?;
+    let key_bound = ensure_default_key_binding(paths, config)?;
+    if key_bound {
+        persist_config(paths, config)?;
     }
-    *config = prepared;
-    Ok(warning)
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -218,34 +168,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_migrates_old_endpoint_and_persists_default_key_binding() {
+    fn startup_binds_default_key_file() {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         paths.ensure_dirs().unwrap();
-        let mut config = LiosConfig {
-            legacy_active_repo: Some(RepoConfig {
-                namespace: "novix".to_string(),
-                dataset: "cold".to_string(),
-                endpoint: "http://127.0.0.1:12345".to_string(),
-            }),
-            key_file_path: None,
-            backup_path: None,
-            chunk_size: None,
-            schema_version: 1,
-            spaces: Default::default(),
-        };
-        config.save(&paths.config).unwrap();
-
-        let warning = prepare_startup_config(&paths, &mut config)
-            .unwrap()
-            .unwrap();
-        let saved = LiosConfig::load(&paths.config).unwrap();
-
-        assert_eq!(warning.code, SetupWarningCode::ReconnectRequired);
-        assert!(warning.message.contains("reconnect"));
-        assert!(config.legacy_active_repo.is_none());
-        assert!(saved.legacy_active_repo.is_none());
-        assert_eq!(saved.key_file_path, config.key_file_path);
+        let mut config = LiosConfig::default();
+        let warning = prepare_startup_config(&paths, &mut config).unwrap();
+        assert!(warning.is_none());
+        assert_eq!(config.key_file_path, Some(paths.home.join("recovery.key")));
         assert!(paths.home.join("recovery.key").exists());
     }
 }
