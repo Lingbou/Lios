@@ -2,6 +2,7 @@ import {
   CheckSquare,
   Download,
   Edit3,
+  Eye,
   FolderOpen,
   Plus,
   RefreshCw,
@@ -17,6 +18,7 @@ export interface ContextMenuProps {
   onClose: () => void;
   selectedCount: number;
   onOpenItem?: (item: DriveItem) => void;
+  onPreviewItem?: (item: DriveItem) => void;
   onDownload?: () => void;
   onRename?: () => void;
   onDelete?: () => void;
@@ -32,6 +34,7 @@ export function ContextMenu({
   onClose,
   selectedCount,
   onOpenItem,
+  onPreviewItem,
   onDownload,
   onRename,
   onDelete,
@@ -119,6 +122,19 @@ export function ContextMenu({
             >
               <FolderOpen aria-hidden />
               <span>打开文件夹</span>
+            </button>
+          )}
+          {item.kind === "File" && onPreviewItem && (
+            <button
+              className="contextMenuItem"
+              role="menuitem"
+              onClick={() => {
+                onPreviewItem(item);
+                onClose();
+              }}
+            >
+              <Eye aria-hidden />
+              <span>在线预览</span>
             </button>
           )}
           {onDownload && (

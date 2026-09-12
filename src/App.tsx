@@ -1846,6 +1846,7 @@ function App() {
           onClose={closeContextMenu}
           selectedCount={selectedCount}
           onOpenItem={enterItem}
+          onPreviewItem={openFilePreview}
           onDownload={downloadSelected}
           onRename={renameSelected}
           onDelete={deleteSelected}
