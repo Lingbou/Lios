@@ -34,7 +34,7 @@ use config_mutation_gate::ConfigMutationGate;
 use download_service::prepare_download_task;
 use lios_application::service::Application;
 use lios_application::space_registry::SpaceRegistry;
-use lios_core::cache::{cleanup_temporary_staging, prune_unreferenced_staging, CacheCleanupReport};
+use lios_core::cache::{prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
     Catalog, CatalogRebuildOutcome, CatalogRebuildReport, CatalogRemoteFile, CatalogSelection,
     CatalogTreeNode, ConflictAction, ConflictResolution, DriveItem, SourceFileSnapshot,
@@ -571,12 +571,28 @@ fn cleanup_current_staging_cache(
     strict: bool,
 ) -> CommandResult<CacheCleanupReport> {
     paths.ensure_dirs().map_err(to_err)?;
-    if prune_unreferenced {
-        if let Some(references) = current_catalog_references(paths, strict)? {
-            return prune_unreferenced_staging(&paths.staging, references).map_err(to_err);
+    let mut active_task_ids = HashSet::new();
+    if let Ok(store) = task_store(paths) {
+        if let Ok(summaries) = store.list_summaries() {
+            for summary in summaries {
+                if !matches!(
+                    summary.state,
+                    TaskState::Completed | TaskState::Canceled | TaskState::Failed
+                ) {
+                    active_task_ids.insert(summary.id);
+                }
+            }
         }
     }
-    cleanup_temporary_staging(&paths.staging).map_err(to_err)
+    let mut report = lios_core::cache::cleanup_all_inactive_staging(&paths.staging, &active_task_ids)
+        .map_err(to_err)?;
+    if prune_unreferenced {
+        if let Some(references) = current_catalog_references(paths, strict)? {
+            let prune_report = prune_unreferenced_staging(&paths.staging, references).map_err(to_err)?;
+            report.add(prune_report);
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -823,11 +839,11 @@ fn terminal_staging_cleanup_label(spec: &TaskSpec) -> Option<&'static str> {
     match spec {
         TaskSpec::VerifySpace { .. } => Some("verification"),
         TaskSpec::RebuildCatalog { .. } => Some("catalog rebuild"),
-        TaskSpec::Copy { .. }
-        | TaskSpec::Sync { .. }
-        | TaskSpec::Upload { .. }
-        | TaskSpec::Delete { .. }
-        | TaskSpec::Download { .. } => None,
+        TaskSpec::Copy { .. } => Some("copy"),
+        TaskSpec::Sync { .. } => Some("sync"),
+        TaskSpec::Upload { .. } => Some("upload"),
+        TaskSpec::Delete { .. } => Some("delete"),
+        TaskSpec::Download { .. } => Some("download"),
     }
 }
 
@@ -890,7 +906,15 @@ fn remove_scoped_staging_directory(
         }
     }
     match fs::remove_dir_all(&paths.staging) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if space_dir.exists() && fs::read_dir(&space_dir).map(|mut i| i.next().is_none()).unwrap_or(false) {
+                let _ = fs::remove_dir(&space_dir);
+            }
+            if account_dir.exists() && fs::read_dir(&account_dir).map(|mut i| i.next().is_none()).unwrap_or(false) {
+                let _ = fs::remove_dir(&account_dir);
+            }
+            Ok(())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(to_err(error)),
     }
@@ -945,6 +969,18 @@ fn cleanup_terminal_task_staging_after_restart(paths: &LiosPaths) -> lios_core::
         cleanup_terminal_task_staging_and_record(&task_paths, &spec, task.id)
             .map_err(|error| lios_core::LiosError::Storage(error.message))?;
     }
+    let mut active_ids = HashSet::new();
+    if let Ok(summaries) = store.list_summaries() {
+        for summary in summaries {
+            if !matches!(
+                summary.state,
+                TaskState::Completed | TaskState::Canceled | TaskState::Failed
+            ) {
+                active_ids.insert(summary.id);
+            }
+        }
+    }
+    let _ = lios_core::cache::cleanup_all_inactive_staging(&paths.staging, &active_ids);
     store.prune_terminal_history()
 }
 
@@ -1627,7 +1663,19 @@ fn set_chunk_size(
 #[tauri::command]
 fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandResult<()> {
     state.paths.ensure_dirs().map_err(to_err)?;
-    SpaceRegistry::new(state.paths.clone()).remove(&name)?;
+    let registry = SpaceRegistry::new(state.paths.clone());
+    if let Ok(repo) = registry.resolve(&name) {
+        let scope = TaskScope::from_repo(&repo);
+        let space_staging = state.paths.staging.join(&scope.account_id).join(&scope.space_id);
+        if space_staging.exists() {
+            let _ = fs::remove_dir_all(&space_staging);
+        }
+        let account_staging = state.paths.staging.join(&scope.account_id);
+        if account_staging.exists() && fs::read_dir(&account_staging).map(|mut i| i.next().is_none()).unwrap_or(false) {
+            let _ = fs::remove_dir(&account_staging);
+        }
+    }
+    registry.remove(&name)?;
     Ok(())
 }
 
@@ -3795,8 +3843,9 @@ mod remote_verification_tests {
 
     #[cfg(windows)]
     use super::cleanup_terminal_task_staging_and_record;
+    use uuid::Uuid;
     use super::{
-        append_task_warning, cleanup_terminal_task_staging,
+        append_task_warning, cleanup_current_staging_cache, cleanup_terminal_task_staging,
         cleanup_terminal_task_staging_after_restart_async, clear_task_record,
         ensure_verification_revision_unchanged, head_revision_with_cancellation,
         map_remote_integrity_error, validate_local_remote_file, verification_commit_id,
@@ -4100,6 +4149,86 @@ mod remote_verification_tests {
             .get(task.id)
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn clearing_terminal_download_removes_staging_before_the_record() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let spec = TaskSpec::Download {
+            account_id: "a".repeat(64),
+            space_id: "b".repeat(64),
+            repo: RepoConfig {
+                namespace: "novix".to_string(),
+                dataset: "cold".to_string(),
+                endpoint: "https://modelscope.cn".to_string(),
+            },
+            node_ids: vec!["node1".to_string()],
+            output_dir: temp.path().join("out"),
+        };
+        let task = TaskRecord::queued_for_spec(&spec);
+        let store = TaskStore::open(&paths.database).unwrap();
+        store.insert_with_spec(&task, &spec).unwrap();
+        store
+            .update_state(task.id, TaskState::Completed, None)
+            .unwrap();
+        let task_paths = paths
+            .for_task(spec.account_id(), spec.space_id(), task.id)
+            .unwrap();
+        task_paths.ensure_dirs().unwrap();
+        fs::write(task_paths.staging.join("chunk.lios"), b"downloaded").unwrap();
+
+        clear_task_record(&paths, &Mutex::new(TaskLifecycleState::default()), task.id)
+            .await
+            .unwrap();
+
+        assert!(!task_paths.staging.exists());
+        assert!(TaskStore::open(&paths.database)
+            .unwrap()
+            .get(task.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_current_staging_cache_removes_terminal_and_orphaned_task_staging() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let account_id = "a".repeat(64);
+        let space_id = "b".repeat(64);
+
+        let completed_id = Uuid::new_v4();
+        let orphaned_id = Uuid::new_v4();
+
+        let store = TaskStore::open(&paths.database).unwrap();
+        let mut completed_task = TaskRecord::queued("completed", 1);
+        completed_task.id = completed_id;
+        store.insert(&completed_task).unwrap();
+        store.update_state(completed_id, TaskState::Completed, None).unwrap();
+
+        let completed_staged = paths.staging
+            .join(&account_id)
+            .join(&space_id)
+            .join(completed_id.to_string())
+            .join("chunk.lios");
+        let orphaned_staged = paths.staging
+            .join(&account_id)
+            .join(&space_id)
+            .join(orphaned_id.to_string())
+            .join("chunk.lios");
+
+        fs::create_dir_all(completed_staged.parent().unwrap()).unwrap();
+        fs::create_dir_all(orphaned_staged.parent().unwrap()).unwrap();
+        fs::write(&completed_staged, b"completed 123").unwrap();
+        fs::write(&orphaned_staged, b"orphaned 456").unwrap();
+
+        let report = cleanup_current_staging_cache(&paths, false, false).unwrap();
+
+        assert!(!completed_staged.exists());
+        assert!(!orphaned_staged.exists());
+        assert_eq!(report.files_removed, 2);
+        assert_eq!(report.bytes_removed, b"completed 123".len() as u64 + b"orphaned 456".len() as u64);
     }
 
     #[tokio::test]

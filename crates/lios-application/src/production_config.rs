@@ -98,7 +98,6 @@ mod tests {
 
     use super::{
         configured_endpoint, persist_config, prepare_startup_config, validate_repo,
-        SetupWarningCode,
     };
     use crate::command_error::CommandErrorCode;
 

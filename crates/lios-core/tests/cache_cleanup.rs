@@ -60,3 +60,63 @@ fn prune_unreferenced_staging_preserves_catalog_and_referenced_objects() {
     assert_eq!(report.files_removed, 1);
     assert_eq!(report.bytes_removed, b"stale".len() as u64);
 }
+
+use std::collections::HashSet;
+use lios_core::cache::{cleanup_all_inactive_staging, cleanup_task_staging};
+use uuid::Uuid;
+
+#[test]
+fn cleanup_task_staging_removes_task_folder_and_empty_parents() {
+    let tmp = tempdir().unwrap();
+    let staging = tmp.path().join("staging");
+    let account_id = "a".repeat(64);
+    let space_id = "b".repeat(64);
+    let task_id = Uuid::new_v4();
+
+    let task_file = staging
+        .join(&account_id)
+        .join(&space_id)
+        .join(task_id.to_string())
+        .join("chunks/data.lios");
+    write_file(&task_file, b"staged data");
+
+    let report = cleanup_task_staging(&staging, &account_id, &space_id, task_id).unwrap();
+
+    assert!(!task_file.exists());
+    assert!(!staging.join(&account_id).exists());
+    assert_eq!(report.files_removed, 1);
+    assert_eq!(report.bytes_removed, b"staged data".len() as u64);
+}
+
+#[test]
+fn cleanup_all_inactive_staging_prunes_only_terminal_and_orphaned_tasks() {
+    let tmp = tempdir().unwrap();
+    let staging = tmp.path().join("staging");
+    let account_id = "a".repeat(64);
+    let space_id = "b".repeat(64);
+    let active_task_id = Uuid::new_v4();
+    let completed_task_id = Uuid::new_v4();
+
+    let active_file = staging
+        .join(&account_id)
+        .join(&space_id)
+        .join(active_task_id.to_string())
+        .join("chunks/active.lios");
+    let completed_file = staging
+        .join(&account_id)
+        .join(&space_id)
+        .join(completed_task_id.to_string())
+        .join("chunks/completed.lios");
+    write_file(&active_file, b"active");
+    write_file(&completed_file, b"completed chunk 12345");
+
+    let mut active_ids = HashSet::new();
+    active_ids.insert(active_task_id);
+
+    let report = cleanup_all_inactive_staging(&staging, &active_ids).unwrap();
+
+    assert!(active_file.exists());
+    assert!(!completed_file.exists());
+    assert_eq!(report.files_removed, 1);
+    assert_eq!(report.bytes_removed, b"completed chunk 12345".len() as u64);
+}

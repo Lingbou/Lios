@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::{LiosError, Result};
@@ -15,7 +16,7 @@ pub struct CacheCleanupReport {
 }
 
 impl CacheCleanupReport {
-    fn add(&mut self, other: CacheCleanupReport) {
+    pub fn add(&mut self, other: CacheCleanupReport) {
         self.files_removed += other.files_removed;
         self.dirs_removed += other.dirs_removed;
         self.bytes_removed += other.bytes_removed;
@@ -48,6 +49,136 @@ pub fn cleanup_temporary_staging(staging: impl AsRef<Path>) -> Result<CacheClean
     }
 
     Ok(report)
+}
+
+pub fn cleanup_task_staging(
+    staging_root: impl AsRef<Path>,
+    account_id: &str,
+    space_id: &str,
+    task_id: Uuid,
+) -> Result<CacheCleanupReport> {
+    let staging_root = staging_root.as_ref();
+    let task_staging = staging_root
+        .join(account_id)
+        .join(space_id)
+        .join(task_id.to_string());
+    let mut report = CacheCleanupReport::default();
+    if !task_staging.exists() {
+        return Ok(report);
+    }
+    report.add(remove_path_counting(&task_staging)?);
+    let space_dir = staging_root.join(account_id).join(space_id);
+    if space_dir.exists() && fs::read_dir(&space_dir).map(|mut iter| iter.next().is_none()).unwrap_or(false) {
+        let _ = fs::remove_dir(&space_dir);
+        report.dirs_removed += 1;
+    }
+    let account_dir = staging_root.join(account_id);
+    if account_dir.exists() && fs::read_dir(&account_dir).map(|mut iter| iter.next().is_none()).unwrap_or(false) {
+        let _ = fs::remove_dir(&account_dir);
+        report.dirs_removed += 1;
+    }
+    Ok(report)
+}
+
+pub fn cleanup_all_inactive_staging(
+    staging_root: impl AsRef<Path>,
+    active_task_ids: &HashSet<Uuid>,
+) -> Result<CacheCleanupReport> {
+    let staging_root = staging_root.as_ref();
+    let mut report = cleanup_temporary_staging(staging_root)?;
+    if !staging_root.exists() {
+        return Ok(report);
+    }
+
+    let entries = match fs::read_dir(staging_root) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(report),
+    };
+
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if !entry_path.is_dir() {
+            if let Ok(file_report) = remove_file_counting(&entry_path) {
+                report.add(file_report);
+            }
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if name == ".tmp" {
+            continue;
+        }
+
+        if !is_scope_hex(&name) {
+            if let Ok(dir_report) = remove_path_counting(&entry_path) {
+                report.add(dir_report);
+            }
+            continue;
+        }
+
+        let space_entries = match fs::read_dir(&entry_path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for space_entry in space_entries.flatten() {
+            let space_path = space_entry.path();
+            if !space_path.is_dir() {
+                if let Ok(file_report) = remove_file_counting(&space_path) {
+                    report.add(file_report);
+                }
+                continue;
+            }
+
+            let space_file_name = space_entry.file_name();
+            let space_name = space_file_name.to_string_lossy();
+            if !is_scope_hex(&space_name) {
+                if let Ok(dir_report) = remove_path_counting(&space_path) {
+                    report.add(dir_report);
+                }
+                continue;
+            }
+
+            let task_entries = match fs::read_dir(&space_path) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            for task_entry in task_entries.flatten() {
+                let task_path = task_entry.path();
+                let task_file_name = task_entry.file_name();
+                let task_name = task_file_name.to_string_lossy();
+                let is_active = match Uuid::parse_str(&task_name) {
+                    Ok(uuid) => active_task_ids.contains(&uuid),
+                    Err(_) => false,
+                };
+                if !is_active {
+                    if let Ok(task_report) = remove_path_counting(&task_path) {
+                        report.add(task_report);
+                    }
+                }
+            }
+
+            if fs::read_dir(&space_path).map(|mut iter| iter.next().is_none()).unwrap_or(false) {
+                if fs::remove_dir(&space_path).is_ok() {
+                    report.dirs_removed += 1;
+                }
+            }
+        }
+
+        if fs::read_dir(&entry_path).map(|mut iter| iter.next().is_none()).unwrap_or(false) {
+            if fs::remove_dir(&entry_path).is_ok() {
+                report.dirs_removed += 1;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn is_scope_hex(name: &str) -> bool {
+    name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 pub fn prune_unreferenced_staging(
@@ -115,33 +246,42 @@ fn safe_relative_path(path: &str) -> Result<PathBuf> {
     Ok(relative.to_path_buf())
 }
 
-fn remove_path_counting(path: &Path) -> Result<CacheCleanupReport> {
+pub fn remove_path_counting(path: &Path) -> Result<CacheCleanupReport> {
     let mut report = CacheCleanupReport::default();
+    if !path.exists() {
+        return Ok(report);
+    }
     if path.is_file() {
         return remove_file_counting(path);
     }
     if path.is_dir() {
         for entry in WalkDir::new(path).contents_first(true) {
             let entry = entry?;
-            if entry.file_type().is_file() {
+            if entry.file_type().is_dir() {
+                match fs::remove_dir(entry.path()) {
+                    Ok(()) => report.dirs_removed += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(LiosError::Io(error)),
+                }
+            } else {
                 report.add(remove_file_counting(entry.path())?);
-            } else if entry.file_type().is_dir() {
-                fs::remove_dir(entry.path())?;
-                report.dirs_removed += 1;
             }
         }
     }
     Ok(report)
 }
 
-fn remove_file_counting(path: &Path) -> Result<CacheCleanupReport> {
-    let bytes = fs::metadata(path)
+pub fn remove_file_counting(path: &Path) -> Result<CacheCleanupReport> {
+    let bytes = fs::symlink_metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    fs::remove_file(path)?;
-    Ok(CacheCleanupReport {
-        files_removed: 1,
-        dirs_removed: 0,
-        bytes_removed: bytes,
-    })
+    match fs::remove_file(path) {
+        Ok(()) => Ok(CacheCleanupReport {
+            files_removed: 1,
+            dirs_removed: 0,
+            bytes_removed: bytes,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(CacheCleanupReport::default()),
+        Err(error) => Err(LiosError::Io(error)),
+    }
 }

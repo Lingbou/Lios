@@ -254,6 +254,8 @@ impl Application {
             .map_err(to_err)?
             .set_transaction_state(task_id, TaskState::Running)
             .map_err(to_err)?;
+        let account_id = spec.account_id().to_string();
+        let space_id_str = spec.space_id().to_string();
         let result = self
             .execute_task_spec(&task_paths, &mut task, spec, &mut on_progress)
             .await;
@@ -268,6 +270,12 @@ impl Application {
                     )
                     .map_err(to_err)?;
                 store.complete_active_items(task_id).map_err(to_err)?;
+                let _ = lios_core::cache::cleanup_task_staging(
+                    &self.paths.staging,
+                    &account_id,
+                    &space_id_str,
+                    task_id,
+                );
                 Ok(TaskRunResult {
                     summary: summary_for(&self.paths, task_id)?,
                     notices,
@@ -357,6 +365,14 @@ impl Application {
             ));
         }
         self.task_manager.cancel(task_id).await;
+        if let Ok(Some(spec)) = store.load_spec(task_id) {
+            let _ = lios_core::cache::cleanup_task_staging(
+                &self.paths.staging,
+                spec.account_id(),
+                spec.space_id(),
+                task_id,
+            );
+        }
         summary_for(&self.paths, task_id)
     }
 
@@ -387,6 +403,19 @@ impl Application {
             return Err(CommandError::invalid_input(
                 "only terminal task records can be cleared",
             ));
+        }
+        let (account_id, space_id) = if let Ok(Some(spec)) = store.load_spec(task_id) {
+            (spec.account_id().to_string(), spec.space_id().to_string())
+        } else {
+            (summary.account_id.clone(), summary.space_id.clone())
+        };
+        if !account_id.is_empty() && !space_id.is_empty() {
+            let _ = lios_core::cache::cleanup_task_staging(
+                &self.paths.staging,
+                &account_id,
+                &space_id,
+                task_id,
+            );
         }
         store.delete(task_id).map_err(to_err)
     }
