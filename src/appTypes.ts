@@ -8,6 +8,7 @@ export type RepoConfig = {
   namespace: string;
   dataset: string;
   endpoint: string;
+  title?: string | null;
 };
 
 export type SpaceSummary = RepoConfig & {

@@ -3,9 +3,11 @@ import { AlertCircle, X } from "lucide-react";
 export interface CreateSpaceModalProps {
   open: boolean;
   name: string;
+  repoId: string;
   error: string;
   busy: boolean;
   onChangeName: (name: string) => void;
+  onChangeRepoId: (repoId: string) => void;
   onClose: () => void;
   onSubmit: () => void;
 }
@@ -13,25 +15,29 @@ export interface CreateSpaceModalProps {
 export function CreateSpaceModal({
   open,
   name,
+  repoId,
   error,
   busy,
   onChangeName,
+  onChangeRepoId,
   onClose,
   onSubmit
 }: CreateSpaceModalProps) {
   if (!open) return null;
 
-  const trimmed = name.trim();
-  const hasChinese = /[\u4e00-\u9fa5]/.test(trimmed);
-  const isInvalidFormat = Boolean(trimmed) && !/^[a-z][a-z0-9_-]{0,31}$/.test(trimmed);
+  const trimmedName = name.trim();
+  const trimmedRepoId = repoId.trim();
+  const isInvalidRepoId = Boolean(trimmedRepoId) && !/^[a-z][a-z0-9_-]{0,31}$/.test(trimmedRepoId);
 
   const displayError =
     error ||
-    (hasChinese
-      ? "空间名称不支持中文，由于 ModelScope 底层 Git 兼容性限制，必须使用纯小写英文标识"
-      : isInvalidFormat
-        ? "必须以小写英文字母开头，仅限小写英文、数字、_ 或 -，最长 32 字符"
-        : "");
+    (!trimmedName
+      ? ""
+      : !trimmedRepoId
+        ? "请输入远端仓库标识 (ID)"
+        : isInvalidRepoId
+          ? "仓库标识必须以小写英文开头，仅限小写英文、数字、_ 或 -，最长 32 字符"
+          : "");
 
   return (
     <div className="modalBackdrop">
@@ -52,14 +58,26 @@ export function CreateSpaceModal({
         </div>
         <div className="spaceModalBody">
           <label>
-            <span>空间名称 (英文标识)</span>
+            <span>空间名称 / 备注 (支持中文)</span>
             <input
               autoFocus
               value={name}
-              placeholder="例如 photos (仅限小写英文、数字、-、_)"
+              placeholder="例如：工作文档、照片备份、photos"
               onChange={(event) => onChangeName(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && trimmed && !isInvalidFormat && !busy) onSubmit();
+                if (event.key === "Enter" && trimmedName && trimmedRepoId && !isInvalidRepoId && !busy) onSubmit();
+                if (event.key === "Escape") onClose();
+              }}
+            />
+          </label>
+          <label>
+            <span>远端仓库 ID (ModelScope 英文标识)</span>
+            <input
+              value={repoId}
+              placeholder="例如：work_docs (仅限小写英文、数字、-、_)"
+              onChange={(event) => onChangeRepoId(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && trimmedName && trimmedRepoId && !isInvalidRepoId && !busy) onSubmit();
                 if (event.key === "Escape") onClose();
               }}
             />
@@ -79,7 +97,7 @@ export function CreateSpaceModal({
             type="button"
             className="primary"
             onClick={onSubmit}
-            disabled={!trimmed || Boolean(displayError) || busy}
+            disabled={!trimmedName || !trimmedRepoId || Boolean(displayError) || busy}
           >
             创建
           </button>

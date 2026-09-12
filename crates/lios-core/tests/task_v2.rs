@@ -11,6 +11,7 @@ fn repo() -> RepoConfig {
         namespace: "allen".to_string(),
         dataset: "photos".to_string(),
         endpoint: MODELSCOPE_ENDPOINT.to_string(),
+        title: None,
     }
 }
 

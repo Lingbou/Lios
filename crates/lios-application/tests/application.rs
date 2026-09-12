@@ -17,6 +17,7 @@ fn configured_application() -> (tempfile::TempDir, Application, LiosPaths, RepoC
         namespace: "novix".to_string(),
         dataset: "cold".to_string(),
         endpoint: MODELSCOPE_ENDPOINT.to_string(),
+        title: None,
     };
     config.spaces.insert("cold".to_string(), repo.clone());
     config.save(&paths.config).unwrap();

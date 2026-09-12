@@ -112,10 +112,10 @@ export function SpaceGrid({
                 >
                   <HardDrive aria-hidden />
                   <span>
-                    <strong>{space.dataset}</strong>
+                    <strong>{space.title || space.dataset}</strong>
                     <small>
-                      {space.namespace}
-                      {hasNonAscii && " · 不支持中文"}
+                      {space.namespace}/{space.dataset}
+                      {hasNonAscii && " · 远端含中文"}
                     </small>
                   </span>
 

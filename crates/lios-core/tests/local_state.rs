@@ -111,6 +111,7 @@ fn config_roundtrips_as_yaml_without_token_material() {
                 namespace: "novix".to_string(),
                 dataset: "cold-backup".to_string(),
                 endpoint: "https://www.modelscope.cn".to_string(),
+                title: None,
             },
         )]
         .into_iter()
@@ -606,6 +607,7 @@ fn task_store_summaries_report_retry_capability_without_failing_on_malformed_spe
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -748,6 +750,7 @@ fn task_store_lists_queued_summaries_with_specs_without_decoding_items() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -805,6 +808,7 @@ fn task_store_lists_startup_summaries_with_specs_using_direct_state_filtering() 
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -850,6 +854,7 @@ fn task_store_spec_summary_queries_skip_malformed_specs() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -1017,6 +1022,7 @@ fn task_store_persists_specs_items_checkpoints_and_content_index() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("album.bin")],
@@ -1205,6 +1211,7 @@ fn task_store_requeues_an_interrupted_active_task_without_restarting_completed_i
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -1282,6 +1289,7 @@ fn task_store_requeues_a_committing_task_for_safe_replay() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -1341,6 +1349,7 @@ fn task_store_completes_a_reconciled_commit_and_its_checkpoints() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -1409,6 +1418,7 @@ fn task_store_fails_a_reconciled_conflict_atomically_without_discarding_checkpoi
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -1525,6 +1535,7 @@ fn task_store_fails_later_queued_tasks_when_a_space_conflicts() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -1566,6 +1577,7 @@ fn task_store_rolls_back_submission_when_any_item_is_invalid() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("album.bin")],
@@ -1650,6 +1662,7 @@ fn task_store_schedules_automatic_retry_and_requeues_manual_retry() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("album.bin")],
@@ -1720,6 +1733,7 @@ fn task_store_does_not_requeue_failed_tasks_with_malformed_specs() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("album.bin")],
@@ -1824,6 +1838,7 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("source.bin")],
@@ -2001,6 +2016,7 @@ fn task_store_restart_recovery_can_be_scoped_to_one_locked_space() {
             namespace: "novix".to_string(),
             dataset: space_id.to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -2130,6 +2146,7 @@ fn task_store_lists_valid_queued_specs_and_claims_each_task_once() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         node_ids: vec!["node-a".to_string()],
     };
@@ -2211,6 +2228,7 @@ fn verify_task_labels_distinguish_quick_and_full_checks() {
         namespace: "novix".to_string(),
         dataset: "archive".to_string(),
         endpoint: "https://modelscope.cn".to_string(),
+        title: None,
     };
     let quick = TaskSpec::VerifySpace {
         account_id: "account".to_string(),
@@ -2238,6 +2256,7 @@ fn rebuild_task_spec_roundtrips_the_confirmed_revision() {
             namespace: "novix".to_string(),
             dataset: "archive".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         expected_revision: Some("commit-123".to_string()),
     };
@@ -2287,6 +2306,7 @@ fn upload_task_spec_roundtrips_the_persisted_source_snapshot() {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         },
         parent_node_id: "root".to_string(),
         source_paths: vec!["C:/source".into()],

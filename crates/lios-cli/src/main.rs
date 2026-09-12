@@ -1467,6 +1467,7 @@ async fn run_space(
                 namespace,
                 dataset: dataset.unwrap_or_else(|| name.clone()),
                 endpoint,
+                title: None,
             })?;
             registry.ensure_can_add(&name, &repo)?;
             application.create_dataset_repo(repo.clone()).await?;

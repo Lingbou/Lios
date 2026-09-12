@@ -363,6 +363,7 @@ function App() {
   const [manualEndpoint, setManualEndpoint] = useState("https://modelscope.cn");
   const [createSpaceOpen, setCreateSpaceOpen] = useState(false);
   const [newSpaceName, setNewSpaceName] = useState("");
+  const [newSpaceRepoId, setNewSpaceRepoId] = useState("");
   const [createSpaceError, setCreateSpaceError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState("");
@@ -469,7 +470,7 @@ function App() {
 
   const rawCrumbs = breadcrumb(catalogTree, currentFolderId);
   const crumbs = rawCrumbs.map((crumb, index) =>
-    index === 0 && !crumb.name ? { ...crumb, name: activeSpace?.dataset ?? "根目录" } : crumb
+    index === 0 && !crumb.name ? { ...crumb, name: (activeSpace?.title || activeSpace?.dataset) ?? "根目录" } : crumb
   );
   const crumbPaths = crumbs.map((_crumb, index) =>
     crumbs
@@ -502,7 +503,7 @@ function App() {
     view === "spaces"
       ? accountName
       : activeSpace
-        ? activeSpace.dataset
+        ? (activeSpace.title || activeSpace.dataset)
         : emptyDriveMode === "create"
           ? "创建一个空间"
           : emptyDriveMode === "connect"
@@ -1398,18 +1399,24 @@ function App() {
     }
     setCreateSpaceError("");
     setNewSpaceName("");
+    setNewSpaceRepoId("");
     setCreateSpaceOpen(true);
   }
 
   async function submitCreateSpace() {
     if (!modelscopeUser?.username) return;
-    const trimmed = newSpaceName.trim();
-    if (!trimmed) {
-      setCreateSpaceError("输入空间名称");
+    const nameTrimmed = newSpaceName.trim();
+    const repoIdTrimmed = newSpaceRepoId.trim();
+    if (!nameTrimmed) {
+      setCreateSpaceError("请输入空间名称");
       return;
     }
-    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(trimmed)) {
-      setCreateSpaceError("Space Name 必须以小写字母开头，只能包含小写字母、数字、_ 和 -，最长 32 个字符");
+    if (!repoIdTrimmed) {
+      setCreateSpaceError("请输入远端仓库标识 (ID)");
+      return;
+    }
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(repoIdTrimmed)) {
+      setCreateSpaceError("仓库标识必须以小写英文字母开头，只能包含小写英文、数字、_ 或 -，最长 32 字符");
       return;
     }
     setBusy("创建空间");
@@ -1417,15 +1424,17 @@ function App() {
     setCreateSpaceError("");
     try {
       await appInvoke("create_dataset_repo", {
-        name: trimmed,
+        name: repoIdTrimmed,
+        title: nameTrimmed !== repoIdTrimmed ? nameTrimmed : null,
         namespace: modelscopeUser.username,
-        dataset: trimmed,
+        dataset: repoIdTrimmed,
         endpoint: manualEndpoint
       });
-      globalThis.localStorage?.setItem("lios.lastSpaceName", trimmed);
+      globalThis.localStorage?.setItem("lios.lastSpaceName", repoIdTrimmed);
       const scopedSpace = await refreshSetup(true);
       setCreateSpaceOpen(false);
       setNewSpaceName("");
+      setNewSpaceRepoId("");
       if (scopedSpace) await loadSpace(scopedSpace);
     } catch (error) {
       const text = errorText(error);
@@ -1825,7 +1834,7 @@ function App() {
               >
                 <DragDropOverlay
                   isDragging={isDragging}
-                  targetDirName={currentFolder?.name || activeSpace?.dataset}
+                  targetDirName={currentFolder?.name || activeSpace?.title || activeSpace?.dataset}
                 />
 
                 {!activeSpace ? (
@@ -1868,7 +1877,7 @@ function App() {
                 ) : catalogStatus === "missing" ? (
                   <div className="emptyDrive">
                     <HardDrive aria-hidden />
-                    <h2>{activeSpace.dataset}</h2>
+                    <h2>{activeSpace.title || activeSpace.dataset}</h2>
                     <button
                       className="primary"
                       onClick={initializeActiveSpace}
@@ -1979,10 +1988,21 @@ function App() {
         <CreateSpaceModal
           open={createSpaceOpen}
           name={newSpaceName}
+          repoId={newSpaceRepoId}
           error={createSpaceError}
           busy={busy !== null}
           onChangeName={(val) => {
             setNewSpaceName(val);
+            setCreateSpaceError("");
+            if (/^[a-z0-9_-]+$/i.test(val.trim())) {
+              const clean = val.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_").slice(0, 32);
+              if (/^[a-z]/.test(clean)) {
+                setNewSpaceRepoId(clean);
+              }
+            }
+          }}
+          onChangeRepoId={(val) => {
+            setNewSpaceRepoId(val);
             setCreateSpaceError("");
           }}
           onClose={() => {

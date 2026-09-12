@@ -56,10 +56,12 @@ pub fn validate_repo(repo: RepoConfig) -> Result<RepoConfig, CommandError> {
     }
     validate_repo_identifier(namespace, "namespace")?;
     validate_repo_identifier(dataset, "dataset")?;
+    let title = repo.title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
     Ok(RepoConfig {
         namespace: namespace.to_string(),
         dataset: dataset.to_string(),
         endpoint: validate_modelscope_production_endpoint(&repo.endpoint)?,
+        title,
     })
 }
 
@@ -117,6 +119,7 @@ mod tests {
             namespace: "novix".to_string(),
             dataset: "测试上传".to_string(),
             endpoint: "https://www.modelscope.cn/".to_string(),
+            title: None,
         })
         .unwrap_err();
         assert_eq!(error.code, CommandErrorCode::InvalidInput);
@@ -129,6 +132,7 @@ mod tests {
             namespace: " novix ".to_string(),
             dataset: " cold ".to_string(),
             endpoint: "https://www.modelscope.cn/".to_string(),
+            title: None,
         })
         .unwrap();
 
@@ -154,6 +158,7 @@ mod tests {
                 namespace: "novix".to_string(),
                 dataset: "cold".to_string(),
                 endpoint: "http://127.0.0.1:12345".to_string(),
+                title: None,
             },
         );
         config.save(&paths.config).unwrap();

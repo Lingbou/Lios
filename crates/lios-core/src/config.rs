@@ -74,6 +74,8 @@ pub struct RepoConfig {
     pub namespace: String,
     pub dataset: String,
     pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -524,6 +524,7 @@ mod tests {
             namespace: namespace.to_string(),
             dataset: dataset.to_string(),
             endpoint: MODELSCOPE_ENDPOINT.to_string(),
+            title: None,
         }
     }
 

@@ -305,6 +305,7 @@ pub fn parse_repository_address(
         namespace: namespace.to_string(),
         dataset: dataset.to_string(),
         endpoint,
+        title: None,
     })
 }
 

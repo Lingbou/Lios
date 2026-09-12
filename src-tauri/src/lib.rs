@@ -139,6 +139,7 @@ struct SetupSnapshot {
 #[derive(Serialize)]
 struct RegisteredSpaceDto {
     space_name: String,
+    title: Option<String>,
     namespace: String,
     dataset: String,
     endpoint: String,
@@ -150,6 +151,7 @@ impl RegisteredSpaceDto {
         let task_space_id = TaskScope::from_repo(&repo).space_id;
         Self {
             space_name,
+            title: repo.title,
             namespace: repo.namespace,
             dataset: repo.dataset,
             endpoint: repo.endpoint,
@@ -197,6 +199,7 @@ impl From<DatasetRepoSummary> for DatasetRepoSummaryDto {
             namespace: repo.namespace.clone(),
             dataset: repo.dataset.clone(),
             endpoint: repo.endpoint.clone(),
+            title: None,
         })
         .space_id;
         Self {
@@ -1615,6 +1618,7 @@ fn setup_token(state: tauri::State<'_, AppContext>, token: String) -> CommandRes
 async fn create_dataset_repo(
     state: tauri::State<'_, AppContext>,
     name: String,
+    title: Option<String>,
     namespace: String,
     dataset: String,
     endpoint: String,
@@ -1624,6 +1628,7 @@ async fn create_dataset_repo(
         namespace,
         dataset,
         endpoint,
+        title,
     })?;
     let application = Application::new(state.paths.clone())?;
     application.create_dataset_repo(repo.clone()).await?;
@@ -1683,6 +1688,7 @@ fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandRes
 fn register_space(
     state: tauri::State<'_, AppContext>,
     name: String,
+    title: Option<String>,
     namespace: String,
     dataset: String,
     endpoint: Option<String>,
@@ -1694,6 +1700,7 @@ fn register_space(
         namespace,
         dataset,
         endpoint,
+        title,
     })?;
     SpaceRegistry::new(state.paths.clone()).add(&name, repo)?;
     Ok(())
@@ -2694,6 +2701,7 @@ mod task_center_backend_tests {
                 namespace: "novix".to_string(),
                 dataset: "safe-summary".to_string(),
                 endpoint: "https://modelscope.cn".to_string(),
+                title: None,
             },
             parent_node_id: "root".to_string(),
             source_paths: vec![sentinel.clone()],
@@ -2893,6 +2901,7 @@ mod task_center_backend_tests {
                 namespace: "novix".to_string(),
                 dataset: "cold".to_string(),
                 endpoint: "https://modelscope.cn".to_string(),
+                title: None,
             },
             node_ids: vec!["node-a".to_string()],
         };
@@ -2942,6 +2951,7 @@ mod task_center_backend_tests {
                 namespace: "novix".to_string(),
                 dataset: "cold".to_string(),
                 endpoint: "https://modelscope.cn".to_string(),
+                title: None,
             },
             node_ids: vec!["node-a".to_string()],
         };
@@ -3257,6 +3267,7 @@ mod task_cleanup_tests {
                 namespace: "novix".to_string(),
                 dataset: "cold".to_string(),
                 endpoint: "https://modelscope.cn".to_string(),
+                title: None,
             },
             node_ids: vec!["node-a".to_string()],
         };
@@ -3860,6 +3871,7 @@ mod remote_verification_tests {
                 namespace: "novix".to_string(),
                 dataset: "cold".to_string(),
                 endpoint: "https://modelscope.cn".to_string(),
+                title: None,
             },
             full: true,
         }
@@ -3873,6 +3885,7 @@ mod remote_verification_tests {
                 namespace: "novix".to_string(),
                 dataset: "cold".to_string(),
                 endpoint: "https://modelscope.cn".to_string(),
+                title: None,
             },
             expected_revision: Some("preview-revision".to_string()),
         }
@@ -3914,6 +3927,7 @@ mod remote_verification_tests {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         };
         let cancellation = CancellationToken::new();
         cancellation.cancel();
@@ -4162,6 +4176,7 @@ mod remote_verification_tests {
                 namespace: "novix".to_string(),
                 dataset: "cold".to_string(),
                 endpoint: "https://modelscope.cn".to_string(),
+                title: None,
             },
             node_ids: vec!["node1".to_string()],
             output_dir: temp.path().join("out"),
@@ -4542,6 +4557,7 @@ mod recovery_key_service_tests {
             namespace: "novix".to_string(),
             dataset: "archive".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         }
     }
 
@@ -4713,6 +4729,7 @@ mod recovery_key_service_tests {
             namespace: "novix".to_string(),
             dataset: "other-space".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         };
         let config_path = paths.config.clone();
         let concurrent_key_for_action = concurrent_key_path.clone();
@@ -4780,6 +4797,7 @@ mod recovery_key_service_tests {
             namespace: "novix".to_string(),
             dataset: "gate-winner".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         };
 
         let (gate_held_tx, gate_held_rx) = std::sync::mpsc::channel();

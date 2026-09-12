@@ -841,6 +841,7 @@ mod tests {
             namespace: "novix".to_string(),
             dataset: "cold-backup".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         };
         let scope = TaskScope::from_repo(&repo);
         assert_eq!(scope, TaskScope::from_repo(&repo));
@@ -878,6 +879,7 @@ mod tests {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         };
         let scope = TaskScope::from_repo(&repo);
         let source_path = temp.path().join("album.bin");
@@ -934,6 +936,7 @@ mod tests {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         };
         let scope = TaskScope::from_repo(&repo);
         let spec = TaskSpec::Upload {
@@ -972,6 +975,7 @@ mod tests {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         };
         let scope = TaskScope::from_repo(&repo);
         let spec = TaskSpec::Upload {
@@ -1077,6 +1081,7 @@ mod tests {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         };
         let scope = TaskScope::from_repo(&repo);
         let spec = TaskSpec::Upload {
@@ -1138,6 +1143,7 @@ mod tests {
             namespace: "novix".to_string(),
             dataset: "cold".to_string(),
             endpoint: "https://modelscope.cn".to_string(),
+            title: None,
         };
         let scope = TaskScope::from_repo(&repo);
         let spec = TaskSpec::Upload {

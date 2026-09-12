@@ -53,6 +53,7 @@ fn copy_submission_persists_every_planned_action_as_a_journal_item() {
                 namespace: "allen".to_string(),
                 dataset: "photos".to_string(),
                 endpoint: MODELSCOPE_ENDPOINT.to_string(),
+                title: None,
             },
             plan,
         )
