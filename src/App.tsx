@@ -315,6 +315,9 @@ async function appInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
   if (command === "register_space") {
     return null as T;
   }
+  if (command === "set_chunk_size") {
+    return null as T;
+  }
   if (command === "preview_file_node") {
     return {
       name: "document.md",
@@ -408,6 +411,8 @@ function App() {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewContent, setPreviewContent] = useState<FilePreviewContent | null>(null);
 
+
+
   const currentFolder = findNode(catalogTree, currentFolderId);
   const children =
     currentFolder?.kind.type === "Directory" ? currentFolder.kind.children.map(treeToDriveItem) : [];
@@ -442,6 +447,22 @@ function App() {
     });
     return items;
   }, [visibleItems, sortField, sortDirection]);
+
+  const previewableFiles = useMemo(
+    () => sortedItems.filter((i) => i.kind === "File"),
+    [sortedItems]
+  );
+  const previewIndex = previewItem
+    ? previewableFiles.findIndex((i) => i.id === previewItem.id)
+    : -1;
+  const hasPrevPreview = previewIndex > 0;
+  const hasNextPreview = previewIndex >= 0 && previewIndex < previewableFiles.length - 1;
+  const handlePrevPreview = () => {
+    if (hasPrevPreview) void openFilePreview(previewableFiles[previewIndex - 1]);
+  };
+  const handleNextPreview = () => {
+    if (hasNextPreview) void openFilePreview(previewableFiles[previewIndex + 1]);
+  };
 
   const rawCrumbs = breadcrumb(catalogTree, currentFolderId);
   const crumbs = rawCrumbs.map((crumb, index) =>
@@ -1643,6 +1664,33 @@ function App() {
               <div className="settingsBlock">
                 <div className="settingsHeaderRow">
                   <div>
+                    <h2>传输分块</h2>
+                    <p>设置大文件上传的分块大小（弱网环境下建议使用较小分块以提升断点重传成功率）</p>
+                  </div>
+                  <select
+                    value={snapshot?.config.chunk_size ?? 134217728}
+                    onChange={async (event) => {
+                      const size = Number(event.target.value);
+                      try {
+                        await appInvoke("set_chunk_size", { chunkSizeBytes: size });
+                        await refreshSetup(false);
+                      } catch (error) {
+                        setMessage(errorText(error));
+                      }
+                    }}
+                    disabled={busy !== null || activeTasks > 0}
+                  >
+                    <option value={16777216}>16 MB (弱网快速重传)</option>
+                    <option value={33554432}>32 MB (推荐 / 均衡)</option>
+                    <option value={67108864}>64 MB (高速网络)</option>
+                    <option value={134217728}>128 MB (超大单块)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="settingsBlock">
+                <div className="settingsHeaderRow">
+                  <div>
                     <h2>本地状态</h2>
                   </div>
                   <button onClick={cleanupLocalCache} disabled={busy !== null || activeTasks > 0}>
@@ -1905,6 +1953,10 @@ function App() {
           loading={previewLoading}
           error={previewError}
           content={previewContent}
+          hasPrev={hasPrevPreview}
+          hasNext={hasNextPreview}
+          onPrev={handlePrevPreview}
+          onNext={handleNextPreview}
           onClose={() => {
             setPreviewOpen(false);
             setPreviewItem(null);

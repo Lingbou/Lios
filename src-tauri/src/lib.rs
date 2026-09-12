@@ -1607,6 +1607,24 @@ async fn create_dataset_repo(
 }
 
 #[tauri::command]
+fn set_chunk_size(
+    state: tauri::State<'_, AppContext>,
+    chunk_size_bytes: Option<usize>,
+) -> CommandResult<()> {
+    state.paths.ensure_dirs().map_err(to_err)?;
+    let _lock = state.paths.try_lock_config().map_err(CommandError::from)?;
+    let mut config = load_config(&state.paths)?;
+    if let Some(size) = chunk_size_bytes {
+        if !(4 * 1024 * 1024..=256 * 1024 * 1024).contains(&size) {
+            return Err(CommandError::invalid_input("chunk size must be between 4MB and 256MB"));
+        }
+    }
+    config.chunk_size = chunk_size_bytes;
+    config.save(&state.paths.config).map_err(to_err)?;
+    Ok(())
+}
+
+#[tauri::command]
 fn register_space(
     state: tauri::State<'_, AppContext>,
     name: String,

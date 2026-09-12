@@ -2417,3 +2417,42 @@ select:focus {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+.previewModalBody {
+  position: relative;
+}
+
+.previewNavBtn {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 10;
+  width: 40px;
+  height: 40px;
+  min-height: auto;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid var(--line);
+  box-shadow: 0 4px 12px rgba(185, 92, 136, 0.16);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  color: var(--ink);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.previewNavBtn:hover {
+  background: var(--surface-strong);
+  color: var(--pink-strong);
+  transform: translateY(-50%) scale(1.06);
+}
+
+.previewNavBtn.prev {
+  left: 16px;
+}
+
+.previewNavBtn.next {
+  right: 16px;
+}
