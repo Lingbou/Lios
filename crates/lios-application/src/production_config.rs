@@ -33,12 +33,30 @@ pub fn configured_endpoint(
     validate_modelscope_production_endpoint(&endpoint).map_err(Into::into)
 }
 
+pub fn validate_repo_identifier(name: &str, field: &'static str) -> Result<(), CommandError> {
+    if name.is_empty() {
+        return Err(CommandError::invalid_input(format!("{field} cannot be empty")));
+    }
+    if !name.is_ascii()
+        || name
+            .chars()
+            .any(|c| c.is_ascii_whitespace() || c == '/' || c == '\\' || c.is_ascii_control())
+    {
+        return Err(CommandError::invalid_input(format!(
+            "{field} `{name}` contains invalid or non-ASCII characters; ModelScope datasets must use ASCII letters, numbers, hyphens, and underscores (Chinese characters are not supported by ModelScope Git endpoints)"
+        )));
+    }
+    Ok(())
+}
+
 pub fn validate_repo(repo: RepoConfig) -> Result<RepoConfig, CommandError> {
     let namespace = repo.namespace.trim();
     let dataset = repo.dataset.trim();
     if namespace.is_empty() || dataset.is_empty() {
         return Err(CommandError::invalid_input("dataset repo is incomplete"));
     }
+    validate_repo_identifier(namespace, "namespace")?;
+    validate_repo_identifier(dataset, "dataset")?;
     Ok(RepoConfig {
         namespace: namespace.to_string(),
         dataset: dataset.to_string(),
@@ -142,6 +160,18 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_non_ascii_dataset_name() {
+        let error = validate_repo(RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "测试上传".to_string(),
+            endpoint: "https://www.modelscope.cn/".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(error.code, CommandErrorCode::InvalidInput);
+        assert!(error.message.contains("non-ASCII"));
     }
 
     #[test]

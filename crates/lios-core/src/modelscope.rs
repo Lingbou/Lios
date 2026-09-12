@@ -571,6 +571,9 @@ impl StorageAdapter for ModelScopeAdapter {
                 .send()
                 .await
                 .map_err(Self::network_error)?;
+            if response.status() == StatusCode::NOT_FOUND && page_number == 1 {
+                return Ok(Vec::new());
+            }
             let data = Self::json_data(response).await?;
             let files = data
                 .as_array()

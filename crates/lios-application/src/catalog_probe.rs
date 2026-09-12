@@ -50,6 +50,15 @@ pub fn map_catalog_load_error(error: LiosError) -> CommandError {
                 "status": remote.status,
             })),
         ),
+        LiosError::Remote(remote) if remote.status == Some(500) => CommandError::new(
+            CommandErrorCode::RemoteServer,
+            "remote ModelScope repository returned a 500 server error; the repository may have failed initial creation on ModelScope or is corrupt",
+            false,
+            Some(serde_json::json!({
+                "kind": remote.kind,
+                "status": remote.status,
+            })),
+        ),
         error => error.into(),
     }
 }

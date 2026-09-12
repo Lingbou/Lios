@@ -1866,3 +1866,434 @@ select:focus {
     grid-template-columns: 1fr;
   }
 }
+
+/* --- New UI Enhancement Styles --- */
+
+.contextMenu {
+  position: fixed;
+  z-index: 100;
+  min-width: 180px;
+  background: var(--surface-strong);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(185, 92, 136, 0.22);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: menuFadeIn 0.12s ease-out;
+}
+
+@keyframes menuFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.contextMenuHeader {
+  padding: 6px 10px 4px;
+  font-size: 11px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 4px;
+}
+
+.contextMenuTargetName {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.contextMenuItem {
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
+}
+
+.contextMenuItem:hover {
+  background: var(--pink-weak);
+  color: var(--pink-strong);
+}
+
+.contextMenuItem.danger {
+  color: var(--danger);
+}
+
+.contextMenuItem.danger:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.contextMenuDivider {
+  height: 1px;
+  background: var(--line);
+  margin: 4px 0;
+}
+
+.crumbRootBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid transparent;
+}
+
+.crumbRootBtn:hover {
+  color: var(--pink-strong);
+  background: var(--pink-weak);
+}
+
+.crumbSeparator {
+  color: var(--muted);
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.toolbarDivider {
+  width: 1px;
+  height: 24px;
+  background: var(--line);
+  margin: 0 4px;
+}
+
+.selectionBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--pink-weak);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+
+.clearSelectionBtn {
+  min-height: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--pink-strong);
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.viewModeSegment {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface-strong);
+}
+
+.viewModeBtn {
+  min-height: 32px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+.viewModeBtn.active {
+  background: var(--pink-weak);
+  color: var(--pink-strong);
+  font-weight: 600;
+}
+
+.fileTableContainer {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+}
+
+.fileTable th.sortableCol {
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s ease;
+}
+
+.fileTable th.sortableCol:hover {
+  background: var(--pink-weak);
+  color: var(--pink-strong);
+}
+
+.sortIndicator {
+  width: 14px;
+  height: 14px;
+  margin-left: 4px;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.fileRow {
+  cursor: pointer;
+  user-select: none;
+}
+
+.fileRow:hover {
+  background: rgba(255, 240, 247, 0.5);
+}
+
+.fileRow.selected {
+  background: var(--pink-weak);
+}
+
+.selectCol {
+  width: 42px;
+  text-align: center;
+}
+
+.nameCol {
+  min-width: 200px;
+}
+
+.itemIcon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.itemIcon.folderIcon {
+  color: #df8a28;
+}
+
+.itemIcon.fileIcon {
+  color: #6b8299;
+}
+
+.fileGridContainer {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  padding: 16px;
+}
+
+.fileGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 12px;
+}
+
+.fileGridCard {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-strong);
+  padding: 12px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.fileGridCard:hover {
+  border-color: var(--pink);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(185, 92, 136, 0.12);
+}
+
+.fileGridCard.selected {
+  border-color: var(--pink-strong);
+  background: var(--pink-weak);
+  box-shadow: 0 4px 12px rgba(185, 92, 136, 0.18);
+}
+
+.cardCheckbox {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.fileGridCard:hover .cardCheckbox,
+.fileGridCard.selected .cardCheckbox {
+  opacity: 1;
+}
+
+.cardIconWrapper {
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
+  margin-bottom: 8px;
+}
+
+.gridItemIcon {
+  width: 44px;
+  height: 44px;
+}
+
+.gridItemIcon.folderIcon {
+  color: #df8a28;
+}
+
+.gridItemIcon.fileIcon {
+  color: #6b8299;
+}
+
+.fileIconContainer {
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
+.fileExtBadge {
+  position: absolute;
+  bottom: 2px;
+  font-size: 9px;
+  font-weight: 700;
+  color: #ffffff;
+  background: var(--pink-strong);
+  border-radius: 3px;
+  padding: 1px 3px;
+  text-transform: uppercase;
+}
+
+.cardDetails {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.cardTitle {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cardSubtitle {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.dragDropOverlay {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  background: rgba(255, 246, 251, 0.88);
+  backdrop-filter: blur(4px);
+  display: grid;
+  place-items: center;
+  border: 3px dashed var(--pink-strong);
+  border-radius: 8px;
+  margin: 8px;
+  pointer-events: none;
+  animation: dragPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes dragPulse {
+  0%, 100% {
+    opacity: 0.92;
+  }
+  50% {
+    opacity: 0.65;
+  }
+}
+
+.dragDropCard {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  color: var(--pink-strong);
+  font-size: 15px;
+}
+
+.dragDropIcon {
+  width: 52px;
+  height: 52px;
+  animation: floatIcon 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes floatIcon {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(-6px);
+  }
+}
+
+.conflictBulkBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: var(--pink-weak);
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.bulkButtons {
+  display: flex;
+  gap: 6px;
+}
+
+.bulkActionBtn {
+  min-height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.spaceCard.unsupportedCard {
+  opacity: 0.75;
+  border-style: dashed;
+  border-color: var(--line-strong);
+}
+
+.spaceCard.unsupportedCard:hover {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.unsupportedIcon {
+  width: 18px;
+  height: 18px;
+  color: var(--danger);
+  flex-shrink: 0;
+}
+
+.fieldErrorIcon {
+  width: 14px;
+  height: 14px;
+  color: var(--danger);
+  flex-shrink: 0;
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 4px;
+}

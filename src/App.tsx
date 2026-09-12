@@ -1,21 +1,16 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AlertTriangle,
-  CheckCircle2,
   ChevronRight,
-  Cloud,
   Download,
-  Edit3,
-  File,
-  Folder,
   FolderOpen,
   HardDrive,
   KeyRound,
   Minus,
-  Plus,
   RefreshCw,
   Search,
   Settings,
@@ -25,7 +20,7 @@ import {
   UploadCloud,
   X
 } from "lucide-react";
-import { type MouseEvent, useCallback, useEffect, useRef, useState } from "react";
+import { type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import liosPetalMark from "./assets/lios-petal-mark.svg";
 import type {
   CacheCleanupReport,
@@ -52,12 +47,9 @@ import { errorText } from "./commandError.ts";
 import { AboutSection } from "./features/settings/AboutSection.tsx";
 import {
   breadcrumb,
-  CatalogRecoveryTree,
   displayPath,
   findNode,
-  formatBytes,
   formatCacheBytes,
-  formatDate,
   sameSpace,
   treeToDriveItem
 } from "./features/catalog/catalogPresentation.tsx";
@@ -72,11 +64,27 @@ import { useTasks } from "./features/tasks/useTasks.ts";
 import {
   conciseRecoveryKeyPath,
   recoveryKeyBackupText,
-  recoveryKeyConfirmationText,
   type RecoveryKeyStatus,
   type RecoveryKeyVerification
 } from "./recoveryKeyPresentation.ts";
 import { setupWarningMessage } from "./setupWarning.ts";
+
+import { ConflictModal } from "./features/drive/ConflictModal.tsx";
+import { ContextMenu } from "./features/drive/ContextMenu.tsx";
+import { DragDropOverlay } from "./features/drive/DragDropOverlay.tsx";
+import { DriveToolbar } from "./features/drive/DriveToolbar.tsx";
+import { FileGrid } from "./features/drive/FileGrid.tsx";
+import { FileTable } from "./features/drive/FileTable.tsx";
+import type {
+  ContextMenuState,
+  SortDirection,
+  SortField,
+  ViewMode
+} from "./features/drive/driveTypes.ts";
+import { CreateSpaceModal } from "./features/spaces/CreateSpaceModal.tsx";
+import { SpaceGrid } from "./features/spaces/SpaceGrid.tsx";
+import { RebuildCatalogModal } from "./features/catalog/RebuildCatalogModal.tsx";
+import { ImportKeyModal } from "./features/recoveryKey/ImportKeyModal.tsx";
 
 type InvokeArgs = Record<string, unknown>;
 
@@ -92,29 +100,178 @@ function hasTauriRuntime() {
   return Boolean(runtime.isTauri || runtime.__TAURI_INTERNALS__?.invoke);
 }
 
+function previewTree(): CatalogTreeNode {
+  return {
+    id: "root-dir",
+    name: "",
+    updated_at: "2026-09-12T10:00:00Z",
+    kind: {
+      type: "Directory",
+      children: [
+        {
+          id: "dir-docs",
+          name: "Documents",
+          updated_at: "2026-09-10T14:30:00Z",
+          kind: {
+            type: "Directory",
+            children: [
+              {
+                id: "file-spec",
+                name: "architecture_spec.pdf",
+                updated_at: "2026-09-10T14:28:00Z",
+                kind: {
+                  type: "File",
+                  original_size: 2457600,
+                  sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  object_id: "obj-1",
+                  chunk_count: 2
+                }
+              },
+              {
+                id: "file-notes",
+                name: "release_notes.md",
+                updated_at: "2026-09-09T18:12:00Z",
+                kind: {
+                  type: "File",
+                  original_size: 14280,
+                  sha256: "d41d8cd98f00b204e9800998ecf8427e",
+                  object_id: "obj-2",
+                  chunk_count: 1
+                }
+              }
+            ]
+          }
+        },
+        {
+          id: "dir-photos",
+          name: "Photos",
+          updated_at: "2026-09-08T09:15:00Z",
+          kind: {
+            type: "Directory",
+            children: [
+              {
+                id: "file-img1",
+                name: "sunset_lake.png",
+                updated_at: "2026-09-08T09:10:00Z",
+                kind: {
+                  type: "File",
+                  original_size: 4892100,
+                  sha256: "abc123",
+                  object_id: "obj-3",
+                  chunk_count: 4
+                }
+              },
+              {
+                id: "file-img2",
+                name: "mountain_peak.jpg",
+                updated_at: "2026-09-07T16:45:00Z",
+                kind: {
+                  type: "File",
+                  original_size: 3200150,
+                  sha256: "def456",
+                  object_id: "obj-4",
+                  chunk_count: 3
+                }
+              }
+            ]
+          }
+        },
+        {
+          id: "file-data",
+          name: "dataset_manifest.json",
+          updated_at: "2026-09-11T20:00:00Z",
+          kind: {
+            type: "File",
+            original_size: 89420,
+            sha256: "789ghi",
+            object_id: "obj-5",
+            chunk_count: 1
+          }
+        },
+        {
+          id: "file-archive",
+          name: "training_checkpoint.tar.gz",
+          updated_at: "2026-09-05T11:20:00Z",
+          kind: {
+            type: "File",
+            original_size: 145892000,
+            sha256: "jkl012",
+            object_id: "obj-6",
+            chunk_count: 12
+          }
+        }
+      ]
+    }
+  };
+}
+
 function previewSnapshot(): Snapshot {
   return {
     paths: {
-      home: "~\\.lios",
-      config: "~\\.lios\\config.yaml",
-      database: "~\\.lios\\lios.db",
-      staging: "~\\.lios\\staging",
-      logs: "~\\.lios\\logs",
-      credentials: "~\\.lios\\credentials.enc"
+      home: "~/.lios",
+      config: "~/.lios/config.yaml",
+      database: "~/.lios/lios.db",
+      staging: "~/.lios/staging",
+      logs: "~/.lios/logs",
+      credentials: "~/.lios/credentials.enc"
     },
     config: {
       schema_version: 2,
-      spaces: {},
-      key_file_path: "~\\.lios\\recovery.key",
+      spaces: {
+        photos: {
+          namespace: "lingbou",
+          dataset: "photos",
+          endpoint: "https://modelscope.cn"
+        },
+        research_data: {
+          namespace: "lingbou",
+          dataset: "research_data",
+          endpoint: "https://modelscope.cn"
+        },
+        checkpoints: {
+          namespace: "lingbou",
+          dataset: "checkpoints",
+          endpoint: "https://modelscope.cn"
+        }
+      },
+      key_file_path: "~/.lios/recovery.key",
       chunk_size: 134217728
     },
     recovery_key: {
-      key_location: "~\\.lios\\recovery.key",
-      backed_up: false,
-      backup_location: null
+      key_location: "~/.lios/recovery.key",
+      backed_up: true,
+      backup_location: "~/Documents/lios-recovery.key"
     },
-    has_token: false,
-    spaces: [],
+    has_token: true,
+    spaces: [
+      {
+        space_name: "photos",
+        namespace: "lingbou",
+        dataset: "photos",
+        endpoint: "https://modelscope.cn",
+        visibility: "Private",
+        updated_at: "2026-09-12T10:00:00Z",
+        task_space_id: "task-space-1"
+      },
+      {
+        space_name: "research_data",
+        namespace: "lingbou",
+        dataset: "research_data",
+        endpoint: "https://modelscope.cn",
+        visibility: "Private",
+        updated_at: "2026-09-11T16:00:00Z",
+        task_space_id: "task-space-2"
+      },
+      {
+        space_name: "checkpoints",
+        namespace: "lingbou",
+        dataset: "checkpoints",
+        endpoint: "https://modelscope.cn",
+        visibility: "Private",
+        updated_at: "2026-09-08T12:00:00Z",
+        task_space_id: "task-space-3"
+      }
+    ],
     warning: null
   };
 }
@@ -132,7 +289,33 @@ async function appInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
     return { task_id: args?.taskId, offset: args?.offset ?? 0, total: 0, items: [] } as T;
   }
   if (command === "list_dataset_repos") {
-    return { user: { username: "Preview" }, repositories: [] } as T;
+    return {
+      user: { username: "lingbou", email: "lingbou@modelscope.cn" },
+      repositories: previewSnapshot().spaces
+    } as T;
+  }
+  if (command === "load_space_catalog") {
+    return {
+      local_path: "~/.lios/staging",
+      bytes: 156480000,
+      tree: previewTree(),
+      warnings: []
+    } as T;
+  }
+  if (command === "search_catalog") {
+    const q = ((args?.query as string) || "").toLowerCase();
+    const tree = previewTree();
+    const all: DriveItem[] = tree.kind.type === "Directory" ? tree.kind.children.map(treeToDriveItem) : [];
+    return all.filter((item: DriveItem) => item.name.toLowerCase().includes(q)) as T;
+  }
+  if (command === "cleanup_local_cache") {
+    return { files_removed: 4, dirs_removed: 2, bytes_removed: 20971520 } as T;
+  }
+  if (command === "create_folder") {
+    return { local_path: "", bytes: 0, tree: previewTree(), warnings: [] } as T;
+  }
+  if (command === "rename_node") {
+    return { local_path: "", bytes: 0, tree: previewTree(), warnings: [] } as T;
   }
   throw new Error("这个操作需要在 Lios 桌面端中执行");
 }
@@ -153,6 +336,7 @@ function App() {
   const [catalogStatus, setCatalogStatus] = useState<CatalogStatus>("idle");
   const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState<DriveItem[]>([]);
   const [token, setToken] = useState("");
@@ -183,11 +367,65 @@ function App() {
   const catalogMutationCompletionBaselineReady = useRef(false);
   const rebuildPreviewRequest = useRef(0);
 
+  // New states for enhanced interaction
+  const [sortField, setSortField] = useState<SortField>("name");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
+  const [viewMode, setViewMode] = useState<ViewMode>(() => {
+    try {
+      const stored = globalThis.localStorage?.getItem("lios.viewMode");
+      if (stored === "grid" || stored === "table") return stored;
+    } catch {
+      // Fall back
+    }
+    return "table";
+  });
+  const [isDragging, setIsDragging] = useState(false);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState>({
+    open: false,
+    x: 0,
+    y: 0,
+    item: null
+  });
+
   const currentFolder = findNode(catalogTree, currentFolderId);
   const children =
     currentFolder?.kind.type === "Directory" ? currentFolder.kind.children.map(treeToDriveItem) : [];
   const visibleItems = query.trim() ? searchResults : children;
-  const crumbs = breadcrumb(catalogTree, currentFolderId);
+
+  const sortedItems = useMemo(() => {
+    const items = [...visibleItems];
+    items.sort((a, b) => {
+      if (sortField !== "kind") {
+        if (a.kind === "Directory" && b.kind === "File") return -1;
+        if (a.kind === "File" && b.kind === "Directory") return 1;
+      }
+
+      let result = 0;
+      if (sortField === "name") {
+        result = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+      } else if (sortField === "kind") {
+        if (a.kind === b.kind) {
+          result = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+        } else {
+          result = a.kind === "Directory" ? -1 : 1;
+        }
+      } else if (sortField === "size") {
+        const sizeA = a.kind === "File" ? a.size : 0;
+        const sizeB = b.kind === "File" ? b.size : 0;
+        result = sizeA - sizeB;
+      } else if (sortField === "updated_at") {
+        result = new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime();
+      }
+
+      return sortDirection === "asc" ? result : -result;
+    });
+    return items;
+  }, [visibleItems, sortField, sortDirection]);
+
+  const rawCrumbs = breadcrumb(catalogTree, currentFolderId);
+  const crumbs = rawCrumbs.map((crumb, index) =>
+    index === 0 && !crumb.name ? { ...crumb, name: activeSpace?.dataset ?? "根目录" } : crumb
+  );
   const crumbPaths = crumbs.map((_crumb, index) =>
     crumbs
       .slice(0, index + 1)
@@ -340,6 +578,99 @@ function App() {
     }
   }, [view, activeSpace, catalogStatus]);
 
+  // Native Tauri drag and drop integration
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    if (hasTauriRuntime()) {
+      try {
+        getCurrentWebview()
+          .onDragDropEvent((event) => {
+            if (event.payload.type === "enter" || event.payload.type === "over") {
+              if (view === "drive" && activeSpace && currentFolderId) {
+                setIsDragging(true);
+              }
+            } else if (event.payload.type === "leave") {
+              setIsDragging(false);
+            } else if (event.payload.type === "drop") {
+              setIsDragging(false);
+              if (view === "drive" && activeSpace && currentFolderId) {
+                const paths = event.payload.paths;
+                if (paths && paths.length > 0) {
+                  void queueUpload(paths);
+                }
+              }
+            }
+          })
+          .then((cleanup) => {
+            unlisten = cleanup;
+          })
+          .catch(() => undefined);
+      } catch {
+        // Fall back gracefully
+      }
+    }
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [view, activeSpace, currentFolderId]);
+
+  useEffect(() => {
+    closeContextMenu();
+  }, [view, currentFolderId]);
+
+  // Global keyboard shortcuts
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      const activeTag = document.activeElement?.tagName?.toLowerCase();
+      if (activeTag === "input" || activeTag === "select" || activeTag === "textarea") {
+        return;
+      }
+
+      if (view === "drive" && activeSpace && catalogTree) {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+          event.preventDefault();
+          selectAll();
+          return;
+        }
+        if (event.key === "Delete" || event.key === "Backspace") {
+          if (selectedIds.size > 0 && busy === null) {
+            event.preventDefault();
+            void deleteSelected();
+          }
+          return;
+        }
+        if (event.key === "F2") {
+          if (selectedIds.size === 1 && busy === null) {
+            event.preventDefault();
+            void renameSelected();
+          }
+          return;
+        }
+        if (event.key === "Enter") {
+          if (selectedIds.size === 1) {
+            const [selectedId] = [...selectedIds];
+            const target = sortedItems.find((item) => item.id === selectedId);
+            if (target && target.kind === "Directory") {
+              event.preventDefault();
+              enterItem(target);
+            }
+          }
+          return;
+        }
+        if (event.key === "Escape") {
+          if (selectedIds.size > 0) {
+            event.preventDefault();
+            setSelectedIds(new Set());
+          }
+          return;
+        }
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [view, activeSpace, catalogTree, selectedIds, sortedItems, busy]);
+
   async function loadSpace(space: SpaceSummary) {
     setView("drive");
     setActiveSpace(space);
@@ -348,6 +679,7 @@ function App() {
     setCatalogTree(null);
     setCurrentFolderId(null);
     setSelectedIds(new Set());
+    setLastSelectedId(null);
     setSearchResults([]);
     setQuery("");
     await catalogLoads.run(async (request) => {
@@ -390,6 +722,7 @@ function App() {
           setCurrentFolderId(result.tree.id);
           setCatalogStatus("ready");
           setSelectedIds(new Set());
+          setLastSelectedId(null);
           setMessage(result.warnings.join("; "));
         },
         () => reloadCatalog(true)
@@ -425,6 +758,7 @@ function App() {
         if (!currentFolderId) setCurrentFolderId(result.tree.id);
         setCatalogStatus("ready");
         setSelectedIds(new Set());
+        setLastSelectedId(null);
         setMessage(result.warnings.join("; "));
         const trimmedQuery = query.trim();
         if (trimmedQuery) {
@@ -447,6 +781,7 @@ function App() {
   }
 
   function toggleSelection(id: string) {
+    setLastSelectedId(id);
     setSelectedIds((current) => {
       const next = new Set(current);
       if (next.has(id)) next.delete(id);
@@ -455,10 +790,42 @@ function App() {
     });
   }
 
+  function selectOnly(id: string) {
+    setLastSelectedId(id);
+    setSelectedIds(new Set([id]));
+  }
+
+  function selectRange(targetId: string) {
+    if (!lastSelectedId || lastSelectedId === targetId) {
+      selectOnly(targetId);
+      return;
+    }
+    const lastIdx = sortedItems.findIndex((item) => item.id === lastSelectedId);
+    const targetIdx = sortedItems.findIndex((item) => item.id === targetId);
+    if (lastIdx === -1 || targetIdx === -1) {
+      selectOnly(targetId);
+      return;
+    }
+    const start = Math.min(lastIdx, targetIdx);
+    const end = Math.max(lastIdx, targetIdx);
+    const rangeIds = sortedItems.slice(start, end + 1).map((item) => item.id);
+    setSelectedIds(new Set(rangeIds));
+  }
+
+  function selectAll() {
+    if (sortedItems.length === 0) return;
+    if (sortedItems.every((item) => selectedIds.has(item.id))) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(sortedItems.map((item) => item.id)));
+    }
+  }
+
   function enterItem(item: DriveItem) {
     if (item.kind === "Directory") {
       setCurrentFolderId(item.id);
       setSelectedIds(new Set());
+      setLastSelectedId(null);
       setQuery("");
       setSearchResults([]);
     } else {
@@ -466,15 +833,39 @@ function App() {
     }
   }
 
-  async function pickUpload(directory: boolean) {
-    if (!activeSpace) return;
-    const selected = await open({ directory, multiple: !directory });
-    const paths = Array.isArray(selected)
-      ? selected.filter((item): item is string => typeof item === "string")
-      : typeof selected === "string"
-        ? [selected]
-        : [];
-    if (paths.length === 0 || !currentFolderId) return;
+  function handleSort(field: SortField) {
+    if (sortField === field) {
+      setSortDirection((current) => (current === "asc" ? "desc" : "asc"));
+    } else {
+      setSortField(field);
+      setSortDirection("asc");
+    }
+  }
+
+  function handleViewModeChange(mode: ViewMode) {
+    setViewMode(mode);
+    try {
+      globalThis.localStorage?.setItem("lios.viewMode", mode);
+    } catch {
+      // ignore
+    }
+  }
+
+  function handleContextMenu(event: MouseEvent, item: DriveItem | null) {
+    setContextMenu({
+      open: true,
+      x: event.clientX,
+      y: event.clientY,
+      item
+    });
+  }
+
+  function closeContextMenu() {
+    setContextMenu((current) => (current.open ? { ...current, open: false } : current));
+  }
+
+  async function queueUpload(paths: string[]) {
+    if (paths.length === 0 || !currentFolderId || !activeSpace) return;
     const found = await appInvoke<UploadConflict[]>("preview_upload_conflicts", {
       spaceName: activeSpace.space_name,
       parentNodeId: currentFolderId,
@@ -489,6 +880,17 @@ function App() {
       return;
     }
     await startUpload(paths, []);
+  }
+
+  async function pickUpload(directory: boolean) {
+    if (!activeSpace) return;
+    const selected = await open({ directory, multiple: !directory });
+    const paths = Array.isArray(selected)
+      ? selected.filter((item): item is string => typeof item === "string")
+      : typeof selected === "string"
+        ? [selected]
+        : [];
+    await queueUpload(paths);
   }
 
   async function startUpload(paths: string[], resolutions: ConflictResolution[]) {
@@ -514,6 +916,19 @@ function App() {
     setConflicts([]);
     setConflictActions({});
     await startUpload(paths, resolutions);
+  }
+
+  function handleConflictAction(sourcePath: string, action: ConflictAction) {
+    setConflictActions((current) => ({
+      ...current,
+      [sourcePath]: action
+    }));
+  }
+
+  function handleSetAllConflictActions(action: ConflictAction) {
+    setConflictActions(
+      Object.fromEntries(conflicts.map((conflict) => [conflict.source_path, action]))
+    );
   }
 
   async function createFolder() {
@@ -548,6 +963,7 @@ function App() {
       setCatalogTree(result.tree);
       setCatalogStatus("ready");
       setSelectedIds(new Set());
+      setLastSelectedId(null);
       setMessage(result.warnings.join("; "));
     });
   }
@@ -665,6 +1081,7 @@ function App() {
         setCurrentFolderId(result.tree.id);
         setCatalogStatus("ready");
         setSelectedIds(new Set());
+        setLastSelectedId(null);
         setSearchResults([]);
         setQuery("");
       } catch (error) {
@@ -891,778 +1308,510 @@ function App() {
       </header>
 
       <main className="driveShell">
-      <aside className="spaceRail">
-        <div className="accountSection">
-          <span className="sectionLabel">账号</span>
-          <button
-            className={`accountItem ${hasToken ? "active" : "empty"}`}
-            onClick={selectAccount}
-          >
-            <KeyRound aria-hidden />
-            <span>
-              <strong>{modelscopeUser?.username ?? "未连接账号"}</strong>
-              <small>{hasToken ? "ModelScope" : "未连接"}</small>
-            </span>
-          </button>
-        </div>
-
-        <div className="accountListSpacer" />
-
-        <div className="railFooter">
-          <button
-            className={view !== "settings" ? "active" : ""}
-            onClick={() => {
-              if (!activeSpace) {
-                setView("spaces");
-              } else if (catalogStatus === "ready" || catalogStatus === "missing" || catalogStatus === "error") {
-                setView("drive");
-              } else {
-                void loadSpace(activeSpace);
-              }
-            }}
-          >
-            <FolderOpen aria-hidden />
-            文件
-          </button>
-          <button
-            className={view === "settings" ? "active" : ""}
-            onClick={() => setView("settings")}
-          >
-            <Settings aria-hidden />
-            设置
-          </button>
-        </div>
-      </aside>
-
-      <section className="driveWorkspace">
-        {view !== "settings" && (
-          <header className="driveTopbar">
-            <nav className="crumbs" aria-label="当前路径" title={fullBreadcrumbPath}>
-              {crumbs.length > 0 ? (
-                crumbs.map((crumb, index) => (
-                  <button
-                    key={crumb.id}
-                    type="button"
-                    onClick={() => setCurrentFolderId(crumb.id)}
-                    className={index === crumbs.length - 1 ? "current" : ""}
-                    title={crumbPaths[index]}
-                    aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
-                    aria-current={index === crumbs.length - 1 ? "page" : undefined}
-                  >
-                    {index > 0 && <ChevronRight aria-hidden />}
-                    <span className="crumbLabel">{crumb.name}</span>
-                  </button>
-                ))
-              ) : (
-                <span className="crumbFallback" title={crumbFallbackLabel}>
-                  {crumbFallbackLabel}
-                </span>
-              )}
-            </nav>
-            <div className="searchBox">
-              <Search aria-hidden />
-              <input
-                value={query}
-                onChange={(event) => {
-                  setQuery(event.target.value);
-                  if (view === "drive" && !event.target.value.trim()) setSearchResults([]);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && view === "drive") searchCatalog();
-                }}
-                placeholder={view === "spaces" ? "搜索空间" : "搜索当前空间"}
-              />
-            </div>
-          </header>
-        )}
-
-        {message && (
-          <div className="noticeBar">
-            <AlertTriangle aria-hidden />
-            <span>{message}</span>
-            <button onClick={() => setMessage("")} title="关闭">
-              <X aria-hidden />
+        <aside className="spaceRail">
+          <div className="accountSection">
+            <span className="sectionLabel">账号</span>
+            <button
+              className={`accountItem ${hasToken ? "active" : "empty"}`}
+              onClick={selectAccount}
+              title="点击查看所有空间"
+            >
+              <KeyRound aria-hidden />
+              <span>
+                <strong>{modelscopeUser?.username ?? "未连接账号"}</strong>
+                <small>{hasToken ? "ModelScope" : "未连接"}</small>
+              </span>
             </button>
           </div>
-        )}
 
-        {view === "settings" ? (
-          <section className="settingsPage">
-            <div className="settingsBlock">
-              <div>
-                <h2>连接</h2>
-                <p>{modelscopeUser?.username ? `已连接 ${modelscopeUser.username}` : "输入访问凭证连接 ModelScope 账号"}</p>
-              </div>
-              <div className="connectionGrid">
-                <input
-                  type="password"
-                  value={token}
-                  onChange={(event) => setToken(event.target.value)}
-                  placeholder="ModelScope access token"
-                  autoComplete="off"
-                />
-                <input
-                  className="endpointInput"
-                  value={manualEndpoint}
-                  onChange={(event) => setManualEndpoint(event.target.value)}
-                  placeholder="服务地址"
-                />
-                <button
-                  className="primary"
-                  onClick={saveToken}
-                  disabled={!token || !manualEndpoint || busy !== null}
-                >
-                  <ShieldCheck aria-hidden />
-                  连接
-                </button>
-              </div>
-            </div>
+          <div className="accountListSpacer" />
 
-            <div className="settingsBlock recoveryKeyBlock">
-              <div className="settingsHeaderRow">
-                <div>
-                  <h2>恢复密钥</h2>
-                  <p>用于打开已加密的 Lios 空间</p>
-                </div>
-                <div className="settingsActions">
-                  <button
-                    onClick={exportRecoveryKey}
-                    disabled={!snapshot?.recovery_key.key_location || busy !== null}
-                  >
-                    <Download aria-hidden />
-                    导出备份
-                  </button>
-                  <button
-                    onClick={selectRecoveryKeyForImport}
-                    disabled={busy !== null || recoveryKeyImport !== null}
-                  >
-                    <UploadCloud aria-hidden />
-                    导入密钥
-                  </button>
-                </div>
-              </div>
-              <div className="recoveryKeySummary">
-                <div className="recoveryKeyLocation">
-                  <KeyRound aria-hidden />
-                  <span>
-                    <small>当前密钥</small>
-                    <strong title={snapshot?.recovery_key.key_location ?? undefined}>
-                      {conciseRecoveryKeyPath(snapshot?.recovery_key.key_location)}
-                    </strong>
-                  </span>
-                </div>
-                <span
-                  className={`backupStatus ${snapshot?.recovery_key.backed_up ? "ready" : "missing"}`}
-                  title={snapshot?.recovery_key.backup_location ?? undefined}
-                >
-                  {recoveryKeyBackupText(snapshot?.recovery_key)}
-                </span>
-              </div>
-            </div>
+          <div className="railFooter">
+            <button
+              className={view === "spaces" ? "active" : ""}
+              onClick={() => {
+                setView("spaces");
+                setQuery("");
+              }}
+              title="所有空间"
+            >
+              <HardDrive aria-hidden />
+              空间
+            </button>
+            <button
+              className={view === "drive" ? "active" : ""}
+              onClick={() => {
+                if (!activeSpace) {
+                  setView("spaces");
+                } else if (
+                  catalogStatus === "ready" ||
+                  catalogStatus === "missing" ||
+                  catalogStatus === "error"
+                ) {
+                  setView("drive");
+                } else {
+                  void loadSpace(activeSpace);
+                }
+              }}
+              title={activeSpace ? `当前空间：${activeSpace.dataset}` : "文件"}
+            >
+              <FolderOpen aria-hidden />
+              文件
+            </button>
+            <button
+              className={view === "settings" ? "active" : ""}
+              onClick={() => setView("settings")}
+              title="设置"
+            >
+              <Settings aria-hidden />
+              设置
+            </button>
+          </div>
+        </aside>
 
-            <div className="settingsBlock">
-              <div className="settingsHeaderRow">
-                <div>
-                  <h2>空间检查</h2>
-                  <p>
-                    {selectedSpace
-                      ? `${selectedSpace.namespace}/${selectedSpace.dataset}`
-                      : "未选择空间"}
-                  </p>
-                </div>
-                <div className="settingsActions">
-                  <button onClick={() => verifySpace(false)} disabled={!selectedSpace || busy !== null}>
-                    <ShieldCheck aria-hidden />
-                    快速检查
-                  </button>
-                  <button onClick={() => verifySpace(true)} disabled={!selectedSpace || busy !== null}>
-                    <HardDrive aria-hidden />
-                    完整检查
-                  </button>
-                  <button
-                    onClick={openCatalogRebuildDialog}
-                    disabled={!selectedSpace || busy !== null || rebuildDialog !== null || rebuildTaskActive}
-                  >
-                    <RefreshCw aria-hidden />
-                    重建 Catalog
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="settingsBlock">
-              <div className="settingsHeaderRow">
-                <div>
-                  <h2>本地状态</h2>
-                </div>
-                <button onClick={cleanupLocalCache} disabled={busy !== null || activeTasks > 0}>
-                  <Trash2 aria-hidden />
-                  清理缓存
-                </button>
-              </div>
-              {cacheCleanup && (
-                <div className="cleanupResult">
-                  已清理 {cacheCleanup.files_removed} 个文件、{cacheCleanup.dirs_removed} 个空目录，释放{" "}
-                  {formatCacheBytes(cacheCleanup.bytes_removed)}
-                </div>
-              )}
-              <dl className="pathGrid">
-                <div>
-                  <dt>Config</dt>
-                  <dd>{displayPath(snapshot?.paths.config)}</dd>
-                </div>
-                <div>
-                  <dt>Database</dt>
-                  <dd>{displayPath(snapshot?.paths.database)}</dd>
-                </div>
-                <div>
-                  <dt>Staging</dt>
-                  <dd>{displayPath(snapshot?.paths.staging)}</dd>
-                </div>
-                <div>
-                  <dt>Logs</dt>
-                  <dd title={snapshot?.paths.logs ?? undefined}>
-                    {conciseRecoveryKeyPath(snapshot?.paths.logs)}
-                  </dd>
-                </div>
-              </dl>
-            </div>
-
-            <AboutSection loadVersion={loadAppVersion} />
-          </section>
-        ) : view === "spaces" ? (
-          <section className="accountSpacesPage">
-            <div className="accountSpacesHeader">
-              <div>
-                <h2>{accountName}</h2>
-                <span>{hasToken ? "ModelScope" : "未连接"}</span>
-              </div>
-              <div className="toolbar">
-                <button onClick={() => refreshSetup(true)} disabled={!hasToken || busy !== null}>
-                  <RefreshCw aria-hidden />
-                  刷新
-                </button>
-                <button
-                  className="primary"
-                  onClick={openCreateSpaceDialog}
-                  disabled={!hasToken || busy !== null}
-                >
-                  <Plus aria-hidden />
-                  创建空间
-                </button>
-              </div>
-            </div>
-
-            <section className="spaceSurface">
-              {!hasToken ? (
-                <div className="emptyDrive">
-                  <Cloud aria-hidden />
-                  <h2>连接 ModelScope</h2>
-                  <button className="primary" onClick={() => setView("settings")}>
-                    <Settings aria-hidden />
-                    设置令牌
-                  </button>
-                </div>
-              ) : visibleSpaces.length === 0 ? (
-                <div className="emptyDrive">
-                  <HardDrive aria-hidden />
-                  <h2>{query.trim() ? "没有匹配空间" : "创建一个空间"}</h2>
-                  {!query.trim() && (
-                    <button className="primary" onClick={openCreateSpaceDialog} disabled={busy !== null}>
-                      <Plus aria-hidden />
-                      创建空间
-                    </button>
-                  )}
-                </div>
-              ) : (
-                <div className="spaceGrid">
-                  {visibleSpaces.map((space) => {
-                    const active =
-                      activeSpace?.namespace === space.namespace &&
-                      activeSpace?.dataset === space.dataset &&
-                      activeSpace?.endpoint === space.endpoint;
-                    return (
-                      <button
-                        className={`spaceCard ${active ? "active" : ""}`}
-                        key={`${space.endpoint}/${space.namespace}/${space.dataset}`}
-                        onClick={() => loadSpace(space)}
-                      >
-                        <HardDrive aria-hidden />
-                        <span>
-                          <strong>{space.dataset}</strong>
-                          <small>{space.namespace}</small>
-                        </span>
-                        <ChevronRight aria-hidden />
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </section>
-          </section>
-        ) : (
-          <>
-            <section className="driveToolbar">
-              <div className="toolbar">
-                <button
-                  className="primary"
-                  onClick={() => pickUpload(false)}
-                  disabled={!catalogTree || busy !== null}
-                >
-                  <UploadCloud aria-hidden />
-                  上传文件
-                </button>
-                <button onClick={() => pickUpload(true)} disabled={!catalogTree || busy !== null}>
-                  <FolderOpen aria-hidden />
-                  上传文件夹
-                </button>
-                <button onClick={createFolder} disabled={!catalogTree || busy !== null}>
-                  <Plus aria-hidden />
-                  新建文件夹
-                </button>
-              </div>
-              <div className="toolbar">
-                <button onClick={downloadSelected} disabled={selectedCount === 0 || busy !== null}>
-                  <Download aria-hidden />
-                  下载
-                </button>
-                <button onClick={renameSelected} disabled={selectedCount !== 1 || busy !== null}>
-                  <Edit3 aria-hidden />
-                  重命名
-                </button>
-                <button
-                  className="danger"
-                  onClick={deleteSelected}
-                  disabled={selectedCount === 0 || busy !== null}
-                >
-                  <Trash2 aria-hidden />
-                  删除
-                </button>
-                <button onClick={() => reloadCatalog()} disabled={!activeSpace || busy !== null}>
-                  <RefreshCw aria-hidden />
-                  刷新
-                </button>
-              </div>
-            </section>
-
-            <section className="fileSurface">
-              {!activeSpace ? (
-                <div className="emptyDrive">
-                  {emptyDriveMode === "create" ? <HardDrive aria-hidden /> : <Cloud aria-hidden />}
-                  <h2>
-                    {emptyDriveMode === "create"
-                      ? "创建一个空间"
-                      : emptyDriveMode === "connect"
-                        ? "连接 ModelScope"
-                        : "选择一个空间"}
-                  </h2>
-                  {emptyDriveMode !== "select" && (
+        <section className="driveWorkspace">
+          {view !== "settings" && (
+            <header className="driveTopbar">
+              <nav className="crumbs" aria-label="当前路径" title={fullBreadcrumbPath}>
+                {view === "drive" && (
+                  <>
                     <button
-                      className="primary"
-                      onClick={emptyDriveMode === "create" ? openCreateSpaceDialog : () => setView("settings")}
+                      type="button"
+                      className="crumbRootBtn"
+                      onClick={() => {
+                        setView("spaces");
+                        setQuery("");
+                      }}
+                      title="空间列表"
+                      aria-label="返回空间列表"
                     >
-                      {emptyDriveMode === "create" ? <Plus aria-hidden /> : <Settings aria-hidden />}
-                      {emptyDriveMode === "create" ? "创建空间" : "设置令牌"}
+                      <HardDrive aria-hidden />
+                      <span>空间列表</span>
                     </button>
-                  )}
-                </div>
-              ) : catalogStatus === "loading" || catalogStatus === "idle" ? (
-                <div className="emptyDrive">
-                  <RefreshCw className="loadingGlyph" aria-hidden />
-                  <h2>正在打开空间</h2>
-                </div>
-              ) : catalogStatus === "missing" ? (
-                <div className="emptyDrive">
-                  <HardDrive aria-hidden />
-                  <h2>{activeSpace.dataset}</h2>
-                  <button className="primary" onClick={initializeActiveSpace} disabled={busy !== null}>
-                    <ShieldCheck aria-hidden />
-                    初始化空间
-                  </button>
-                </div>
-              ) : catalogStatus === "error" || !catalogTree ? (
-                <div className="emptyDrive">
-                  <AlertTriangle aria-hidden />
-                  <h2>打开空间失败</h2>
-                  <button className="primary" onClick={() => reloadCatalog()} disabled={busy !== null}>
-                    <RefreshCw aria-hidden />
-                    重试
-                  </button>
-                </div>
-              ) : visibleItems.length === 0 ? (
-                <div className="emptyDrive">
-                  <Folder aria-hidden />
-                  <h2>{query.trim() ? "没有搜索结果" : "此文件夹为空"}</h2>
-                </div>
-              ) : (
-                <table className="fileTable">
-                  <thead>
-                    <tr>
-                      <th aria-label="选择" />
-                      <th>名称</th>
-                      <th>类型</th>
-                      <th>大小</th>
-                      <th>修改时间</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {visibleItems.map((item) => (
-                      <tr
-                        key={item.id}
-                        className={selectedIds.has(item.id) ? "selected" : ""}
-                        onDoubleClick={() => enterItem(item)}
-                      >
-                        <td>
-                          <input
-                            type="checkbox"
-                            checked={selectedIds.has(item.id)}
-                            onChange={() => toggleSelection(item.id)}
-                          />
-                        </td>
-                        <td>
-                          <button className="fileName" onClick={() => enterItem(item)}>
-                            {item.kind === "Directory" ? <Folder aria-hidden /> : <File aria-hidden />}
-                            <span>{item.name}</span>
-                          </button>
-                        </td>
-                        <td>{item.kind === "Directory" ? `${item.children_count} 项` : "文件"}</td>
-                        <td>{item.kind === "File" ? formatBytes(item.size) : "-"}</td>
-                        <td>{formatDate(item.updated_at)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-            </section>
-          </>
-        )}
-
-        <TaskCenter
-          tasks={tasks}
-          pendingActions={pendingActions}
-          onAction={runTaskAction}
-          listTaskItems={listTaskItems}
-          onError={handleTaskError}
-        />
-      </section>
-
-      {rebuildDialog && (
-        <div className="modalBackdrop">
-          <section
-            className="rebuildModal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="rebuild-catalog-title"
-          >
-            <div className="modalHeader">
-              <div>
-                <h2 id="rebuild-catalog-title">恢复目录结构</h2>
-                <p>{`${rebuildDialog.space.namespace}/${rebuildDialog.space.dataset}`}</p>
-              </div>
-              <button
-                onClick={closeCatalogRebuildDialog}
-                disabled={rebuildDialog.status === "submitting"}
-                title="关闭"
-                aria-label="关闭"
-              >
-                <X aria-hidden />
-              </button>
-            </div>
-
-            <div className="rebuildModalBody">
-              {rebuildDialog.status === "loading" && (
-                <div className="rebuildLoading" role="status">
-                  <RefreshCw aria-hidden />
-                  <strong>正在准备恢复预览</strong>
-                  <span>正在读取可恢复的目录信息，请稍候。</span>
-                </div>
-              )}
-
-              {rebuildDialog.error && (
-                <div className="rebuildError" role="alert">
-                  <AlertTriangle aria-hidden />
-                  <span>
-                    <strong>{rebuildDialog.preview ? "恢复任务未能开始" : "无法生成恢复预览"}</strong>
-                    <small>{rebuildDialog.error}</small>
-                  </span>
-                </div>
-              )}
-
-              {rebuildDialog.preview && (
-                <>
-                  <p className="rebuildIntro">
-                    Lios 将根据已恢复的信息重新生成目录索引。请确认下方目录和统计无误；如果远端内容在预览后发生变化，任务会停止并要求重新预览。
-                  </p>
-
-                  <dl className="rebuildReport">
-                    <div>
-                      <dt>可恢复节点</dt>
-                      <dd>{rebuildDialog.preview.report.nodes_rebuilt}</dd>
-                    </div>
-                    <div>
-                      <dt>文件夹</dt>
-                      <dd>{rebuildDialog.preview.report.directories_rebuilt}</dd>
-                    </div>
-                    <div>
-                      <dt>文件</dt>
-                      <dd>{rebuildDialog.preview.report.files_rebuilt}</dd>
-                    </div>
-                    <div>
-                      <dt>文件内容</dt>
-                      <dd>{rebuildDialog.preview.report.content_objects_rebuilt}</dd>
-                    </div>
-                    <div>
-                      <dt>数据分片</dt>
-                      <dd>{rebuildDialog.preview.report.chunks_referenced}</dd>
-                    </div>
-                    <div>
-                      <dt>原始数据</dt>
-                      <dd>{formatBytes(rebuildDialog.preview.report.original_bytes_referenced)}</dd>
-                    </div>
-                    <div>
-                      <dt>未引用对象</dt>
-                      <dd>{rebuildDialog.preview.report.unreferenced_managed_objects}</dd>
-                    </div>
-                  </dl>
-
-                  <section className="rebuildTreePanel" aria-labelledby="rebuild-tree-title">
-                    <div className="rebuildSectionHeader">
-                      <h3 id="rebuild-tree-title">可恢复的目录</h3>
-                      <span>完整预览</span>
-                    </div>
-                    <div className="rebuildTreeScroll">
-                      <ul className="rebuildTree">
-                        <CatalogRecoveryTree node={rebuildDialog.preview.tree} />
-                      </ul>
-                    </div>
-                  </section>
-
-                  <section className="rebuildWarnings" aria-labelledby="rebuild-warnings-title">
-                    <div className="rebuildSectionHeader">
-                      <h3 id="rebuild-warnings-title">恢复提示</h3>
-                      <span>{rebuildDialog.preview.warnings.length} 项</span>
-                    </div>
-                    {rebuildDialog.preview.warnings.length > 0 ? (
-                      <ul>
-                        {rebuildDialog.preview.warnings.map((warning, index) => (
-                          <li key={`${index}-${warning}`}>{warning}</li>
-                        ))}
-                      </ul>
-                    ) : (
-                      <p>未发现需要额外处理的提示。</p>
-                    )}
-                  </section>
-                </>
-              )}
-            </div>
-
-            <div className="modalActions">
-              <button onClick={closeCatalogRebuildDialog} disabled={rebuildDialog.status === "submitting"}>
-                取消
-              </button>
-              <div className="modalActionGroup">
-                {rebuildDialog.status === "error" && (
-                  <button onClick={() => loadCatalogRebuildPreview(rebuildDialog.space)}>重新预览</button>
+                    {crumbs.length > 0 && <ChevronRight aria-hidden className="crumbSeparator" />}
+                  </>
                 )}
-                <button
-                  className="primary"
-                  onClick={confirmCatalogRebuild}
-                  disabled={
-                    !rebuildDialog.preview ||
-                    rebuildDialog.status === "loading" ||
-                    rebuildDialog.status === "submitting" ||
-                    rebuildTaskActive
-                  }
-                >
-                  <RefreshCw
-                    className={rebuildDialog.status === "submitting" ? "loadingGlyph" : undefined}
-                    aria-hidden
-                  />
-                  {rebuildDialog.status === "submitting" ? "正在加入任务" : "确认恢复"}
-                </button>
-              </div>
-            </div>
-          </section>
-        </div>
-      )}
-
-      {recoveryKeyImport && (
-        <div className="modalBackdrop">
-          <section
-            className="recoveryKeyModal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="recovery-key-import-title"
-          >
-            <div className="modalHeader">
-              <div>
-                <h2 id="recovery-key-import-title">导入恢复密钥</h2>
-                <p>{conciseRecoveryKeyPath(recoveryKeyImport.path)}</p>
-              </div>
-              <button
-                onClick={() => setRecoveryKeyImport(null)}
-                disabled={recoveryKeyImport.importing}
-                title="关闭"
-                aria-label="关闭"
-              >
-                <X aria-hidden />
-              </button>
-            </div>
-            <div className="recoveryKeyModalBody">
-              <div className="recoveryVerificationResult">
-                <CheckCircle2 aria-hidden />
-                <span>
-                  <strong>密钥验证通过</strong>
-                  <small>{recoveryKeyConfirmationText(recoveryKeyImport.verification)}</small>
-                </span>
-              </div>
-              <div className="externalKeyNotice">
-                <KeyRound aria-hidden />
-                <span>
-                  Lios 不会把此密钥复制到 ~/.lios。导入后请勿移动、改名或删除所选文件。
-                </span>
-              </div>
-              {recoveryKeyImport.error && (
-                <div className="rebuildError" role="alert">
-                  <AlertTriangle aria-hidden />
-                  <span>
-                    <strong>密钥导入失败</strong>
-                    <small>{recoveryKeyImport.error}</small>
+                {crumbs.length > 0 ? (
+                  crumbs.map((crumb, index) => (
+                    <button
+                      key={crumb.id}
+                      type="button"
+                      onClick={() => setCurrentFolderId(crumb.id)}
+                      className={index === crumbs.length - 1 ? "current" : ""}
+                      title={crumbPaths[index]}
+                      aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
+                      aria-current={index === crumbs.length - 1 ? "page" : undefined}
+                    >
+                      {index > 0 && <ChevronRight aria-hidden />}
+                      <span className="crumbLabel">{crumb.name}</span>
+                    </button>
+                  ))
+                ) : (
+                  <span className="crumbFallback" title={crumbFallbackLabel}>
+                    {crumbFallbackLabel}
                   </span>
-                </div>
-              )}
-            </div>
-            <div className="modalActions">
-              <button
-                onClick={() => setRecoveryKeyImport(null)}
-                disabled={recoveryKeyImport.importing}
-              >
-                取消
-              </button>
-              <button
-                className="primary"
-                onClick={confirmRecoveryKeyImport}
-                disabled={recoveryKeyImport.importing}
-              >
-                <KeyRound aria-hidden />
-                {recoveryKeyImport.importing ? "正在重新验证" : "确认导入"}
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
-
-      {conflicts.length > 0 && (
-        <div className="modalBackdrop">
-          <section className="conflictModal">
-            <div className="modalHeader">
-              <div>
-                <h2>处理同名项目</h2>
-              </div>
-              <button
-                onClick={() => {
-                  setConflicts([]);
-                  setPendingUpload([]);
-                }}
-              >
-                <X aria-hidden />
-              </button>
-            </div>
-            <div className="conflictList">
-              {conflicts.map((conflict) => (
-                <label className="conflictItem" key={conflict.source_path}>
-                  <span>
-                    <strong>{conflict.target_name}</strong>
-                    <small>{conflict.source_path}</small>
-                  </span>
-                  <select
-                    value={conflictActions[conflict.source_path] || "KeepBoth"}
-                    onChange={(event) =>
-                      setConflictActions((current) => ({
-                        ...current,
-                        [conflict.source_path]: event.target.value as ConflictAction
-                      }))
-                    }
-                  >
-                    <option value="KeepBoth">保留两者</option>
-                    <option value="Replace">替换</option>
-                    <option value="Skip">跳过</option>
-                  </select>
-                </label>
-              ))}
-            </div>
-            <div className="modalActions">
-              <button
-                onClick={() => {
-                  setConflicts([]);
-                  setPendingUpload([]);
-                }}
-              >
-                取消
-              </button>
-              <button className="primary" onClick={confirmConflicts}>
-                继续上传
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
-
-      {createSpaceOpen && (
-        <div className="modalBackdrop">
-          <section className="spaceModal" role="dialog" aria-modal="true" aria-labelledby="create-space-title">
-            <div className="modalHeader">
-              <div>
-                <h2 id="create-space-title">创建空间</h2>
-              </div>
-              <button
-                onClick={() => {
-                  setCreateSpaceOpen(false);
-                  setCreateSpaceError("");
-                }}
-                title="关闭"
-              >
-                <X aria-hidden />
-              </button>
-            </div>
-            <div className="spaceModalBody">
-              <label>
-                <span>空间名称</span>
+                )}
+              </nav>
+              <div className="searchBox">
+                <Search aria-hidden />
                 <input
-                  autoFocus
-                  value={newSpaceName}
+                  value={query}
                   onChange={(event) => {
-                    setNewSpaceName(event.target.value);
-                    setCreateSpaceError("");
+                    setQuery(event.target.value);
+                    if (view === "drive" && !event.target.value.trim()) setSearchResults([]);
                   }}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter") submitCreateSpace();
-                    if (event.key === "Escape") setCreateSpaceOpen(false);
+                    if (event.key === "Enter" && view === "drive") searchCatalog();
                   }}
+                  placeholder={view === "spaces" ? "搜索空间" : "搜索当前空间"}
                 />
-              </label>
-              {createSpaceError && <div className="fieldError">{createSpaceError}</div>}
+              </div>
+            </header>
+          )}
+
+          {message && (
+            <div className="noticeBar">
+              <AlertTriangle aria-hidden />
+              <span>{message}</span>
+              <button onClick={() => setMessage("")} title="关闭">
+                <X aria-hidden />
+              </button>
             </div>
-            <div className="modalActions">
-              <button
-                onClick={() => {
-                  setCreateSpaceOpen(false);
-                  setCreateSpaceError("");
+          )}
+
+          {view === "settings" ? (
+            <section className="settingsPage">
+              <div className="settingsBlock">
+                <div>
+                  <h2>连接</h2>
+                  <p>
+                    {modelscopeUser?.username
+                      ? `已连接 ${modelscopeUser.username}`
+                      : "输入访问凭证连接 ModelScope 账号"}
+                  </p>
+                </div>
+                <div className="connectionGrid">
+                  <input
+                    type="password"
+                    value={token}
+                    onChange={(event) => setToken(event.target.value)}
+                    placeholder="ModelScope access token"
+                    autoComplete="off"
+                  />
+                  <input
+                    className="endpointInput"
+                    value={manualEndpoint}
+                    onChange={(event) => setManualEndpoint(event.target.value)}
+                    placeholder="服务地址"
+                  />
+                  <button
+                    className="primary"
+                    onClick={saveToken}
+                    disabled={!token || !manualEndpoint || busy !== null}
+                  >
+                    <ShieldCheck aria-hidden />
+                    连接
+                  </button>
+                </div>
+              </div>
+
+              <div className="settingsBlock recoveryKeyBlock">
+                <div className="settingsHeaderRow">
+                  <div>
+                    <h2>恢复密钥</h2>
+                    <p>用于打开已加密的 Lios 空间</p>
+                  </div>
+                  <div className="settingsActions">
+                    <button
+                      onClick={exportRecoveryKey}
+                      disabled={!snapshot?.recovery_key.key_location || busy !== null}
+                    >
+                      <Download aria-hidden />
+                      导出备份
+                    </button>
+                    <button
+                      onClick={selectRecoveryKeyForImport}
+                      disabled={busy !== null || recoveryKeyImport !== null}
+                    >
+                      <UploadCloud aria-hidden />
+                      导入密钥
+                    </button>
+                  </div>
+                </div>
+                <div className="recoveryKeySummary">
+                  <div className="recoveryKeyLocation">
+                    <KeyRound aria-hidden />
+                    <span>
+                      <small>当前密钥</small>
+                      <strong title={snapshot?.recovery_key.key_location ?? undefined}>
+                        {conciseRecoveryKeyPath(snapshot?.recovery_key.key_location)}
+                      </strong>
+                    </span>
+                  </div>
+                  <span
+                    className={`backupStatus ${snapshot?.recovery_key.backed_up ? "ready" : "missing"}`}
+                    title={snapshot?.recovery_key.backup_location ?? undefined}
+                  >
+                    {recoveryKeyBackupText(snapshot?.recovery_key)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="settingsBlock">
+                <div className="settingsHeaderRow">
+                  <div>
+                    <h2>空间检查</h2>
+                    <p>
+                      {selectedSpace
+                        ? `${selectedSpace.namespace}/${selectedSpace.dataset}`
+                        : "未选择空间"}
+                    </p>
+                  </div>
+                  <div className="settingsActions">
+                    <button
+                      onClick={() => verifySpace(false)}
+                      disabled={!selectedSpace || busy !== null}
+                    >
+                      <ShieldCheck aria-hidden />
+                      快速检查
+                    </button>
+                    <button
+                      onClick={() => verifySpace(true)}
+                      disabled={!selectedSpace || busy !== null}
+                    >
+                      <HardDrive aria-hidden />
+                      完整检查
+                    </button>
+                    <button
+                      onClick={openCatalogRebuildDialog}
+                      disabled={
+                        !selectedSpace || busy !== null || rebuildDialog !== null || rebuildTaskActive
+                      }
+                    >
+                      <RefreshCw aria-hidden />
+                      重建 Catalog
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="settingsBlock">
+                <div className="settingsHeaderRow">
+                  <div>
+                    <h2>本地状态</h2>
+                  </div>
+                  <button onClick={cleanupLocalCache} disabled={busy !== null || activeTasks > 0}>
+                    <Trash2 aria-hidden />
+                    清理缓存
+                  </button>
+                </div>
+                {cacheCleanup && (
+                  <div className="cleanupResult">
+                    已清理 {cacheCleanup.files_removed} 个文件、{cacheCleanup.dirs_removed} 个空目录，释放{" "}
+                    {formatCacheBytes(cacheCleanup.bytes_removed)}
+                  </div>
+                )}
+                <dl className="pathGrid">
+                  <div>
+                    <dt>Config</dt>
+                    <dd>{displayPath(snapshot?.paths.config)}</dd>
+                  </div>
+                  <div>
+                    <dt>Database</dt>
+                    <dd>{displayPath(snapshot?.paths.database)}</dd>
+                  </div>
+                  <div>
+                    <dt>Staging</dt>
+                    <dd>{displayPath(snapshot?.paths.staging)}</dd>
+                  </div>
+                  <div>
+                    <dt>Logs</dt>
+                    <dd title={snapshot?.paths.logs ?? undefined}>
+                      {conciseRecoveryKeyPath(snapshot?.paths.logs)}
+                    </dd>
+                  </div>
+                </dl>
+              </div>
+
+              <AboutSection loadVersion={loadAppVersion} />
+            </section>
+          ) : view === "spaces" ? (
+            <SpaceGrid
+              accountName={accountName}
+              hasToken={hasToken}
+              spaces={visibleSpaces}
+              activeSpace={activeSpace}
+              query={query}
+              busy={busy !== null}
+              onRefresh={() => refreshSetup(true)}
+              onCreateSpace={openCreateSpaceDialog}
+              onSelectSpace={(space) => loadSpace(space)}
+              onOpenSettings={() => setView("settings")}
+            />
+          ) : (
+            <>
+              <DriveToolbar
+                canUpload={Boolean(catalogTree)}
+                selectedCount={selectedCount}
+                totalCount={visibleItems.length}
+                viewMode={viewMode}
+                busy={busy !== null}
+                onUploadFiles={() => pickUpload(false)}
+                onUploadFolder={() => pickUpload(true)}
+                onNewFolder={createFolder}
+                onDownload={downloadSelected}
+                onRename={renameSelected}
+                onDelete={deleteSelected}
+                onRefresh={() => reloadCatalog()}
+                onClearSelection={() => {
+                  setSelectedIds(new Set());
+                  setLastSelectedId(null);
+                }}
+                onViewModeChange={handleViewModeChange}
+              />
+
+              <section
+                className="fileSurface"
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  if (activeSpace && currentFolderId) setIsDragging(true);
+                }}
+                onDragLeave={(event) => {
+                  if (event.currentTarget.contains(event.relatedTarget as Node)) return;
+                  setIsDragging(false);
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setIsDragging(false);
                 }}
               >
-                取消
-              </button>
-              <button
-                className="primary"
-                onClick={submitCreateSpace}
-                disabled={!newSpaceName.trim() || busy !== null}
-              >
-                创建
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
+                <DragDropOverlay
+                  isDragging={isDragging}
+                  targetDirName={currentFolder?.name || activeSpace?.dataset}
+                />
+
+                {!activeSpace ? (
+                  <div className="emptyDrive">
+                    {emptyDriveMode === "create" ? (
+                      <HardDrive aria-hidden />
+                    ) : (
+                      <UploadCloud aria-hidden />
+                    )}
+                    <h2>
+                      {emptyDriveMode === "create"
+                        ? "创建一个空间"
+                        : emptyDriveMode === "connect"
+                          ? "连接 ModelScope"
+                          : "选择一个空间"}
+                    </h2>
+                    {emptyDriveMode !== "select" && (
+                      <button
+                        className="primary"
+                        onClick={
+                          emptyDriveMode === "create"
+                            ? openCreateSpaceDialog
+                            : () => setView("settings")
+                        }
+                      >
+                        {emptyDriveMode === "create" ? (
+                          <UploadCloud aria-hidden />
+                        ) : (
+                          <Settings aria-hidden />
+                        )}
+                        <span>{emptyDriveMode === "create" ? "创建空间" : "设置令牌"}</span>
+                      </button>
+                    )}
+                  </div>
+                ) : catalogStatus === "loading" || catalogStatus === "idle" ? (
+                  <div className="emptyDrive">
+                    <RefreshCw className="loadingGlyph" aria-hidden />
+                    <h2>正在打开空间</h2>
+                  </div>
+                ) : catalogStatus === "missing" ? (
+                  <div className="emptyDrive">
+                    <HardDrive aria-hidden />
+                    <h2>{activeSpace.dataset}</h2>
+                    <button
+                      className="primary"
+                      onClick={initializeActiveSpace}
+                      disabled={busy !== null}
+                    >
+                      <ShieldCheck aria-hidden />
+                      初始化空间
+                    </button>
+                  </div>
+                ) : catalogStatus === "error" || !catalogTree ? (
+                  <div className="emptyDrive">
+                    <AlertTriangle aria-hidden />
+                    <h2>打开空间失败</h2>
+                    <button
+                      className="primary"
+                      onClick={() => reloadCatalog()}
+                      disabled={busy !== null}
+                    >
+                      <RefreshCw aria-hidden />
+                      重试
+                    </button>
+                  </div>
+                ) : visibleItems.length === 0 ? (
+                  <div className="emptyDrive">
+                    <FolderOpen aria-hidden />
+                    <h2>{query.trim() ? "没有搜索结果" : "此文件夹为空"}</h2>
+                  </div>
+                ) : viewMode === "grid" ? (
+                  <FileGrid
+                    items={sortedItems}
+                    selectedIds={selectedIds}
+                    onToggleSelect={toggleSelection}
+                    onSelectOnly={selectOnly}
+                    onSelectRange={selectRange}
+                    onEnterItem={enterItem}
+                    onContextMenu={handleContextMenu}
+                  />
+                ) : (
+                  <FileTable
+                    items={sortedItems}
+                    selectedIds={selectedIds}
+                    sortField={sortField}
+                    sortDirection={sortDirection}
+                    onSort={handleSort}
+                    onToggleSelect={toggleSelection}
+                    onSelectOnly={selectOnly}
+                    onSelectRange={selectRange}
+                    onSelectAll={selectAll}
+                    onEnterItem={enterItem}
+                    onContextMenu={handleContextMenu}
+                  />
+                )}
+              </section>
+            </>
+          )}
+
+          <TaskCenter
+            tasks={tasks}
+            pendingActions={pendingActions}
+            onAction={runTaskAction}
+            listTaskItems={listTaskItems}
+            onError={handleTaskError}
+          />
+        </section>
+
+        <ContextMenu
+          state={contextMenu}
+          onClose={closeContextMenu}
+          selectedCount={selectedCount}
+          onOpenItem={enterItem}
+          onDownload={downloadSelected}
+          onRename={renameSelected}
+          onDelete={deleteSelected}
+          onUploadFiles={() => pickUpload(false)}
+          onUploadFolder={() => pickUpload(true)}
+          onNewFolder={createFolder}
+          onRefresh={() => reloadCatalog()}
+          onSelectAll={selectAll}
+        />
+
+        <RebuildCatalogModal
+          dialog={rebuildDialog}
+          rebuildTaskActive={rebuildTaskActive}
+          onClose={closeCatalogRebuildDialog}
+          onReloadPreview={() => rebuildDialog && loadCatalogRebuildPreview(rebuildDialog.space)}
+          onConfirm={confirmCatalogRebuild}
+        />
+
+        <ImportKeyModal
+          dialog={recoveryKeyImport}
+          onClose={() => setRecoveryKeyImport(null)}
+          onConfirm={confirmRecoveryKeyImport}
+        />
+
+        <ConflictModal
+          conflicts={conflicts}
+          conflictActions={conflictActions}
+          onSetAction={handleConflictAction}
+          onSetAllActions={handleSetAllConflictActions}
+          onCancel={() => {
+            setConflicts([]);
+            setPendingUpload([]);
+          }}
+          onConfirm={confirmConflicts}
+        />
+
+        <CreateSpaceModal
+          open={createSpaceOpen}
+          name={newSpaceName}
+          error={createSpaceError}
+          busy={busy !== null}
+          onChangeName={(val) => {
+            setNewSpaceName(val);
+            setCreateSpaceError("");
+          }}
+          onClose={() => {
+            setCreateSpaceOpen(false);
+            setCreateSpaceError("");
+          }}
+          onSubmit={submitCreateSpace}
+        />
       </main>
     </div>
   );
