@@ -8,6 +8,7 @@ macro_rules! with_registered_commands {
             list_dataset_repos,
             initialize_space,
             load_space_catalog,
+            preview_file_node,
             preview_upload_conflicts,
             enqueue_upload_to_folder,
             enqueue_download,

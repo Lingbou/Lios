@@ -18,6 +18,7 @@ test = false
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
+base64 = "0.22"
 lios-application = { path = "../crates/lios-application" }
 lios-core = { path = "../crates/lios-core" }
 chrono = { version = "0.4", features = ["serde"] }

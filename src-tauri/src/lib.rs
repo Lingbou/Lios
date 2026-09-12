@@ -1,3 +1,4 @@
+use base64::Engine;
 pub use lios_application::{
     app_log, catalog_mutation_gate, catalog_probe, catalog_sync, command_error,
     config_mutation_gate, download_service, production_config, recovery_key_service, task_manager,
@@ -1722,6 +1723,151 @@ async fn load_space_catalog(
         bytes: snapshot.bytes,
         tree: snapshot.tree,
         warnings: snapshot.warnings,
+    })
+}
+
+#[derive(Serialize)]
+struct FilePreviewResult {
+    name: String,
+    size: u64,
+    mime_type: String,
+    is_text: bool,
+    text: Option<String>,
+    data_url: Option<String>,
+}
+
+fn file_preview_type(name: &str) -> (&'static str, bool) {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        ("image/png", false)
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        ("image/jpeg", false)
+    } else if lower.ends_with(".webp") {
+        ("image/webp", false)
+    } else if lower.ends_with(".gif") {
+        ("image/gif", false)
+    } else if lower.ends_with(".svg") {
+        ("image/svg+xml", true)
+    } else if lower.ends_with(".txt") {
+        ("text/plain", true)
+    } else if lower.ends_with(".md") || lower.ends_with(".markdown") {
+        ("text/markdown", true)
+    } else if lower.ends_with(".json") {
+        ("application/json", true)
+    } else if lower.ends_with(".csv") {
+        ("text/csv", true)
+    } else if lower.ends_with(".rs")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".js")
+        || lower.ends_with(".py")
+        || lower.ends_with(".sh")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".toml")
+        || lower.ends_with(".css")
+        || lower.ends_with(".html")
+    {
+        ("text/plain", true)
+    } else {
+        ("application/octet-stream", false)
+    }
+}
+
+fn find_tree_node<'a>(
+    node: &'a CatalogTreeNode,
+    target_id: &str,
+) -> Option<&'a CatalogTreeNode> {
+    if node.id == target_id {
+        return Some(node);
+    }
+    if let lios_core::catalog::CatalogTreeNodeKind::Directory { children } = &node.kind {
+        for child in children {
+            if let Some(found) = find_tree_node(child, target_id) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+#[tauri::command]
+async fn preview_file_node(
+    state: tauri::State<'_, AppContext>,
+    space_name: String,
+    node_id: String,
+) -> CommandResult<FilePreviewResult> {
+    state.paths.ensure_dirs().map_err(to_err)?;
+    let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
+    let config = load_config(&state.paths)?;
+    let key = key_from_config(&config)?;
+    let app = Application::new(state.paths.clone())?;
+    let snapshot = app.open_space(repo.clone()).await?;
+
+    let node = find_tree_node(&snapshot.tree, &node_id)
+        .ok_or_else(|| CommandError::invalid_input("file not found in space catalog"))?;
+
+    let (mime_type, is_text) = file_preview_type(&node.name);
+    let is_supported_preview = is_text || mime_type.starts_with("image/");
+    if !is_supported_preview {
+        return Err(CommandError::invalid_input(
+            "this file format is not supported for in-memory preview; please download to view",
+        ));
+    }
+
+    let original_size = match &node.kind {
+        lios_core::catalog::CatalogTreeNodeKind::File { original_size, .. } => *original_size,
+        _ => return Err(CommandError::invalid_input("cannot preview a directory")),
+    };
+
+    if original_size > 10 * 1024 * 1024 {
+        return Err(CommandError::invalid_input(
+            "file exceeds 10MB preview limit; please download to view",
+        ));
+    }
+
+    let temp_preview_dir = state.paths.staging.join(".preview-tmp");
+    fs::create_dir_all(&temp_preview_dir).map_err(to_err)?;
+    let temp_output_path = temp_preview_dir.join(&node.name);
+
+    let prepared = prepare_download_task(vec![node_id.clone()], temp_preview_dir.display().to_string())?;
+    let CatalogSelection::Nodes(node_ids) = prepared.selection else {
+        return Err(CommandError::invalid_input("invalid selection"));
+    };
+
+    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(&state.paths)?);
+    let catalog = Catalog::from_staging(state.paths.staging.clone());
+    let remote_files = catalog.remote_files_for_selection(&CatalogSelection::Nodes(node_ids), &key).map_err(to_err)?;
+
+    for file in &remote_files {
+        let local_path = remote_to_staging_path(&state.paths.staging, &file.path)?;
+        if !local_path.exists() {
+            adapter.download_object(&repo.namespace, &repo.dataset, &file.path, &local_path).await.map_err(to_err)?;
+        }
+    }
+
+    let restore_options = lios_core::restore::RestoreOptions {
+        output_dir: temp_preview_dir.clone(),
+        conflict_policy: lios_core::restore::RestoreConflictPolicy::Rename,
+    };
+    catalog.restore(CatalogSelection::Nodes(vec![node_id]), &key, restore_options).map_err(to_err)?;
+
+    let read_bytes = fs::read(&temp_output_path).map_err(to_err)?;
+    let _ = fs::remove_file(&temp_output_path);
+
+    let (text, data_url) = if is_text {
+        (Some(String::from_utf8_lossy(&read_bytes).into_owned()), None)
+    } else {
+        (None, Some(format!("data:{mime_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(&read_bytes))))
+    };
+
+    Ok(FilePreviewResult {
+        name: node.name.clone(),
+        size: original_size,
+        mime_type: mime_type.to_string(),
+        is_text,
+        text,
+        data_url,
     })
 }
 

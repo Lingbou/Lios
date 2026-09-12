@@ -75,6 +75,7 @@ import { DragDropOverlay } from "./features/drive/DragDropOverlay.tsx";
 import { DriveToolbar } from "./features/drive/DriveToolbar.tsx";
 import { FileGrid } from "./features/drive/FileGrid.tsx";
 import { FileTable } from "./features/drive/FileTable.tsx";
+import { FilePreviewModal, type FilePreviewContent } from "./features/drive/FilePreviewModal.tsx";
 import type {
   ContextMenuState,
   SortDirection,
@@ -314,6 +315,16 @@ async function appInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
   if (command === "register_space") {
     return null as T;
   }
+  if (command === "preview_file_node") {
+    return {
+      name: "document.md",
+      size: 1024,
+      mime_type: "text/markdown",
+      is_text: true,
+      text: "# Lios 存储与加密架构\n\n- 端到端零知识加密\n- 自适应高熵压缩旁路 (Zstd Level 1)\n- 自动空间发现与无感绑定",
+      data_url: undefined
+    } as T;
+  }
   if (command === "create_folder") {
     return { local_path: "", bytes: 0, tree: previewTree(), warnings: [] } as T;
   }
@@ -389,6 +400,13 @@ function App() {
     y: 0,
     item: null
   });
+
+  // In-app file preview states
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewItem, setPreviewItem] = useState<DriveItem | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewContent, setPreviewContent] = useState<FilePreviewContent | null>(null);
 
   const currentFolder = findNode(catalogTree, currentFolderId);
   const children =
@@ -856,6 +874,37 @@ function App() {
     }
   }
 
+  async function openFilePreview(item: DriveItem) {
+    if (!activeSpace) return;
+    setPreviewItem(item);
+    setPreviewOpen(true);
+    setPreviewLoading(true);
+    setPreviewError(null);
+    setPreviewContent(null);
+    try {
+      const res = await appInvoke<{
+        name: string;
+        size: number;
+        mime_type: string;
+        is_text: boolean;
+        text?: string;
+        data_url?: string;
+      }>("preview_file_node", {
+        spaceName: activeSpace.space_name,
+        nodeId: item.id
+      });
+      setPreviewContent({
+        isText: res.is_text,
+        text: res.text,
+        dataUrl: res.data_url
+      });
+    } catch (err) {
+      setPreviewError(errorText(err));
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
+
   function enterItem(item: DriveItem) {
     if (item.kind === "Directory") {
       setCurrentFolderId(item.id);
@@ -865,6 +914,7 @@ function App() {
       setSearchResults([]);
     } else {
       toggleSelection(item.id);
+      void openFilePreview(item);
     }
   }
 
@@ -1846,6 +1896,24 @@ function App() {
             setCreateSpaceError("");
           }}
           onSubmit={submitCreateSpace}
+        />
+
+        <FilePreviewModal
+          open={previewOpen}
+          item={previewItem}
+          loading={previewLoading}
+          error={previewError}
+          content={previewContent}
+          onClose={() => {
+            setPreviewOpen(false);
+            setPreviewItem(null);
+          }}
+          onDownload={() => {
+            if (previewItem) {
+              setSelectedIds(new Set([previewItem.id]));
+              void downloadSelected();
+            }
+          }}
         />
       </main>
     </div>

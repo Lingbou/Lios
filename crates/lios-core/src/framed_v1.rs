@@ -130,7 +130,7 @@ pub fn encode_chunk_stream_with_compression_v1<R: Read, W: Write>(
 }
 
 /// Internal streaming decoder for temporary files; errors may leave partial plaintext in `output`.
-pub(crate) fn decode_chunk_stream_v1<R: Read, W: Write>(
+pub fn decode_chunk_stream_v1<R: Read, W: Write>(
     key_file: &KeyFile,
     expected_chunk_id: ChunkIdV1,
     input: R,
