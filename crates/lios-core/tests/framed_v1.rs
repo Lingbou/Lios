@@ -529,3 +529,33 @@ fn decode_limits_reject_authenticated_zstd_window_above_maximum() {
     );
     assert_no_transactional_output(tmp.path(), &destination);
 }
+
+#[test]
+fn chunk_stream_roundtrips_uncompressed_mode_with_exact_hash() {
+    use lios_core::framed_v1::encode_chunk_stream_with_compression_v1;
+
+    let tmp = tempdir().unwrap();
+    let key = fixed_key(&tmp.path().join("key"), 39);
+    let chunk_id = ChunkIdV1::from_bytes([18; 32]);
+    let input = b"uncompressed raw stream payload with high efficiency";
+    let mut encoded = Vec::new();
+    let encode_stats = encode_chunk_stream_with_compression_v1(
+        &key,
+        chunk_id,
+        Cursor::new(input),
+        &mut encoded,
+        false,
+    )
+    .unwrap();
+
+    let (decode_stats, decoded) =
+        decode_transactionally(&key, chunk_id, &encoded, input.len() as u64).unwrap();
+    let expected_hash: [u8; 32] = Sha256::digest(input).into();
+
+    assert_eq!(decoded, input);
+    assert_eq!(encode_stats.original_bytes, input.len() as u64);
+    assert_eq!(decode_stats.original_bytes, input.len() as u64);
+    assert_eq!(encode_stats.original_sha256, expected_hash);
+    assert_eq!(decode_stats.original_sha256, expected_hash);
+    assert_eq!(encode_stats.compressed_bytes, input.len() as u64);
+}

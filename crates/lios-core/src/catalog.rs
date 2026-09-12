@@ -14,7 +14,8 @@ use crate::format_v1::{
     decrypt_envelope_v1, encrypt_envelope_v1, envelope_encoded_len_v1, EnvelopeKindV1,
 };
 use crate::framed_v1::{
-    decode_chunk_stream_v1, encode_chunk_stream_v1, ChunkDecodeLimitsV1, ChunkIdV1,
+    decode_chunk_stream_v1, encode_chunk_stream_with_compression_v1,
+    ChunkDecodeLimitsV1, ChunkIdV1,
 };
 use crate::pack::{PackOptions, PackProgress, PackSource};
 use crate::restore::{RestoreConflictPolicy, RestoreOptions};
@@ -2359,12 +2360,25 @@ fn pack_content_object_v1(
                 format!("{FILES_DIR}/{object_id}/{FILE_CHUNKS_DIR}/{chunk_id_hex}.lios");
             let chunk_path = options.staging_dir.join(&relative_path);
             let mut temp = SiblingTempFile::create(&chunk_path, ".lios-tmp")?;
+            let should_compress = !is_precompressed_path(path);
             let stats = if at_eof {
-                encode_chunk_stream_v1(key, chunk_id, std::io::empty(), temp.file_mut())?
+                encode_chunk_stream_with_compression_v1(
+                    key,
+                    chunk_id,
+                    std::io::empty(),
+                    temp.file_mut(),
+                    should_compress,
+                )?
             } else {
                 let limited = source.by_ref().take(options.chunk_size as u64);
                 let hashing = WholeFileHashingReader::new(limited, &mut file_hasher);
-                encode_chunk_stream_v1(key, chunk_id, hashing, temp.file_mut())?
+                encode_chunk_stream_with_compression_v1(
+                    key,
+                    chunk_id,
+                    hashing,
+                    temp.file_mut(),
+                    should_compress,
+                )?
             };
             temp.persist_new(&chunk_path)?;
             total_size = total_size
@@ -3499,5 +3513,21 @@ mod tests {
             "failed to create junction: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+pub fn is_precompressed_path(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "zip" | "gz" | "tgz" | "tar" | "xz" | "7z" | "bz2" | "zst" | "lz4"
+                | "mp4" | "mkv" | "mov" | "avi" | "webm" | "flv" | "wmv"
+                | "mp3" | "flac" | "aac" | "ogg" | "m4a" | "wav"
+                | "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "avif"
+                | "iso" | "dmg" | "apk" | "ipa" | "whl" | "jar" | "war"
+                | "pdf" | "docx" | "xlsx" | "pptx"
+        )
+    } else {
+        false
     }
 }

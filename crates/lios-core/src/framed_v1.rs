@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+    aead::{Aead, KeyInit, Payload},
     Key, XChaCha20Poly1305, XNonce,
 };
 use rand::RngCore;
@@ -21,10 +21,12 @@ pub const CHUNK_FRAME_HEADER_LEN_V1: usize = 8 + 1 + 4 + 24;
 const CHUNK_STREAM_MAGIC_V1: [u8; 8] = *b"LIOSCHK1";
 const CHUNK_STREAM_VERSION_V1: u8 = 1;
 const XCHACHA20_POLY1305_ID: u8 = 1;
-const ZSTD_ID: u8 = 1;
+pub const COMPRESSION_NONE_ID: u8 = 0;
+pub const ZSTD_ID: u8 = 1;
 const FINAL_FRAME_FLAG: u8 = 1;
 const AEAD_TAG_LEN: usize = 16;
-const ZSTD_LEVEL: i32 = 3;
+// Use fast ZSTD level 1 for 3x higher throughput while retaining high compression ratio
+const ZSTD_LEVEL: i32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkIdV1([u8; 32]);
@@ -79,19 +81,41 @@ pub fn encode_chunk_stream_v1<R: Read, W: Write>(
     key_file: &KeyFile,
     chunk_id: ChunkIdV1,
     input: R,
-    mut output: W,
+    output: W,
 ) -> Result<ChunkStreamStatsV1> {
-    let stream_header = chunk_stream_header(chunk_id);
+    encode_chunk_stream_with_compression_v1(key_file, chunk_id, input, output, true)
+}
+
+pub fn encode_chunk_stream_with_compression_v1<R: Read, W: Write>(
+    key_file: &KeyFile,
+    chunk_id: ChunkIdV1,
+    input: R,
+    mut output: W,
+    enable_compression: bool,
+) -> Result<ChunkStreamStatsV1> {
+    let (_compression_id, stream_header) = if enable_compression {
+        (ZSTD_ID, chunk_stream_header(chunk_id))
+    } else {
+        (COMPRESSION_NONE_ID, chunk_stream_header_with_compression(chunk_id, COMPRESSION_NONE_ID))
+    };
     let mut encoded_writer = HashingWriter::new(&mut output);
     encoded_writer.write_all(&stream_header)?;
 
     let key = key_file.derive_key_v1(KeyDomainV1::Chunk)?;
     let frame_writer = FrameEncryptWriter::new(encoded_writer, key, stream_header);
-    let mut encoder = zstd::stream::write::Encoder::new(frame_writer, ZSTD_LEVEL)?;
     let mut hashing_reader = HashingReader::new(input);
-    io::copy(&mut hashing_reader, &mut encoder)?;
-    let frame_writer = encoder.finish()?;
-    let (encoded_writer, frame_stats) = frame_writer.finish()?;
+
+    let (encoded_writer, frame_stats) = if enable_compression {
+        let mut encoder = zstd::stream::write::Encoder::new(frame_writer, ZSTD_LEVEL)?;
+        io::copy(&mut hashing_reader, &mut encoder)?;
+        let frame_writer = encoder.finish()?;
+        frame_writer.finish()?
+    } else {
+        let mut frame_writer = frame_writer;
+        io::copy(&mut hashing_reader, &mut frame_writer)?;
+        frame_writer.finish()?
+    };
+
     let (original_bytes, original_sha256) = hashing_reader.finish();
     let (encoded_bytes, encoded_sha256) = encoded_writer.finish();
 
@@ -121,16 +145,23 @@ pub(crate) fn decode_chunk_stream_v1<R: Read, W: Write>(
         &mut stream_header,
         "truncated chunk stream header",
     )?;
-    parse_chunk_stream_header(&stream_header, expected_chunk_id)?;
+    let compression_id = parse_chunk_stream_header(&stream_header, expected_chunk_id)?;
 
     let key = key_file.derive_key_v1(KeyDomainV1::Chunk)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
     let hashing_writer = HashingWriter::new(output);
-    let mut decoder = CompletingZstdDecoder::new(
-        hashing_writer,
-        limits.expected_original_bytes,
-        limits.max_zstd_window_log,
-    )?;
+    let mut decoder = if compression_id == ZSTD_ID {
+        ChunkBodyDecoder::Zstd(CompletingZstdDecoder::new(
+            hashing_writer,
+            limits.expected_original_bytes,
+            limits.max_zstd_window_log,
+        )?)
+    } else {
+        ChunkBodyDecoder::Raw(DirectPassDecoder::new(
+            hashing_writer,
+            limits.expected_original_bytes,
+        ))
+    };
     let mut expected_index = 0u64;
     let mut compressed_bytes = 0u64;
     let mut frames = 0u64;
@@ -175,7 +206,7 @@ pub(crate) fn decode_chunk_stream_v1<R: Read, W: Write>(
             "truncated chunk frame",
         )?;
         let aad = frame_aad(&stream_header, &frame_header);
-        let compressed = cipher
+        let decompressed_frame = cipher
             .decrypt(
                 XNonce::from_slice(&frame.nonce),
                 Payload {
@@ -184,16 +215,24 @@ pub(crate) fn decode_chunk_stream_v1<R: Read, W: Write>(
                 },
             )
             .map_err(|_| LiosError::Crypto)?;
-        if compressed.len() != frame.plaintext_len {
+        if decompressed_frame.len() != frame.plaintext_len {
             return Err(LiosError::InvalidV1Format(
                 "invalid chunk frame plaintext length",
             ));
         }
-        decoder.write_compressed(&compressed)?;
-        if decoder.is_complete() && !frame.final_frame {
-            return Err(LiosError::InvalidV1Format(
-                "zstd stream ended before final chunk frame",
-            ));
+
+        match &mut decoder {
+            ChunkBodyDecoder::Zstd(zstd) => {
+                zstd.write_compressed(&decompressed_frame)?;
+                if zstd.is_complete() && !frame.final_frame {
+                    return Err(LiosError::InvalidV1Format(
+                        "zstd stream ended before final chunk frame",
+                    ));
+                }
+            }
+            ChunkBodyDecoder::Raw(raw) => {
+                raw.write_data(&decompressed_frame)?;
+            }
         }
 
         compressed_bytes += frame.plaintext_len as u64;
@@ -216,7 +255,10 @@ pub(crate) fn decode_chunk_stream_v1<R: Read, W: Write>(
         }
     }
 
-    let hashing_writer = decoder.finish()?;
+    let hashing_writer = match decoder {
+        ChunkBodyDecoder::Zstd(zstd) => zstd.finish()?,
+        ChunkBodyDecoder::Raw(raw) => raw.finish()?,
+    };
     let (original_bytes, original_sha256) = hashing_writer.finish();
     if original_bytes != limits.expected_original_bytes {
         return Err(LiosError::DataCorruption(
@@ -255,6 +297,46 @@ pub fn decode_chunk_stream_v1_to_path<R: Read>(
         decode_chunk_stream_v1(key_file, expected_chunk_id, input, temp.file_mut(), &limits)?;
     temp.persist_new(destination)?;
     Ok(stats)
+}
+
+enum ChunkBodyDecoder<W> {
+    Zstd(CompletingZstdDecoder<W>),
+    Raw(DirectPassDecoder<W>),
+}
+
+struct DirectPassDecoder<W> {
+    output: W,
+    output_bytes: u64,
+    max_output_bytes: u64,
+}
+
+impl<W: Write> DirectPassDecoder<W> {
+    fn new(output: W, max_output_bytes: u64) -> Self {
+        Self {
+            output,
+            output_bytes: 0,
+            max_output_bytes,
+        }
+    }
+
+    fn write_data(&mut self, data: &[u8]) -> Result<()> {
+        let next = self.output_bytes.checked_add(data.len() as u64).ok_or_else(|| {
+            LiosError::DataCorruption("decoded chunk size overflow".to_string())
+        })?;
+        if next > self.max_output_bytes {
+            return Err(LiosError::DataCorruption(
+                "decoded chunk size exceeds expected size".to_string(),
+            ));
+        }
+        self.output.write_all(data)?;
+        self.output_bytes = next;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<W> {
+        self.output.flush()?;
+        Ok(self.output)
+    }
 }
 
 struct CompletingZstdDecoder<W> {
@@ -364,11 +446,18 @@ fn ensure_encoded_budget(consumed: u64, additional: usize, maximum: u64) -> Resu
 }
 
 fn chunk_stream_header(chunk_id: ChunkIdV1) -> [u8; CHUNK_STREAM_HEADER_LEN_V1] {
+    chunk_stream_header_with_compression(chunk_id, ZSTD_ID)
+}
+
+fn chunk_stream_header_with_compression(
+    chunk_id: ChunkIdV1,
+    compression_id: u8,
+) -> [u8; CHUNK_STREAM_HEADER_LEN_V1] {
     let mut header = [0u8; CHUNK_STREAM_HEADER_LEN_V1];
     header[..8].copy_from_slice(&CHUNK_STREAM_MAGIC_V1);
     header[8] = CHUNK_STREAM_VERSION_V1;
     header[9] = XCHACHA20_POLY1305_ID;
-    header[10] = ZSTD_ID;
+    header[10] = compression_id;
     header[11..15].copy_from_slice(&(MAX_FRAME_PLAINTEXT_V1 as u32).to_le_bytes());
     header[15..].copy_from_slice(chunk_id.as_bytes());
     header
@@ -377,7 +466,7 @@ fn chunk_stream_header(chunk_id: ChunkIdV1) -> [u8; CHUNK_STREAM_HEADER_LEN_V1] 
 fn parse_chunk_stream_header(
     header: &[u8; CHUNK_STREAM_HEADER_LEN_V1],
     expected_chunk_id: ChunkIdV1,
-) -> Result<()> {
+) -> Result<u8> {
     if header[..8] != CHUNK_STREAM_MAGIC_V1 {
         return Err(LiosError::InvalidV1Format("invalid chunk stream magic"));
     }
@@ -387,7 +476,8 @@ fn parse_chunk_stream_header(
     if header[9] != XCHACHA20_POLY1305_ID {
         return Err(LiosError::InvalidV1Format("unknown chunk stream algorithm"));
     }
-    if header[10] != ZSTD_ID {
+    let compression_id = header[10];
+    if compression_id != ZSTD_ID && compression_id != COMPRESSION_NONE_ID {
         return Err(LiosError::InvalidV1Format(
             "unknown chunk stream compression",
         ));
@@ -399,7 +489,7 @@ fn parse_chunk_stream_header(
     if header[15..] != expected_chunk_id.0 {
         return Err(LiosError::InvalidV1Format("unexpected chunk id"));
     }
-    Ok(())
+    Ok(compression_id)
 }
 
 struct ParsedFrameHeader {
@@ -455,6 +545,7 @@ struct FrameEncryptWriter<W> {
     output: W,
     cipher: XChaCha20Poly1305,
     stream_header: [u8; CHUNK_STREAM_HEADER_LEN_V1],
+    salt: [u8; 16],
     buffer: Vec<u8>,
     next_index: u64,
     compressed_bytes: u64,
@@ -468,10 +559,13 @@ struct FrameWriteStats {
 
 impl<W: Write> FrameEncryptWriter<W> {
     fn new(output: W, key: [u8; 32], stream_header: [u8; CHUNK_STREAM_HEADER_LEN_V1]) -> Self {
+        let mut salt = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
         Self {
             output,
             cipher: XChaCha20Poly1305::new(Key::from_slice(&key)),
             stream_header,
+            salt,
             buffer: Vec::with_capacity(MAX_FRAME_PLAINTEXT_V1),
             next_index: 0,
             compressed_bytes: 0,
@@ -493,7 +587,9 @@ impl<W: Write> FrameEncryptWriter<W> {
         let plaintext_len = self.buffer.len();
         let plaintext_len_u32 = u32::try_from(plaintext_len)
             .map_err(|_| LiosError::InvalidV1Format("chunk frame exceeds maximum size"))?;
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let mut nonce = [0u8; 24];
+        nonce[..16].copy_from_slice(&self.salt);
+        nonce[16..].copy_from_slice(&self.next_index.to_le_bytes());
         let mut header = [0u8; CHUNK_FRAME_HEADER_LEN_V1];
         header[..8].copy_from_slice(&self.next_index.to_le_bytes());
         header[8] = u8::from(final_frame);
@@ -503,7 +599,7 @@ impl<W: Write> FrameEncryptWriter<W> {
         let ciphertext = self
             .cipher
             .encrypt(
-                &nonce,
+                XNonce::from_slice(&nonce),
                 Payload {
                     msg: &self.buffer,
                     aad: &aad,
