@@ -5,6 +5,7 @@ macro_rules! with_registered_commands {
             setup_token,
             set_chunk_size,
             register_space,
+            remove_space,
             create_dataset_repo,
             list_dataset_repos,
             initialize_space,

@@ -1,4 +1,4 @@
-import { AlertTriangle, ChevronRight, Cloud, HardDrive, Plus, RefreshCw, Settings } from "lucide-react";
+import { AlertTriangle, ChevronRight, Cloud, HardDrive, Plus, RefreshCw, Settings, Trash2 } from "lucide-react";
 import type { SpaceSummary } from "../../appTypes.ts";
 
 export interface SpaceGridProps {
@@ -11,6 +11,7 @@ export interface SpaceGridProps {
   onRefresh: () => void;
   onCreateSpace: () => void;
   onSelectSpace: (space: SpaceSummary) => void;
+  onRemoveSpace?: (space: SpaceSummary) => void;
   onOpenSettings: () => void;
 }
 
@@ -24,6 +25,7 @@ export function SpaceGrid({
   onRefresh,
   onCreateSpace,
   onSelectSpace,
+  onRemoveSpace,
   onOpenSettings
 }: SpaceGridProps) {
   const isSearching = Boolean(query.trim());
@@ -88,8 +90,7 @@ export function SpaceGrid({
               const hasNonAscii = /[^\x00-\x7F]/.test(space.dataset);
 
               return (
-                <button
-                  type="button"
+                <div
                   className={`spaceCard ${active ? "active" : ""} ${hasNonAscii ? "unsupportedCard" : ""}`}
                   key={`${space.endpoint}/${space.namespace}/${space.dataset}`}
                   onClick={() => {
@@ -106,6 +107,8 @@ export function SpaceGrid({
                       ? "名称包含非 ASCII 字符（如中文），暂不支持关联"
                       : `${space.namespace}/${space.dataset}`
                   }
+                  role="button"
+                  tabIndex={0}
                 >
                   <HardDrive aria-hidden />
                   <span>
@@ -115,12 +118,29 @@ export function SpaceGrid({
                       {hasNonAscii && " · 不支持中文"}
                     </small>
                   </span>
-                  {hasNonAscii ? (
-                    <AlertTriangle className="unsupportedIcon" aria-hidden />
-                  ) : (
-                    <ChevronRight aria-hidden />
-                  )}
-                </button>
+
+                  <div className="spaceCardActions">
+                    {onRemoveSpace && !hasNonAscii && (
+                      <button
+                        type="button"
+                        className="removeSpaceBtn"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onRemoveSpace(space);
+                        }}
+                        title="从本地移除此空间"
+                        aria-label="从本地移除空间"
+                      >
+                        <Trash2 aria-hidden />
+                      </button>
+                    )}
+                    {hasNonAscii ? (
+                      <AlertTriangle className="unsupportedIcon" aria-hidden />
+                    ) : (
+                      <ChevronRight aria-hidden />
+                    )}
+                  </div>
+                </div>
               );
             })}
           </div>

@@ -1625,6 +1625,13 @@ fn set_chunk_size(
 }
 
 #[tauri::command]
+fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandResult<()> {
+    state.paths.ensure_dirs().map_err(to_err)?;
+    SpaceRegistry::new(state.paths.clone()).remove(&name)?;
+    Ok(())
+}
+
+#[tauri::command]
 fn register_space(
     state: tauri::State<'_, AppContext>,
     name: String,

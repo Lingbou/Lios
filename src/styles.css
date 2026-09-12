@@ -2456,3 +2456,36 @@ select:focus {
 .previewNavBtn.next {
   right: 16px;
 }
+
+.spaceCardActions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.removeSpaceBtn {
+  min-height: auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  opacity: 0;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.spaceCard:hover .removeSpaceBtn {
+  opacity: 1;
+}
+
+.removeSpaceBtn:hover {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}

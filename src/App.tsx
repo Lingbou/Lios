@@ -318,6 +318,9 @@ async function appInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
   if (command === "set_chunk_size") {
     return null as T;
   }
+  if (command === "remove_space") {
+    return null as T;
+  }
   if (command === "preview_file_node") {
     return {
       name: "document.md",
@@ -563,6 +566,23 @@ function App() {
       });
       setModelscopeUser(result.user);
 
+      // Auto-prune any locally registered space whose remote repo has been deleted on ModelScope
+      const remoteRepoSet = new Set(result.repositories.map((r) => `${r.namespace}/${r.dataset}`));
+      let anyPruned = false;
+      for (const space of next.spaces) {
+        if (
+          space.namespace === result.user.username &&
+          !remoteRepoSet.has(`${space.namespace}/${space.dataset}`)
+        ) {
+          try {
+            await appInvoke("remove_space", { name: space.space_name });
+            anyPruned = true;
+          } catch {
+            // Ignore
+          }
+        }
+      }
+
       // Auto-register any discovered ASCII ModelScope dataset into local space registry
       const registeredSet = new Set(next.spaces.map((s) => `${s.namespace}/${s.dataset}`));
       let anyRegistered = false;
@@ -584,14 +604,20 @@ function App() {
           }
         }
       }
-      if (anyRegistered) {
+      if (anyRegistered || anyPruned) {
         const updatedSetup = await appInvoke<Snapshot>("current_setup");
         setSnapshot(updatedSetup);
         setSpaces(updatedSetup.spaces);
         const updatedActive = preferredName
           ? updatedSetup.spaces.find((space) => space.space_name === preferredName) ?? null
           : null;
-        if (updatedActive) setActiveSpace(updatedActive);
+        if (updatedActive) {
+          setActiveSpace(updatedActive);
+        } else if (activeSpace && !updatedSetup.spaces.some((s) => s.space_name === activeSpace.space_name)) {
+          setActiveSpace(null);
+          setCatalogTree(null);
+          setCatalogStatus("idle");
+        }
         return updatedActive;
       }
     }
@@ -1330,6 +1356,24 @@ function App() {
     setRebuildDialog(null);
   }
 
+  async function handleRemoveSpace(space: SpaceSummary) {
+    const ok = window.confirm(
+      `确定从本地移除空间「${space.dataset}」？此操作仅移除本地空间别名映射，不会影响远端数据。`
+    );
+    if (!ok) return;
+    try {
+      await appInvoke("remove_space", { name: space.space_name });
+      if (activeSpace?.space_name === space.space_name) {
+        setActiveSpace(null);
+        setCatalogTree(null);
+        setCatalogStatus("idle");
+      }
+      await refreshSetup(false);
+    } catch (error) {
+      setMessage(errorText(error));
+    }
+  }
+
   async function selectAccount() {
     setView("spaces");
     setMessage("");
@@ -1739,6 +1783,7 @@ function App() {
               onRefresh={() => refreshSetup(true)}
               onCreateSpace={openCreateSpaceDialog}
               onSelectSpace={(space) => loadSpace(space)}
+              onRemoveSpace={handleRemoveSpace}
               onOpenSettings={() => setView("settings")}
             />
           ) : (
