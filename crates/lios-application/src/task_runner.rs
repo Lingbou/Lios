@@ -1101,13 +1101,21 @@ impl Application {
                 None,
             ));
         }
+        let mut metrics = crate::task_manager::TransferMetrics::new();
         let outcome = execute_sync_work(
             adapter,
             repo,
             work,
             || Ok(false),
             |progress| {
-                persist_transaction_progress(paths, task_id, &progress)?;
+                let observation = metrics.observe(progress.bytes_done, progress.bytes_total, false);
+                persist_transaction_progress(
+                    paths,
+                    task_id,
+                    &progress,
+                    observation.speed_bps,
+                    observation.eta_seconds,
+                )?;
                 on_progress(progress_from_transaction(task_id, &progress));
                 Ok(())
             },
@@ -1164,11 +1172,33 @@ impl Application {
         store
             .update_transfer(task.id, 0, total, 0, bytes_total, 0)
             .map_err(to_err)?;
+        let mut metrics = crate::task_manager::TransferMetrics::new();
         let mut bytes_done = 0u64;
         for (index, file) in remote_files.iter().enumerate() {
             let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
+            let file_bytes_start = bytes_done;
             adapter
-                .download_object(&repo.namespace, &repo.dataset, &file.path, &local_path)
+                .download_object_with_progress(
+                    &repo.namespace,
+                    &repo.dataset,
+                    &file.path,
+                    &local_path,
+                    |chunk_bytes| {
+                        let current_bytes_done = file_bytes_start.saturating_add(chunk_bytes);
+                        let observation = metrics.observe(current_bytes_done, bytes_total, false);
+                        if let Ok(store) = TaskStore::open(&paths.database) {
+                            let _ = store.update_transfer(
+                                task.id,
+                                index as u64,
+                                total,
+                                current_bytes_done,
+                                bytes_total,
+                                observation.speed_bps,
+                            );
+                            let _ = store.update_eta(task.id, observation.eta_seconds);
+                        }
+                    },
+                )
                 .await
                 .map_err(to_err)?;
             bytes_done = bytes_done.saturating_add(
@@ -1176,9 +1206,20 @@ impl Application {
                     .map(|metadata| metadata.len())
                     .unwrap_or(0),
             );
+            let observation = metrics.observe(bytes_done, bytes_total, true);
             let completed = index as u64 + 1;
             store
-                .update_transfer(task.id, completed, total, bytes_done, bytes_total, 0)
+                .update_transfer(
+                    task.id,
+                    completed,
+                    total,
+                    bytes_done,
+                    bytes_total,
+                    observation.speed_bps,
+                )
+                .map_err(to_err)?;
+            store
+                .update_eta(task.id, observation.eta_seconds)
                 .map_err(to_err)?;
             on_progress(ForegroundProgress {
                 task_id: task.id,
@@ -1868,6 +1909,8 @@ fn persist_transaction_progress(
     paths: &LiosPaths,
     task_id: Uuid,
     progress: &CatalogTransactionProgress,
+    speed_bps: u64,
+    eta_seconds: Option<u64>,
 ) -> lios_core::Result<()> {
     let store = TaskStore::open(&paths.database)?;
     if let Some(checkpoint) = &progress.blob_checkpoint {
@@ -1889,8 +1932,9 @@ fn persist_transaction_progress(
         progress.total_items,
         progress.bytes_done,
         progress.bytes_total,
-        0,
-    )
+        speed_bps,
+    )?;
+    store.update_eta(task_id, eta_seconds)
 }
 
 fn progress_from_transaction(
@@ -1982,6 +2026,8 @@ mod tests {
             &paths,
             task.id,
             &progress(CatalogBlobCheckpointState::Uploaded),
+            0,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1993,6 +2039,8 @@ mod tests {
             &paths,
             task.id,
             &progress(CatalogBlobCheckpointState::Committed),
+            0,
+            None,
         )
         .unwrap();
         assert_eq!(

@@ -1293,12 +1293,9 @@ select:focus {
 }
 
 .taskFileProgress {
-  display: grid;
-  gap: 4px;
-}
-
-.taskFileProgress .meter {
-  height: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
 }
 
 .taskFileProgress small {

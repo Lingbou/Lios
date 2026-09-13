@@ -303,14 +303,6 @@ function TaskDetails({
                     <span>{taskItemStatusText(item)}</span>
                   </div>
                   <div className="taskFileProgress">
-                    <progress
-                      className="meter"
-                      max={100}
-                      value={taskItemProgressPercent(item)}
-                      aria-label={`${taskItemProgressPercent(item)}%`}
-                    >
-                      {taskItemProgressPercent(item)}%
-                    </progress>
                     <small>{taskItemProgressText(item)}</small>
                   </div>
                 </>
