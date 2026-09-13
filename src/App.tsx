@@ -83,6 +83,7 @@ import type {
   ViewMode
 } from "./features/drive/driveTypes.ts";
 import { CreateSpaceModal } from "./features/spaces/CreateSpaceModal.tsx";
+import { nameToSafeSlug } from "./features/spaces/spaceMapping.ts";
 import { SpaceGrid } from "./features/spaces/SpaceGrid.tsx";
 import { RebuildCatalogModal } from "./features/catalog/RebuildCatalogModal.tsx";
 import { ImportKeyModal } from "./features/recoveryKey/ImportKeyModal.tsx";
@@ -363,7 +364,6 @@ function App() {
   const [manualEndpoint, setManualEndpoint] = useState("https://modelscope.cn");
   const [createSpaceOpen, setCreateSpaceOpen] = useState(false);
   const [newSpaceName, setNewSpaceName] = useState("");
-  const [newSpaceRepoId, setNewSpaceRepoId] = useState("");
   const [createSpaceError, setCreateSpaceError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState("");
@@ -1399,42 +1399,32 @@ function App() {
     }
     setCreateSpaceError("");
     setNewSpaceName("");
-    setNewSpaceRepoId("");
     setCreateSpaceOpen(true);
   }
 
   async function submitCreateSpace() {
     if (!modelscopeUser?.username) return;
     const nameTrimmed = newSpaceName.trim();
-    const repoIdTrimmed = newSpaceRepoId.trim();
     if (!nameTrimmed) {
       setCreateSpaceError("请输入空间名称");
       return;
     }
-    if (!repoIdTrimmed) {
-      setCreateSpaceError("请输入远端仓库标识 (ID)");
-      return;
-    }
-    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(repoIdTrimmed)) {
-      setCreateSpaceError("仓库标识必须以小写英文字母开头，只能包含小写英文、数字、_ 或 -，最长 32 字符");
-      return;
-    }
+    const repoId = nameToSafeSlug(nameTrimmed);
     setBusy("创建空间");
     setMessage("");
     setCreateSpaceError("");
     try {
       await appInvoke("create_dataset_repo", {
-        name: repoIdTrimmed,
-        title: nameTrimmed !== repoIdTrimmed ? nameTrimmed : null,
+        name: repoId,
+        title: nameTrimmed,
         namespace: modelscopeUser.username,
-        dataset: repoIdTrimmed,
+        dataset: repoId,
         endpoint: manualEndpoint
       });
-      globalThis.localStorage?.setItem("lios.lastSpaceName", repoIdTrimmed);
+      globalThis.localStorage?.setItem("lios.lastSpaceName", repoId);
       const scopedSpace = await refreshSetup(true);
       setCreateSpaceOpen(false);
       setNewSpaceName("");
-      setNewSpaceRepoId("");
       if (scopedSpace) await loadSpace(scopedSpace);
     } catch (error) {
       const text = errorText(error);
@@ -1988,21 +1978,10 @@ function App() {
         <CreateSpaceModal
           open={createSpaceOpen}
           name={newSpaceName}
-          repoId={newSpaceRepoId}
           error={createSpaceError}
           busy={busy !== null}
           onChangeName={(val) => {
             setNewSpaceName(val);
-            setCreateSpaceError("");
-            if (/^[a-z0-9_-]+$/i.test(val.trim())) {
-              const clean = val.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_").slice(0, 32);
-              if (/^[a-z]/.test(clean)) {
-                setNewSpaceRepoId(clean);
-              }
-            }
-          }}
-          onChangeRepoId={(val) => {
-            setNewSpaceRepoId(val);
             setCreateSpaceError("");
           }}
           onClose={() => {

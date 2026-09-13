@@ -3,11 +3,9 @@ import { AlertCircle, X } from "lucide-react";
 export interface CreateSpaceModalProps {
   open: boolean;
   name: string;
-  repoId: string;
   error: string;
   busy: boolean;
   onChangeName: (name: string) => void;
-  onChangeRepoId: (repoId: string) => void;
   onClose: () => void;
   onSubmit: () => void;
 }
@@ -15,29 +13,15 @@ export interface CreateSpaceModalProps {
 export function CreateSpaceModal({
   open,
   name,
-  repoId,
   error,
   busy,
   onChangeName,
-  onChangeRepoId,
   onClose,
   onSubmit
 }: CreateSpaceModalProps) {
   if (!open) return null;
 
-  const trimmedName = name.trim();
-  const trimmedRepoId = repoId.trim();
-  const isInvalidRepoId = Boolean(trimmedRepoId) && !/^[a-z][a-z0-9_-]{0,31}$/.test(trimmedRepoId);
-
-  const displayError =
-    error ||
-    (!trimmedName
-      ? ""
-      : !trimmedRepoId
-        ? "请输入远端仓库标识 (ID)"
-        : isInvalidRepoId
-          ? "仓库标识必须以小写英文开头，仅限小写英文、数字、_ 或 -，最长 32 字符"
-          : "");
+  const trimmed = name.trim();
 
   return (
     <div className="modalBackdrop">
@@ -58,34 +42,21 @@ export function CreateSpaceModal({
         </div>
         <div className="spaceModalBody">
           <label>
-            <span>空间名称 / 备注 (支持中文)</span>
+            <span>空间名称</span>
             <input
               autoFocus
               value={name}
-              placeholder="例如：工作文档、照片备份、photos"
               onChange={(event) => onChangeName(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && trimmedName && trimmedRepoId && !isInvalidRepoId && !busy) onSubmit();
+                if (event.key === "Enter" && trimmed && !busy) onSubmit();
                 if (event.key === "Escape") onClose();
               }}
             />
           </label>
-          <label>
-            <span>远端仓库 ID (ModelScope 英文标识)</span>
-            <input
-              value={repoId}
-              placeholder="例如：work_docs (仅限小写英文、数字、-、_)"
-              onChange={(event) => onChangeRepoId(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && trimmedName && trimmedRepoId && !isInvalidRepoId && !busy) onSubmit();
-                if (event.key === "Escape") onClose();
-              }}
-            />
-          </label>
-          {displayError && (
+          {error && (
             <div className="fieldError">
               <AlertCircle className="fieldErrorIcon" aria-hidden />
-              <span>{displayError}</span>
+              <span>{error}</span>
             </div>
           )}
         </div>
@@ -97,7 +68,7 @@ export function CreateSpaceModal({
             type="button"
             className="primary"
             onClick={onSubmit}
-            disabled={!trimmedName || !trimmedRepoId || Boolean(displayError) || busy}
+            disabled={!trimmed || busy}
           >
             创建
           </button>
