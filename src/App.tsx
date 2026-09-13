@@ -1477,35 +1477,15 @@ function App() {
 
           <div className="railFooter">
             <button
-              className={view === "spaces" ? "active" : ""}
+              className={view === "spaces" || view === "drive" ? "active" : ""}
               onClick={() => {
                 setView("spaces");
                 setQuery("");
               }}
-              title="所有空间"
+              title="空间"
             >
               <HardDrive aria-hidden />
               空间
-            </button>
-            <button
-              className={view === "drive" ? "active" : ""}
-              onClick={() => {
-                if (!activeSpace) {
-                  setView("spaces");
-                } else if (
-                  catalogStatus === "ready" ||
-                  catalogStatus === "missing" ||
-                  catalogStatus === "error"
-                ) {
-                  setView("drive");
-                } else {
-                  void loadSpace(activeSpace);
-                }
-              }}
-              title={activeSpace ? `当前空间：${activeSpace.dataset}` : "文件"}
-            >
-              <FolderOpen aria-hidden />
-              文件
             </button>
             <button
               className={view === "settings" ? "active" : ""}
