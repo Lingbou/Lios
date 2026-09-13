@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use lios_core::catalog::{
-    Catalog, CatalogIntegrityReport, CatalogRemoteIntegrityReport, CatalogSelection,
-    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution, SourceFileSnapshot,
-    CATALOG_FILE,
+    Catalog, CatalogIntegrityReport,
+    CatalogRemoteIntegrityReport, CatalogSelection, CatalogTreeNode, CatalogTreeNodeKind,
+    ConflictAction, ConflictResolution, SourceFileSnapshot, CATALOG_FILE,
 };
 use lios_core::catalog_transaction::{
     probe_catalog_sha256, CatalogBlobCheckpointState, CatalogTransactionOutcome,
@@ -591,9 +591,14 @@ impl Application {
                 self.run_verify(task_paths, task, repo, full, on_progress)
                     .await
             }
-            TaskSpec::RebuildCatalog { .. } => Err(CommandError::invalid_input(
-                "catalog rebuild is not available in the first CLI release",
-            )),
+            TaskSpec::RebuildCatalog {
+                repo,
+                expected_revision,
+                ..
+            } => {
+                self.run_rebuild(task_paths, task, repo, expected_revision, on_progress)
+                    .await
+            }
         }
     }
 
@@ -1209,6 +1214,129 @@ impl Application {
             bytes_total,
         });
         Ok(Vec::new())
+    }
+
+    async fn run_rebuild<F>(
+        &self,
+        paths: &LiosPaths,
+        task: &TaskRecord,
+        repo: RepoConfig,
+        expected_revision: Option<String>,
+        on_progress: &mut F,
+    ) -> CommandResult<Vec<String>>
+    where
+        F: FnMut(ForegroundProgress),
+    {
+        let config = LiosConfig::load(&paths.config).map_err(to_err)?;
+        let key = key_from_config(&config)?;
+        let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
+        let started_revision = adapter
+            .head_revision(&repo.namespace, &repo.dataset)
+            .await
+            .map_err(to_err)?;
+        if let Some(expected) = expected_revision.as_deref() {
+            let current_commit = started_revision
+                .commit_id
+                .as_deref()
+                .unwrap_or("");
+            if expected != current_commit {
+                return Err(CommandError::new(
+                    CommandErrorCode::RemoteConflict,
+                    "remote space changed after the rebuild preview",
+                    false,
+                    Some(serde_json::json!({
+                        "preview_revision": expected,
+                        "current_revision": current_commit,
+                    })),
+                ));
+            }
+        }
+        let remote_objects = adapter
+            .list_objects(&repo.namespace, &repo.dataset, "")
+            .await
+            .map_err(to_err)?;
+        let metadata_objects = remote_objects
+            .iter()
+            .filter(|obj| {
+                obj.path.starts_with("recovery/nodes/")
+                    || (obj.path.starts_with("objects/files/") && obj.path.ends_with("/manifest.enc"))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let total_objects = metadata_objects.len() as u64;
+        let total_bytes = metadata_objects
+            .iter()
+            .fold(0u64, |sum, obj| sum.saturating_add(obj.size));
+        let mut completed_bytes = 0u64;
+
+        for (index, obj) in metadata_objects.iter().enumerate() {
+            let local_path = remote_to_staging_path(&paths.staging, &obj.path)?;
+            adapter
+                .download_object(&repo.namespace, &repo.dataset, &obj.path, &local_path)
+                .await
+                .map_err(to_err)?;
+            completed_bytes = completed_bytes.saturating_add(obj.size);
+            let completed = (index + 1) as u64;
+            on_progress(ForegroundProgress {
+                task_id: task.id,
+                phase: "downloading_recovery_metadata".to_string(),
+                completed,
+                total: total_objects,
+                bytes_done: completed_bytes,
+                bytes_total: total_bytes,
+            });
+        }
+
+        on_progress(ForegroundProgress {
+            task_id: task.id,
+            phase: "rebuilding_catalog".to_string(),
+            completed: total_objects,
+            total: total_objects,
+            bytes_done: completed_bytes,
+            bytes_total: total_bytes,
+        });
+
+        let staging_dir = paths.staging.clone();
+        let key_clone = key.clone();
+        let remote_clone = remote_objects.clone();
+        let (catalog, report) = tokio::task::spawn_blocking(move || {
+            Catalog::rebuild_from_recovery(&key_clone, staging_dir, &remote_clone)
+        })
+        .await
+        .map_err(|error| {
+            CommandError::new(
+                CommandErrorCode::Internal,
+                format!("catalog rebuild worker failed: {error}"),
+                false,
+                None,
+            )
+        })?
+        .map_err(to_err)?;
+
+        let mut work = plan_catalog_sync(
+            paths,
+            &catalog,
+            &key,
+            crate::catalog_sync::CatalogBaseline {
+                catalog_sha256: None,
+                referenced_paths: std::collections::HashSet::new(),
+                remote_objects,
+            },
+        )?;
+        work.delete.clear();
+        work.expected_revision = Some(started_revision);
+        persist_sync_checkpoints(paths, task.id, &work)?;
+        let mut warnings = self
+            .publish_sync(paths, task.id, &adapter, &repo, work, on_progress)
+            .await?;
+        if report.unreferenced_managed_objects > 0 {
+            warnings.push(format!(
+                "发现 {} 个未被重建 catalog 引用的远端对象，未执行删除",
+                report.unreferenced_managed_objects
+            ));
+        }
+        Ok(warnings)
     }
 
     async fn run_verify<F>(
