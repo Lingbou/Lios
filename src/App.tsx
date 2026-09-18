@@ -113,6 +113,18 @@ const taskApi = createTaskApi(appInvoke);
 
 type View = "spaces" | "drive" | "settings";
 type CatalogStatus = "idle" | "loading" | "ready" | "missing" | "error";
+const naturalNameCollator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base"
+});
+const activeTaskStates = new Set([
+  "Queued",
+  "Preparing",
+  "Running",
+  "Paused",
+  "Retrying",
+  "Committing"
+]);
 
 function App() {
   const [view, setView] = useState<View>("spaces");
@@ -186,10 +198,21 @@ function App() {
 
 
 
-  const currentFolder = findNode(catalogTree, currentFolderId);
-  const children =
-    currentFolder?.kind.type === "Directory" ? currentFolder.kind.children.map(treeToDriveItem) : [];
-  const visibleItems = query.trim() ? searchResults : children;
+  const currentFolder = useMemo(
+    () => findNode(catalogTree, currentFolderId),
+    [catalogTree, currentFolderId]
+  );
+  const children = useMemo(
+    () =>
+      currentFolder?.kind.type === "Directory"
+        ? currentFolder.kind.children.map(treeToDriveItem)
+        : [],
+    [currentFolder]
+  );
+  const visibleItems = useMemo(
+    () => (query.trim() ? searchResults : children),
+    [children, query, searchResults]
+  );
 
   const sortedItems = useMemo(() => {
     const items = [...visibleItems];
@@ -201,10 +224,10 @@ function App() {
 
       let result = 0;
       if (sortField === "name") {
-        result = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+        result = naturalNameCollator.compare(a.name, b.name);
       } else if (sortField === "kind") {
         if (a.kind === b.kind) {
-          result = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+          result = naturalNameCollator.compare(a.name, b.name);
         } else {
           result = a.kind === "Directory" ? -1 : 1;
         }
@@ -225,9 +248,13 @@ function App() {
     () => sortedItems.filter((i) => i.kind === "File"),
     [sortedItems]
   );
-  const previewIndex = previewItem
-    ? previewableFiles.findIndex((i) => i.id === previewItem.id)
-    : -1;
+  const previewIndex = useMemo(
+    () =>
+      previewItem
+        ? previewableFiles.findIndex((item) => item.id === previewItem.id)
+        : -1,
+    [previewItem, previewableFiles]
+  );
   const hasPrevPreview = previewIndex > 0;
   const hasNextPreview = previewIndex >= 0 && previewIndex < previewableFiles.length - 1;
   const handlePrevPreview = () => {
@@ -237,40 +264,60 @@ function App() {
     if (hasNextPreview) void openFilePreview(previewableFiles[previewIndex + 1]);
   };
 
-  const rawCrumbs = breadcrumb(catalogTree, currentFolderId);
-  const crumbs = rawCrumbs.map((crumb, index) =>
-    index === 0
-      ? {
-          ...crumb,
-          name: activeSpace?.title || activeSpace?.dataset || crumb.name || "根目录"
-        }
-      : crumb
+  const rawCrumbs = useMemo(
+    () => breadcrumb(catalogTree, currentFolderId),
+    [catalogTree, currentFolderId]
   );
-  const crumbPaths = crumbs.map((_crumb, index) =>
-    crumbs
-      .slice(0, index + 1)
-      .map((crumb) => crumb.name)
-      .join(" / ")
+  const crumbs = useMemo(
+    () =>
+      rawCrumbs.map((crumb, index) =>
+        index === 0
+          ? {
+              ...crumb,
+              name: activeSpace?.title || activeSpace?.dataset || crumb.name || "根目录"
+            }
+          : crumb
+      ),
+    [activeSpace?.dataset, activeSpace?.title, rawCrumbs]
+  );
+  const crumbPaths = useMemo(
+    () =>
+      crumbs.map((_crumb, index) =>
+        crumbs
+          .slice(0, index + 1)
+          .map((crumb) => crumb.name)
+          .join(" / ")
+      ),
+    [crumbs]
   );
   const selectedCount = selectedIds.size;
-  const activeTasks = tasks.filter((task) =>
-    ["Queued", "Preparing", "Running", "Paused", "Retrying", "Committing"].includes(task.state)
-  ).length;
-  const rebuildTaskActive = tasks.some(
-    (task) =>
-      task.label === "rebuild" &&
-      ["Queued", "Preparing", "Running", "Paused", "Retrying", "Committing"].includes(task.state)
+  const activeTasks = useMemo(
+    () =>
+      tasks.filter((task) =>
+        activeTaskStates.has(task.state)
+      ).length,
+    [tasks]
+  );
+  const rebuildTaskActive = useMemo(
+    () =>
+      tasks.some(
+        (task) =>
+          task.label === "rebuild" &&
+          activeTaskStates.has(task.state)
+      ),
+    [tasks]
   );
   const hasToken = Boolean(snapshot?.has_token);
   const selectedSpace = activeSpace;
 
-  const displayedSpaces = spaces;
-  const visibleSpaces = query.trim()
-    ? displayedSpaces.filter((space) =>
-        `${space.dataset} ${space.namespace}`.toLowerCase().includes(query.trim().toLowerCase())
-      )
-    : displayedSpaces;
-  const hasSpaces = displayedSpaces.length > 0;
+  const visibleSpaces = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    if (!normalizedQuery) return spaces;
+    return spaces.filter((space) =>
+      `${space.dataset} ${space.namespace}`.toLowerCase().includes(normalizedQuery)
+    );
+  }, [query, spaces]);
+  const hasSpaces = spaces.length > 0;
   const emptyDriveMode = !hasToken ? "connect" : hasSpaces ? "select" : "create";
   const accountName = modelscopeUser?.username ?? "未连接账号";
   const crumbFallbackLabel = activeSpace
