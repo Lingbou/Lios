@@ -79,6 +79,21 @@ fn desktop_binary_name_is_reserved_for_the_desktop_product() {
 }
 
 #[test]
+fn worker_sidecar_is_generated_ephemerally_and_declared_for_bundling() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repository = manifest.parent().unwrap();
+    let config = read_json(&manifest.join("tauri.conf.json"));
+    let gitignore = fs::read_to_string(repository.join(".gitignore")).unwrap();
+    let builder = fs::read_to_string(repository.join("scripts/build-worker-sidecar.mjs")).unwrap();
+
+    assert_eq!(config["bundle"]["externalBin"][0], "binaries/lios-worker");
+    assert!(gitignore
+        .lines()
+        .any(|line| line.trim() == "src-tauri/binaries/"));
+    assert!(builder.contains("lios-worker-${artifactTarget}"));
+}
+
+#[test]
 fn linux_desktop_entry_matches_the_wayland_app_id() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let shared = read_json(&manifest.join("tauri.conf.json"));
