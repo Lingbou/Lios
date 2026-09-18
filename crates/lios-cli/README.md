@@ -1,10 +1,11 @@
-# Lios CLI 0.2
+# Lios CLI 0.1
 
 `lios` is the headless, rsync-style client for encrypted Lios Spaces. Desktop and CLI share the
 same `DIR/.lios` configuration, Space registry, Recovery Key, durable task database, and
 `lios-worker` process.
 
-Build both installed executables from the repository root:
+Build both executables into the project-local `target/release/` directory from the repository
+root:
 
 ```bash
 cargo build --release --locked -p lios-cli

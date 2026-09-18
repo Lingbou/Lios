@@ -14,9 +14,8 @@ and rsync-style transfers.
   per-action journals, atomic pull replacement, and Catalog transaction reconciliation.
 - Added the portable `lios-worker`. CLI and Desktop use the same task database and execution
   engine; detached tasks survive client exit and workers recover interrupted work.
-- Upgraded shared configuration to schema v2. The first migration backs up v1 as
-  `config.yaml.v1.bak` and reports the explicit `space add` command required to register the old
-  Repository Address.
+- Shared configuration now requires schema v3. Pre-release state with another schema must be
+  deleted and initialized with `lios setup`; there is no migration path.
 - Recovery Key verification now covers every registered Space before an imported key can replace
   the current key.
 
