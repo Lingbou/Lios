@@ -93,7 +93,7 @@ impl SpaceRegistry {
         let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
         if config.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(CommandError::invalid_input(
-                "configuration must be upgraded with `lios setup`",
+                "unsupported local configuration schema; delete the local Lios state and run `lios setup`",
             ));
         }
         Ok(config)

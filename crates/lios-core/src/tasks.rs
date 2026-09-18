@@ -440,7 +440,7 @@ impl TaskStore {
         )?;
         enable_wal_with_retry(&connection)?;
         connection.execute_batch("PRAGMA synchronous = NORMAL;")?;
-        migrate_task_store(&mut connection)?;
+        ensure_task_store_schema(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -1996,7 +1996,7 @@ fn upsert_task_catalog_checkpoint_on(
     Ok(())
 }
 
-fn migrate_task_store(connection: &mut rusqlite::Connection) -> Result<()> {
+fn ensure_task_store_schema(connection: &mut rusqlite::Connection) -> Result<()> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let version = transaction.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
