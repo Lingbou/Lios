@@ -876,18 +876,6 @@ impl Application {
         repo: &RepoConfig,
         work: crate::catalog_sync::SyncWork,
     ) -> CommandResult<Vec<String>> {
-        let store = TaskStore::open(&paths.database).map_err(to_err)?;
-        if !store
-            .set_transaction_state(task_id, TaskState::Committing)
-            .map_err(to_err)?
-        {
-            return Err(CommandError::new(
-                CommandErrorCode::CorruptedData,
-                "task could not enter the committing state",
-                false,
-                None,
-            ));
-        }
         let mut metrics = crate::task_support::TransferMetrics::new();
         let outcome = execute_sync_work(
             adapter,
@@ -1620,6 +1608,34 @@ fn persist_transaction_progress(
             },
         })?;
     }
+    let state = match progress.phase {
+        CatalogTransactionPhase::ValidateBlobs
+        | CatalogTransactionPhase::UploadBlobs
+        | CatalogTransactionPhase::Prepublish
+        | CatalogTransactionPhase::ProbeCatalog => TaskState::Running,
+        CatalogTransactionPhase::Publish | CatalogTransactionPhase::Cleanup => {
+            TaskState::Committing
+        }
+    };
+    if !store.set_transaction_state(task_id, state)? {
+        return Err(lios_core::LiosError::Unsupported(
+            "task was interrupted before the catalog transaction phase could start".to_string(),
+        ));
+    }
+    let item_phase = match progress.phase {
+        CatalogTransactionPhase::ValidateBlobs
+        | CatalogTransactionPhase::UploadBlobs
+        | CatalogTransactionPhase::Prepublish
+        | CatalogTransactionPhase::ProbeCatalog => "uploading",
+        CatalogTransactionPhase::Publish | CatalogTransactionPhase::Cleanup => "committing",
+    };
+    store.update_items_state(
+        task_id,
+        TaskItemState::Running,
+        Some(item_phase.to_string()),
+        None,
+        false,
+    )?;
     store.update_phase(task_id, Some(phase_label(progress.phase).to_string()))?;
     store.update_transfer(
         task_id,
@@ -1660,8 +1676,8 @@ mod tests {
     };
     use lios_core::config::LiosPaths;
     use lios_core::tasks::{
-        CheckpointState, PersistedTransferAction, TaskRecord, TaskStore, TransferActionKind,
-        TransferActionState, TransferEntryKind,
+        CheckpointState, PersistedTransferAction, TaskRecord, TaskState, TaskStore,
+        TransferActionKind, TransferActionState, TransferEntryKind,
     };
     use tempfile::tempdir;
 
@@ -1677,6 +1693,9 @@ mod tests {
         let task = TaskRecord::queued("upload", 1);
         let store = TaskStore::open(&paths.database).unwrap();
         store.insert(&task).unwrap();
+        store
+            .update_state(task.id, TaskState::Running, None)
+            .unwrap();
 
         let progress = |state| CatalogTransactionProgress {
             phase: CatalogTransactionPhase::UploadBlobs,
@@ -1716,6 +1735,30 @@ mod tests {
         assert_eq!(
             store.list_checkpoints(task.id).unwrap()[0].state,
             CheckpointState::Committed
+        );
+        assert_eq!(
+            store.get_summary(task.id).unwrap().unwrap().state,
+            TaskState::Running
+        );
+
+        persist_transaction_progress(
+            &paths,
+            task.id,
+            &CatalogTransactionProgress {
+                phase: CatalogTransactionPhase::Publish,
+                completed_items: 2,
+                total_items: 2,
+                bytes_done: 10,
+                bytes_total: 10,
+                blob_checkpoint: None,
+            },
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            store.get_summary(task.id).unwrap().unwrap().state,
+            TaskState::Committing
         );
     }
 
