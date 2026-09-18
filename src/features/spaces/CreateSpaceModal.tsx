@@ -1,6 +1,6 @@
 import { AlertCircle, X } from "lucide-react";
 
-export interface CreateSpaceModalProps {
+interface CreateSpaceModalProps {
   open: boolean;
   name: string;
   error: string;

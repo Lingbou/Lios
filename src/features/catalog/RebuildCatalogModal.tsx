@@ -2,7 +2,7 @@ import { AlertTriangle, RefreshCw, X } from "lucide-react";
 import type { CatalogRebuildDialog } from "../../appTypes.ts";
 import { CatalogRecoveryTree, formatBytes } from "./catalogPresentation.tsx";
 
-export interface RebuildCatalogModalProps {
+interface RebuildCatalogModalProps {
   dialog: CatalogRebuildDialog | null;
   rebuildTaskActive: boolean;
   onClose: () => void;

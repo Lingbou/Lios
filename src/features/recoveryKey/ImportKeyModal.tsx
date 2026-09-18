@@ -5,7 +5,7 @@ import {
   recoveryKeyConfirmationText
 } from "../../recoveryKeyPresentation.ts";
 
-export interface ImportKeyModalProps {
+interface ImportKeyModalProps {
   dialog: RecoveryKeyImportDialog | null;
   onClose: () => void;
   onConfirm: () => void;

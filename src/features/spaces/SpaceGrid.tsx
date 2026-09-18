@@ -2,7 +2,7 @@ import { AlertTriangle, ChevronRight, Cloud, HardDrive, Plus, RefreshCw, Setting
 import { memo } from "react";
 import type { SpaceSummary } from "../../appTypes.ts";
 
-export interface SpaceGridProps {
+interface SpaceGridProps {
   accountName: string;
   hasToken: boolean;
   spaces: SpaceSummary[];

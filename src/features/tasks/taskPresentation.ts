@@ -29,7 +29,7 @@ export function isLiveTask(task: Pick<TaskSummary, "state">) {
   return liveTaskStates.has(task.state);
 }
 
-export type TaskPresentationRecord = Pick<
+type TaskPresentationRecord = Pick<
   TaskSummary,
   "state" | "label" | "progress_total" | "progress_done"
 > &
@@ -40,7 +40,7 @@ export type TaskPresentationRecord = Pick<
     >
   >;
 
-export type TaskItemPresentationRecord = Pick<
+type TaskItemPresentationRecord = Pick<
   TaskItem,
   "state" | "phase" | "bytes_done" | "bytes_total" | "size" | "error"
 >;
@@ -108,7 +108,7 @@ function finiteNonNegative(value: number | null | undefined) {
   return Number.isFinite(value) && (value ?? 0) > 0 ? (value ?? 0) : 0;
 }
 
-export function formatTaskBytes(bytes: number) {
+function formatTaskBytes(bytes: number) {
   const safeBytes = Math.max(0, bytes);
   if (safeBytes < 1024) return `${Math.round(safeBytes)} B`;
   const units = ["KB", "MB", "GB", "TB"];

@@ -1,7 +1,7 @@
 import { X } from "lucide-react";
 import type { ConflictAction, UploadConflict } from "../../appTypes.ts";
 
-export interface ConflictModalProps {
+interface ConflictModalProps {
   conflicts: UploadConflict[];
   conflictActions: Record<string, ConflictAction>;
   onSetAction: (sourcePath: string, action: ConflictAction) => void;

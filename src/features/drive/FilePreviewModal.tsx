@@ -9,7 +9,7 @@ export interface FilePreviewContent {
   dataUrl?: string;
 }
 
-export interface FilePreviewModalProps {
+interface FilePreviewModalProps {
   open: boolean;
   item: DriveItem | null;
   loading: boolean;

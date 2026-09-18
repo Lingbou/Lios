@@ -29,7 +29,6 @@ import {
   isTerminalTask,
   isLiveTask,
   taskActionsForTask,
-  taskItemProgressPercent,
   taskItemProgressText,
   taskItemStatusText,
   taskLabelText,
@@ -95,7 +94,7 @@ const actionDetails: Record<
   clear: { label: "清除记录", icon: Trash2 }
 };
 
-export type TaskCenterProps = {
+type TaskCenterProps = {
   tasks: TaskSummary[];
   pendingActions: Partial<Record<string, TaskAction>>;
   onAction: (action: TaskAction, taskId: string) => Promise<void>;

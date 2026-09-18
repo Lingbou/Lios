@@ -9,7 +9,7 @@ export type TaskState =
   | "Completed"
   | "Canceled";
 
-export type TaskItemState =
+type TaskItemState =
   | "Queued"
   | "Running"
   | "Skipped"

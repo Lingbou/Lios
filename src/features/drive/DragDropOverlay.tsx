@@ -1,6 +1,6 @@
 import { UploadCloud } from "lucide-react";
 
-export interface DragDropOverlayProps {
+interface DragDropOverlayProps {
   isDragging: boolean;
   targetDirName?: string;
 }

@@ -1,4 +1,4 @@
-export type CommandErrorCode =
+type CommandErrorCode =
   | "NotInitialized"
   | "AlreadyInitialized"
   | "Authentication"

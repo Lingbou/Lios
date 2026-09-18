@@ -3,7 +3,7 @@ import { memo, type MouseEvent } from "react";
 import type { DriveItem } from "../../appTypes.ts";
 import { formatBytes, formatDate } from "../catalog/catalogPresentation.tsx";
 
-export interface FileGridProps {
+interface FileGridProps {
   items: DriveItem[];
   selectedIds: Set<string>;
   onToggleSelect: (id: string) => void;

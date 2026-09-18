@@ -13,7 +13,7 @@ import { useEffect, useLayoutEffect, useRef } from "react";
 import type { DriveItem } from "../../appTypes.ts";
 import type { ContextMenuState } from "./driveTypes.ts";
 
-export interface ContextMenuProps {
+interface ContextMenuProps {
   state: ContextMenuState;
   onClose: () => void;
   selectedCount: number;

@@ -1,6 +1,6 @@
 import { commandError } from "./commandError.ts";
 
-export type LatestSerialRequest = {
+type LatestSerialRequest = {
   isCurrent: () => boolean;
 };
 
@@ -27,7 +27,7 @@ export function createLatestSerialExecutor() {
   };
 }
 
-export type CatalogLoadState<T> =
+type CatalogLoadState<T> =
   | { status: "ready"; catalog: T }
   | { status: "missing" };
 

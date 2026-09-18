@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import type { ViewMode } from "./driveTypes.ts";
 
-export interface DriveToolbarProps {
+interface DriveToolbarProps {
   canUpload: boolean;
   selectedCount: number;
   totalCount: number;

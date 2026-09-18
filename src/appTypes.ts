@@ -28,7 +28,7 @@ export type DatasetRepoListResult = {
   repositories: SpaceSummary[];
 };
 
-export type LiosConfig = {
+type LiosConfig = {
   schema_version: number;
   spaces: Record<string, RepoConfig>;
   key_file_path?: string | null;
@@ -36,7 +36,7 @@ export type LiosConfig = {
   chunk_size?: number | null;
 };
 
-export type PathsDto = {
+type PathsDto = {
   home: string;
   config: string;
   database: string;
@@ -82,7 +82,7 @@ export type CatalogLoadResult = {
   warnings: string[];
 };
 
-export type CatalogRebuildReport = {
+type CatalogRebuildReport = {
   nodes_rebuilt: number;
   directories_rebuilt: number;
   files_rebuilt: number;

@@ -4,7 +4,7 @@ import type { DriveItem } from "../../appTypes.ts";
 import { formatBytes, formatDate } from "../catalog/catalogPresentation.tsx";
 import type { SortDirection, SortField } from "./driveTypes.ts";
 
-export interface FileTableProps {
+interface FileTableProps {
   items: DriveItem[];
   selectedIds: Set<string>;
   sortField: SortField;
