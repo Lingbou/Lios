@@ -99,6 +99,12 @@ fn worker_sidecar_is_generated_ephemerally_and_declared_for_bundling() {
             "{workflow_path} must rely on the Tauri build hook for the worker sidecar"
         );
     }
+
+    let ci = fs::read_to_string(repository.join(".github/workflows/ci.yml")).unwrap();
+    assert!(
+        ci.contains("node scripts/build-worker-sidecar.mjs"),
+        "CI must prepare the worker sidecar before direct Cargo checks"
+    );
 }
 
 #[test]

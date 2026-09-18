@@ -60,6 +60,9 @@ jobs:
       - name: Verify Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Prepare worker sidecar for Cargo checks
+        run: node scripts/build-worker-sidecar.mjs
+
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
