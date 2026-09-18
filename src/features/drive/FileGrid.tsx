@@ -1,5 +1,5 @@
 import { File, Folder } from "lucide-react";
-import type { MouseEvent } from "react";
+import { memo, type MouseEvent } from "react";
 import type { DriveItem } from "../../appTypes.ts";
 import { formatBytes, formatDate } from "../catalog/catalogPresentation.tsx";
 
@@ -18,7 +18,7 @@ function getFileExtension(filename: string): string {
   return parts.length > 1 ? (parts.pop() ?? "").toUpperCase() : "";
 }
 
-export function FileGrid({
+function FileGridComponent({
   items,
   selectedIds,
   onToggleSelect,
@@ -107,3 +107,5 @@ export function FileGrid({
     </div>
   );
 }
+
+export const FileGrid = memo(FileGridComponent);

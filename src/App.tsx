@@ -1258,6 +1258,13 @@ function App() {
   const selectSpace = useStableCallback((space: SpaceSummary) => loadSpace(space));
   const removeSpace = useStableCallback(handleRemoveSpace);
   const openSettings = useStableCallback(() => setView("settings"));
+  const onSort = useStableCallback(handleSort);
+  const onToggleSelect = useStableCallback(toggleSelection);
+  const onSelectOnly = useStableCallback(selectOnly);
+  const onSelectRange = useStableCallback(selectRange);
+  const onSelectAll = useStableCallback(selectAll);
+  const onEnterItem = useStableCallback(enterItem);
+  const onContextMenu = useStableCallback(handleContextMenu);
 
   return (
     <div className="appFrame">
@@ -1709,11 +1716,11 @@ function App() {
                   <FileGrid
                     items={sortedItems}
                     selectedIds={selectedIds}
-                    onToggleSelect={toggleSelection}
-                    onSelectOnly={selectOnly}
-                    onSelectRange={selectRange}
-                    onEnterItem={enterItem}
-                    onContextMenu={handleContextMenu}
+                    onToggleSelect={onToggleSelect}
+                    onSelectOnly={onSelectOnly}
+                    onSelectRange={onSelectRange}
+                    onEnterItem={onEnterItem}
+                    onContextMenu={onContextMenu}
                   />
                 ) : (
                   <FileTable
@@ -1721,13 +1728,13 @@ function App() {
                     selectedIds={selectedIds}
                     sortField={sortField}
                     sortDirection={sortDirection}
-                    onSort={handleSort}
-                    onToggleSelect={toggleSelection}
-                    onSelectOnly={selectOnly}
-                    onSelectRange={selectRange}
-                    onSelectAll={selectAll}
-                    onEnterItem={enterItem}
-                    onContextMenu={handleContextMenu}
+                    onSort={onSort}
+                    onToggleSelect={onToggleSelect}
+                    onSelectOnly={onSelectOnly}
+                    onSelectRange={onSelectRange}
+                    onSelectAll={onSelectAll}
+                    onEnterItem={onEnterItem}
+                    onContextMenu={onContextMenu}
                   />
                 )}
               </section>

@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronUp, File, Folder } from "lucide-react";
-import { type MouseEvent, useEffect, useRef } from "react";
+import { type MouseEvent, memo, useEffect, useRef } from "react";
 import type { DriveItem } from "../../appTypes.ts";
 import { formatBytes, formatDate } from "../catalog/catalogPresentation.tsx";
 import type { SortDirection, SortField } from "./driveTypes.ts";
@@ -18,7 +18,7 @@ export interface FileTableProps {
   onContextMenu: (event: MouseEvent, item: DriveItem | null) => void;
 }
 
-export function FileTable({
+function FileTableComponent({
   items,
   selectedIds,
   sortField,
@@ -160,3 +160,5 @@ export function FileTable({
     </div>
   );
 }
+
+export const FileTable = memo(FileTableComponent);
