@@ -18,8 +18,8 @@ pub mod production_config;
 pub mod recovery_key_service;
 pub mod service;
 pub mod space_registry;
-pub mod task_manager;
 pub mod task_runner;
+pub mod task_support;
 pub mod transfer_planner;
 pub mod transfer_request;
 

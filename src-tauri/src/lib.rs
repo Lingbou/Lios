@@ -1,7 +1,7 @@
 use base64::Engine;
 pub use lios_application::{
     app_log, catalog_mutation_gate, catalog_probe, catalog_sync, command_error,
-    config_mutation_gate, download_service, production_config, recovery_key_service, task_manager,
+    config_mutation_gate, download_service, production_config, recovery_key_service, task_support,
 };
 
 pub mod command_surface;
@@ -69,9 +69,9 @@ use task_center::{
     emit_removed_tasks, emit_task, list_task_items_for_paths, task_summaries_for_paths,
     task_summary_for_paths, webview_safe_task_summary, TaskItemsPageDto,
 };
-use task_manager::{persist_submission, snapshot_upload_sources, TaskScope};
+use task_support::{persist_submission, snapshot_upload_sources, TaskScope};
 #[cfg(test)]
-use task_manager::{retry_backoff, TransferMetrics};
+use task_support::{retry_backoff, TransferMetrics};
 use tauri::Manager;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;

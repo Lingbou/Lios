@@ -24,7 +24,7 @@ use crate::recovery_key_service::{
     RecoveryKeyVerification,
 };
 use crate::recovery_key_service::{recovery_key_status, RecoveryKeyStatus};
-use crate::task_manager::TaskScope;
+use crate::task_support::TaskScope;
 use crate::{to_err, CommandError, CommandResult};
 
 #[derive(Debug, Clone)]

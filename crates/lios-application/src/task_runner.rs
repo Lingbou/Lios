@@ -28,7 +28,7 @@ use crate::catalog_sync::{
 use crate::service::{
     existing_absolute_directory, existing_absolute_paths, key_from_config, Application,
 };
-use crate::task_manager::{
+use crate::task_support::{
     apply_pack_progress, persist_submission, persist_transfer_submission, reconcile_catalog_hash,
     snapshot_upload_sources, validate_task_sources, CatalogReconcileDecision, TaskScope,
 };
@@ -1086,7 +1086,7 @@ impl Application {
                 None,
             ));
         }
-        let mut metrics = crate::task_manager::TransferMetrics::new();
+        let mut metrics = crate::task_support::TransferMetrics::new();
         let outcome = execute_sync_work(
             adapter,
             repo,
@@ -1157,7 +1157,7 @@ impl Application {
         store
             .update_transfer(task.id, 0, total, 0, bytes_total, 0)
             .map_err(to_err)?;
-        let mut metrics = crate::task_manager::TransferMetrics::new();
+        let mut metrics = crate::task_support::TransferMetrics::new();
         let mut bytes_done = 0u64;
         for (index, file) in remote_files.iter().enumerate() {
             let local_path = remote_to_staging_path(&paths.staging, &file.path)?;

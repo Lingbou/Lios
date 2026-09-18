@@ -6,8 +6,8 @@ use tokio::sync::{Mutex, MutexGuard};
 ///
 /// Phase v1 has one account and one writer, so a single global gate protects the shared staging
 /// directory and remote-inventory snapshot. This does not provide multi-device safety; the next
-/// ModelScope transaction phase must add remote revision conflict detection. TaskManager will move
-/// transfers to task-private staging later, allowing this global shared-staging gate to narrow.
+/// ModelScope transaction phase must add remote revision conflict detection. Transfers already use
+/// task-private staging, so this gate only protects the shared catalog staging directory.
 #[derive(Default)]
 pub struct CatalogMutationGate {
     mutex: Mutex<()>,
