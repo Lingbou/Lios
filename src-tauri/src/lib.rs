@@ -1316,7 +1316,8 @@ fn set_chunk_size(
 fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandResult<()> {
     state.paths.ensure_dirs().map_err(to_err)?;
     let registry = SpaceRegistry::new(state.paths.clone());
-    if let Ok(repo) = registry.resolve(&name) {
+    let resolved = registry.resolve(&name).ok();
+    if let Some(repo) = &resolved {
         let scope = TaskScope::from_repo(&repo);
         let store = TaskStore::open(&state.paths.database).map_err(to_err)?;
         if store.list_summaries().map_err(to_err)?.iter().any(|task| {
@@ -1328,6 +1329,10 @@ fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandRes
                 "cannot remove a space while one of its tasks is active",
             ));
         }
+    }
+    registry.remove(&name)?;
+    if let Some(repo) = resolved {
+        let scope = TaskScope::from_repo(&repo);
         let space_staging = state
             .paths
             .staging
@@ -1345,7 +1350,6 @@ fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandRes
             let _ = fs::remove_dir(&account_staging);
         }
     }
-    registry.remove(&name)?;
     Ok(())
 }
 
