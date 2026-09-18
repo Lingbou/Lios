@@ -54,13 +54,17 @@ async fn run(args: WorkerArgs) -> lios_application::CommandResult<()> {
             .list_tasks()?
             .into_iter()
             .rev()
-            .find(|task| task.state == TaskState::Queued);
+            .find(|task| matches!(task.state, TaskState::Queued | TaskState::Committing));
         if let Some(task) = next {
             idle_since = Instant::now();
-            if run_one_task(&application, &paths, task.id).await? {
-                break;
+            match run_one_task(&application, &paths, task.id).await {
+                Ok(stop_requested) if stop_requested => break,
+                Ok(_) => continue,
+                Err(error) => {
+                    eprintln!("lios-worker: task {}: {}", task.id, error.message);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             }
-            continue;
         }
         if idle_since.elapsed() >= Duration::from_secs(5 * 60) {
             break;
@@ -83,9 +87,9 @@ async fn run_one_task(
     loop {
         tokio::select! {
             result = &mut execution => {
-                let _ = result;
                 let _ = fs::remove_file(paths.worker_pause_path(task_id));
                 let _ = fs::remove_file(paths.worker_cancel_path(task_id));
+                result?;
                 return Ok(paths.worker_stop_path().exists());
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {

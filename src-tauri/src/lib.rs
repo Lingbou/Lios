@@ -14,8 +14,8 @@ mod build_support;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs;
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -802,15 +802,36 @@ fn start_shared_worker(paths: &LiosPaths) -> CommandResult<()> {
             None,
         )
     })?;
-    ProcessCommand::new(worker)
+    let stdout = open_worker_log(paths)?;
+    let stderr = stdout.try_clone().map_err(to_err)?;
+    let mut child = ProcessCommand::new(worker)
         .arg("--home")
         .arg(home_root)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .map_err(to_err)?;
+    let log_path = paths.logs.join("lios-worker.log");
+    std::thread::spawn(move || {
+        let message = match child.wait() {
+            Ok(status) => format!("lios-worker exited: {status}"),
+            Err(error) => format!("failed to wait for lios-worker: {error}"),
+        };
+        if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
+            let _ = writeln!(log, "{message}");
+        }
+    });
     Ok(())
+}
+
+fn open_worker_log(paths: &LiosPaths) -> CommandResult<fs::File> {
+    fs::create_dir_all(&paths.logs).map_err(to_err)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.logs.join("lios-worker.log"))
+        .map_err(to_err)
 }
 
 fn recover_startup_tasks(paths: &LiosPaths) -> CommandResult<StartupTaskRecovery> {
