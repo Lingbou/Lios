@@ -2072,6 +2072,11 @@ fn upsert_task_catalog_checkpoint_on(
 
 fn migrate_task_store(connection: &mut rusqlite::Connection) -> Result<()> {
     let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    if version > TASK_SCHEMA_VERSION {
+        return Err(LiosError::DataCorruption(format!(
+            "task database schema version {version} is newer than supported version {TASK_SCHEMA_VERSION}"
+        )));
+    }
     if version == TASK_SCHEMA_VERSION {
         return Ok(());
     }
@@ -2079,6 +2084,11 @@ fn migrate_task_store(connection: &mut rusqlite::Connection) -> Result<()> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let version = transaction.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    if version > TASK_SCHEMA_VERSION {
+        return Err(LiosError::DataCorruption(format!(
+            "task database schema version {version} is newer than supported version {TASK_SCHEMA_VERSION}"
+        )));
+    }
     if version == TASK_SCHEMA_VERSION {
         transaction.commit()?;
         return Ok(());
