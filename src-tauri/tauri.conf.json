@@ -5,8 +5,8 @@
   "version": "0.1.0",
   "identifier": "dev.lios.client",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "cargo build -p lios-cli --bin lios-worker && npm run dev",
+    "beforeBuildCommand": "cargo build --release -p lios-cli --bin lios-worker && npm run build",
     "devUrl": "http://127.0.0.1:5173",
     "frontendDist": "../dist"
   },
@@ -28,7 +28,6 @@
   },
   "bundle": {
     "active": false,
-    "externalBin": ["binaries/lios-worker"],
     "publisher": "Lingbou",
     "targets": "all",
     "icon": [
