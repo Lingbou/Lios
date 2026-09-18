@@ -78,8 +78,7 @@ impl Application {
             chunk_size: config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
             conflict_resolutions,
         };
-        let task =
-            persist_submission(&self.paths, &spec, &source_snapshot.files).map_err(to_err)?;
+        let task = persist_submission(&self.paths, &spec).map_err(to_err)?;
         summary_for(&self.paths, task.id)
     }
 
@@ -96,7 +95,7 @@ impl Application {
             repo,
             node_ids,
         };
-        let task = persist_submission(&self.paths, &spec, &[]).map_err(to_err)?;
+        let task = persist_submission(&self.paths, &spec).map_err(to_err)?;
         summary_for(&self.paths, task.id)
     }
 
@@ -116,7 +115,7 @@ impl Application {
             node_ids,
             output_dir,
         };
-        let task = persist_submission(&self.paths, &spec, &[]).map_err(to_err)?;
+        let task = persist_submission(&self.paths, &spec).map_err(to_err)?;
         summary_for(&self.paths, task.id)
     }
 
@@ -130,7 +129,7 @@ impl Application {
             repo,
             full,
         };
-        let task = persist_submission(&self.paths, &spec, &[]).map_err(to_err)?;
+        let task = persist_submission(&self.paths, &spec).map_err(to_err)?;
         summary_for(&self.paths, task.id)
     }
 

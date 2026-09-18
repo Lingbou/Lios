@@ -37,8 +37,7 @@ use lios_application::space_registry::SpaceRegistry;
 use lios_core::cache::{prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
     Catalog, CatalogRebuildOutcome, CatalogRebuildReport, CatalogRemoteFile, CatalogSelection,
-    CatalogTreeNode, ConflictAction, ConflictResolution, DriveItem, SourceFileSnapshot,
-    UploadConflict, CATALOG_FILE,
+    CatalogTreeNode, ConflictAction, ConflictResolution, DriveItem, UploadConflict, CATALOG_FILE,
 };
 #[cfg(test)]
 use lios_core::catalog_transaction::{
@@ -815,9 +814,8 @@ fn submit_and_spawn(
     app: &tauri::AppHandle,
     state: &AppContext,
     spec: TaskSpec,
-    source_files: &[SourceFileSnapshot],
 ) -> CommandResult<TaskSummary> {
-    let task = persist_submission(&state.paths, &spec, source_files).map_err(to_err)?;
+    let task = persist_submission(&state.paths, &spec).map_err(to_err)?;
     let summary = submission_summary(&task)?;
     emit_task(app, &state.paths, task.id);
     start_shared_worker(&state.paths)?;
@@ -1895,7 +1893,7 @@ async fn enqueue_upload_to_folder(
         chunk_size: config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
         conflict_resolutions,
     };
-    submit_and_spawn(&app, state.inner(), spec, &source_snapshot.files)
+    submit_and_spawn(&app, state.inner(), spec)
 }
 
 #[tauri::command]
@@ -1920,7 +1918,7 @@ async fn enqueue_delete_nodes(
         repo,
         node_ids,
     };
-    submit_and_spawn(&app, state.inner(), spec, &[])
+    submit_and_spawn(&app, state.inner(), spec)
 }
 
 #[tauri::command]
@@ -1948,7 +1946,7 @@ async fn enqueue_download(
         node_ids,
         output_dir: prepared.output_dir,
     };
-    submit_and_spawn(&app, state.inner(), spec, &[])
+    submit_and_spawn(&app, state.inner(), spec)
 }
 
 #[tauri::command]
@@ -1969,7 +1967,7 @@ async fn enqueue_verify_space(
         repo,
         full,
     };
-    submit_and_spawn(&app, state.inner(), spec, &[])
+    submit_and_spawn(&app, state.inner(), spec)
 }
 
 #[tauri::command]
@@ -2085,7 +2083,7 @@ async fn enqueue_rebuild_catalog(
         repo,
         expected_revision: Some(expected_revision.to_string()),
     };
-    submit_and_spawn(&app, state.inner(), spec, &[])
+    submit_and_spawn(&app, state.inner(), spec)
 }
 
 #[tauri::command]
@@ -2244,7 +2242,7 @@ pub fn run() {
 mod task_center_backend_tests {
     use std::path::PathBuf;
 
-    use lios_core::catalog::SourceFileSnapshot;
+    use lios_core::catalog::{SourceFileSnapshot, SourceSnapshotReport};
     use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
     use lios_core::tasks::{
         TaskItem, TaskItemState, TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary,
@@ -2479,11 +2477,14 @@ mod task_center_backend_tests {
             },
             parent_node_id: "root".to_string(),
             source_paths: vec![sentinel.clone()],
-            source_snapshot: Default::default(),
+            source_snapshot: SourceSnapshotReport {
+                files: vec![source.clone()],
+                ..SourceSnapshotReport::default()
+            },
             chunk_size: 1,
             conflict_resolutions: Vec::new(),
         };
-        let task = persist_submission(&paths, &spec, std::slice::from_ref(&source)).unwrap();
+        let task = persist_submission(&paths, &spec).unwrap();
 
         let summary = submission_summary(&task).unwrap();
         let value = serde_json::to_value(summary).unwrap();

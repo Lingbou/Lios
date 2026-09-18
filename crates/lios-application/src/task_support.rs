@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use lios_core::catalog::{snapshot_source_files, SourceFileSnapshot, SourceSnapshotReport};
+use lios_core::catalog::{snapshot_source_files, SourceSnapshotReport};
 use lios_core::config::{LiosPaths, RepoConfig};
 use lios_core::tasks::{
     PersistedTransferAction, TaskCatalogCheckpoint, TaskItem, TaskItemState, TaskRecord, TaskSpec,
@@ -142,11 +142,13 @@ pub fn reconcile_catalog_hash(
     CatalogReconcileDecision::Conflict
 }
 
-pub fn persist_submission(
-    paths: &LiosPaths,
-    spec: &TaskSpec,
-    source_files: &[SourceFileSnapshot],
-) -> CoreResult<TaskRecord> {
+pub fn persist_submission(paths: &LiosPaths, spec: &TaskSpec) -> CoreResult<TaskRecord> {
+    let source_files = match spec {
+        TaskSpec::Upload {
+            source_snapshot, ..
+        } => source_snapshot.files.as_slice(),
+        _ => &[],
+    };
     let mut task = TaskRecord::queued_for_spec(spec);
     task.items = source_files
         .iter()
@@ -478,24 +480,27 @@ mod tests {
         };
         let scope = TaskScope::from_repo(&repo);
         let source_path = temp.path().join("album.bin");
-        let spec = TaskSpec::Upload {
-            account_id: scope.account_id,
-            space_id: scope.space_id,
-            repo,
-            parent_node_id: "root".to_string(),
-            source_paths: vec![source_path.clone()],
-            source_snapshot: SourceSnapshotReport::default(),
-            chunk_size: 128 * 1024 * 1024,
-            conflict_resolutions: Vec::new(),
-        };
-
         let snapshots = vec![SourceFileSnapshot {
             source_path: source_path.clone(),
             relative_path: "photos/album.bin".into(),
             size: 4096,
             modified_at_ns: Some(123456789),
         }];
-        let task = persist_submission(&paths, &spec, &snapshots).unwrap();
+        let spec = TaskSpec::Upload {
+            account_id: scope.account_id,
+            space_id: scope.space_id,
+            repo,
+            parent_node_id: "root".to_string(),
+            source_paths: vec![source_path.clone()],
+            source_snapshot: SourceSnapshotReport {
+                files: snapshots.clone(),
+                ..SourceSnapshotReport::default()
+            },
+            chunk_size: 128 * 1024 * 1024,
+            conflict_resolutions: Vec::new(),
+        };
+
+        let task = persist_submission(&paths, &spec).unwrap();
 
         assert_eq!(task.state, TaskState::Queued);
         assert_eq!(task.progress_total, 1);
@@ -544,7 +549,7 @@ mod tests {
             chunk_size: 128 * 1024 * 1024,
             conflict_resolutions: Vec::new(),
         };
-        let task = persist_submission(&paths, &spec, &snapshot.files).unwrap();
+        let task = persist_submission(&paths, &spec).unwrap();
         std::fs::write(&source_path, [2u8; 8]).unwrap();
 
         let error =
@@ -583,7 +588,7 @@ mod tests {
             chunk_size: 128 * 1024 * 1024,
             conflict_resolutions: Vec::new(),
         };
-        let task = persist_submission(&paths, &spec, &snapshot.files).unwrap();
+        let task = persist_submission(&paths, &spec).unwrap();
         std::fs::write(source_dir.join("second.bin"), [2u8; 4]).unwrap();
 
         let error =
@@ -690,7 +695,7 @@ mod tests {
             conflict_resolutions: Vec::new(),
         };
         let paths = LiosPaths::from_home(temp.path());
-        let mut task = persist_submission(&paths, &spec, &snapshot.files).unwrap();
+        let mut task = persist_submission(&paths, &spec).unwrap();
         task.items[0].source_modified_at_ns = None;
 
         let error =
@@ -747,11 +752,14 @@ mod tests {
             repo,
             parent_node_id: "root".to_string(),
             source_paths: vec![first_path, second_path],
-            source_snapshot: SourceSnapshotReport::default(),
+            source_snapshot: SourceSnapshotReport {
+                files: snapshots.clone(),
+                ..SourceSnapshotReport::default()
+            },
             chunk_size: 4,
             conflict_resolutions: Vec::new(),
         };
-        let mut task = persist_submission(&paths, &spec, &snapshots).unwrap();
+        let mut task = persist_submission(&paths, &spec).unwrap();
 
         let changed = apply_pack_progress(&mut task.items, 2, 8, 4).unwrap();
 
