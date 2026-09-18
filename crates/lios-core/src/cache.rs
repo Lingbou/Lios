@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use crate::config::LiosPaths;
 use crate::{LiosError, Result};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -21,6 +22,27 @@ impl CacheCleanupReport {
         self.dirs_removed += other.dirs_removed;
         self.bytes_removed += other.bytes_removed;
     }
+}
+
+pub fn reset_shared_staging(paths: &LiosPaths) -> Result<CacheCleanupReport> {
+    paths.ensure_dirs()?;
+    let staging = paths.staging.canonicalize().map_err(LiosError::Io)?;
+    let home = paths.home.canonicalize().map_err(LiosError::Io)?;
+    if !staging.starts_with(&home) {
+        return Err(LiosError::Storage(
+            "refusing to clear staging outside the Lios state directory".to_string(),
+        ));
+    }
+
+    let mut report = CacheCleanupReport::default();
+    for entry in fs::read_dir(&staging)? {
+        let entry = entry?;
+        if is_scope_hex(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        report.add(remove_path_counting(&entry.path())?);
+    }
+    Ok(report)
 }
 
 pub fn cleanup_temporary_staging(staging: impl AsRef<Path>) -> Result<CacheCleanupReport> {

@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-use lios_core::cache::{cleanup_temporary_staging, prune_unreferenced_staging};
+use lios_core::cache::{
+    cleanup_temporary_staging, prune_unreferenced_staging, reset_shared_staging,
+};
+use lios_core::config::LiosPaths;
 use tempfile::tempdir;
 
 fn write_file(path: &Path, contents: &[u8]) {
@@ -59,6 +62,30 @@ fn prune_unreferenced_staging_preserves_catalog_and_referenced_objects() {
     assert!(!stale.exists());
     assert_eq!(report.files_removed, 1);
     assert_eq!(report.bytes_removed, b"stale".len() as u64);
+}
+
+#[test]
+fn reset_shared_staging_preserves_task_scopes_and_removes_shared_cache() {
+    let tmp = tempdir().unwrap();
+    let paths = LiosPaths::from_home(tmp.path());
+    paths.ensure_dirs().unwrap();
+    let account_id = "a".repeat(64);
+    let space_id = "b".repeat(64);
+    let task_file = paths
+        .staging
+        .join(&account_id)
+        .join(&space_id)
+        .join(Uuid::new_v4().to_string())
+        .join("chunk.lios");
+    let catalog = paths.staging.join("catalog.enc");
+    write_file(&task_file, b"task");
+    write_file(&catalog, b"catalog");
+
+    let report = reset_shared_staging(&paths).unwrap();
+
+    assert!(task_file.exists());
+    assert!(!catalog.exists());
+    assert_eq!(report.files_removed, 1);
 }
 
 use lios_core::cache::{cleanup_all_inactive_staging, cleanup_task_staging};

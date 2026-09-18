@@ -426,38 +426,6 @@ fn key_from_config(config: &LiosConfig) -> CommandResult<KeyFile> {
     KeyFile::load_from_path(path).map_err(to_err)
 }
 
-fn reset_staging(paths: &LiosPaths) -> CommandResult<()> {
-    paths.ensure_dirs().map_err(to_err)?;
-    if paths.staging.exists() {
-        let staging = paths.staging.canonicalize().map_err(to_err)?;
-        let home = paths.home.canonicalize().map_err(to_err)?;
-        if !staging.starts_with(home) {
-            return Err(CommandError::invalid_input(
-                "refusing to clear staging outside ~/.lios",
-            ));
-        }
-        let entries = fs::read_dir(&paths.staging).map_err(to_err)?;
-        for entry in entries {
-            let entry = entry.map_err(to_err)?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.len() == 64
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-            {
-                continue;
-            }
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                fs::remove_dir_all(entry_path).map_err(to_err)?;
-            } else {
-                fs::remove_file(entry_path).map_err(to_err)?;
-            }
-        }
-    }
-    fs::create_dir_all(&paths.staging).map_err(to_err)
-}
-
 fn remote_to_staging_path(staging: &Path, remote_path: &str) -> CommandResult<PathBuf> {
     let relative = Path::new(remote_path);
     if relative.is_absolute()
@@ -1818,7 +1786,7 @@ async fn initialize_space(
     };
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
-    reset_staging(&state.paths)?;
+    lios_core::cache::reset_shared_staging(&state.paths).map_err(to_err)?;
     let catalog = Catalog::initialize_empty(&repo.dataset, &key, state.paths.staging.clone())
         .map_err(to_err)?;
     let warnings =

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use lios_core::cache::reset_shared_staging;
 use lios_core::catalog::{
     Catalog, CatalogTreeNode, ConflictResolution, DriveItem, UploadConflict, CATALOG_FILE,
 };
@@ -199,7 +200,7 @@ impl Application {
         };
         let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
-        reset_staging(&self.paths)?;
+        reset_shared_staging(&self.paths).map_err(to_err)?;
         let catalog = Catalog::initialize_empty(&repo.dataset, &key, self.paths.staging.clone())
             .map_err(to_err)?;
         let warnings =
@@ -411,21 +412,6 @@ pub(crate) fn key_from_config(config: &LiosConfig) -> CommandResult<KeyFile> {
         .as_ref()
         .ok_or_else(|| CommandError::invalid_input("recovery key is not configured"))?;
     KeyFile::load_from_path(path).map_err(to_err)
-}
-
-fn reset_staging(paths: &LiosPaths) -> CommandResult<()> {
-    paths.ensure_dirs().map_err(to_err)?;
-    if paths.staging.exists() {
-        let staging = paths.staging.canonicalize().map_err(to_err)?;
-        let home = paths.home.canonicalize().map_err(to_err)?;
-        if !staging.starts_with(home) {
-            return Err(CommandError::invalid_input(
-                "refusing to clear staging outside the Lios state directory",
-            ));
-        }
-        fs::remove_dir_all(&paths.staging).map_err(to_err)?;
-    }
-    fs::create_dir_all(&paths.staging).map_err(to_err)
 }
 
 fn snapshot_from_catalog(
