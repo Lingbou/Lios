@@ -61,8 +61,8 @@ fn prune_unreferenced_staging_preserves_catalog_and_referenced_objects() {
     assert_eq!(report.bytes_removed, b"stale".len() as u64);
 }
 
-use std::collections::HashSet;
 use lios_core::cache::{cleanup_all_inactive_staging, cleanup_task_staging};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 #[test]
@@ -119,4 +119,35 @@ fn cleanup_all_inactive_staging_prunes_only_terminal_and_orphaned_tasks() {
     assert!(!completed_file.exists());
     assert_eq!(report.files_removed, 1);
     assert_eq!(report.bytes_removed, b"completed chunk 12345".len() as u64);
+}
+
+#[test]
+fn inactive_sweep_preserves_shared_entries_and_active_downloads() {
+    let tmp = tempdir().unwrap();
+    let staging = tmp.path().join("staging");
+    let account = "a".repeat(64);
+    let space = "b".repeat(64);
+    let active_id = Uuid::new_v4();
+    let inactive_id = Uuid::new_v4();
+    let active_download = staging
+        .join(&account)
+        .join(&space)
+        .join(active_id.to_string())
+        .join("chunk.download");
+    let inactive_file = staging
+        .join(&account)
+        .join(&space)
+        .join(inactive_id.to_string())
+        .join("chunk.lios");
+    write_file(&staging.join("catalog.enc"), b"catalog");
+    write_file(&staging.join("objects/files/live/chunk.lios"), b"object");
+    write_file(&active_download, b"partial");
+    write_file(&inactive_file, b"stale");
+
+    cleanup_all_inactive_staging(&staging, &HashSet::from([active_id])).unwrap();
+
+    assert!(staging.join("catalog.enc").exists());
+    assert!(staging.join("objects/files/live/chunk.lios").exists());
+    assert!(active_download.exists());
+    assert!(!inactive_file.exists());
 }

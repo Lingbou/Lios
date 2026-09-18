@@ -436,7 +436,24 @@ fn reset_staging(paths: &LiosPaths) -> CommandResult<()> {
                 "refusing to clear staging outside ~/.lios",
             ));
         }
-        fs::remove_dir_all(&paths.staging).map_err(to_err)?;
+        let entries = fs::read_dir(&paths.staging).map_err(to_err)?;
+        for entry in entries {
+            let entry = entry.map_err(to_err)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.len() == 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            {
+                continue;
+            }
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                fs::remove_dir_all(entry_path).map_err(to_err)?;
+            } else {
+                fs::remove_file(entry_path).map_err(to_err)?;
+            }
+        }
     }
     fs::create_dir_all(&paths.staging).map_err(to_err)
 }
@@ -587,11 +604,13 @@ fn cleanup_current_staging_cache(
             }
         }
     }
-    let mut report = lios_core::cache::cleanup_all_inactive_staging(&paths.staging, &active_task_ids)
-        .map_err(to_err)?;
+    let mut report =
+        lios_core::cache::cleanup_all_inactive_staging(&paths.staging, &active_task_ids)
+            .map_err(to_err)?;
     if prune_unreferenced {
         if let Some(references) = current_catalog_references(paths, strict)? {
-            let prune_report = prune_unreferenced_staging(&paths.staging, references).map_err(to_err)?;
+            let prune_report =
+                prune_unreferenced_staging(&paths.staging, references).map_err(to_err)?;
             report.add(prune_report);
         }
     }
@@ -910,10 +929,18 @@ fn remove_scoped_staging_directory(
     }
     match fs::remove_dir_all(&paths.staging) {
         Ok(()) => {
-            if space_dir.exists() && fs::read_dir(&space_dir).map(|mut i| i.next().is_none()).unwrap_or(false) {
+            if space_dir.exists()
+                && fs::read_dir(&space_dir)
+                    .map(|mut i| i.next().is_none())
+                    .unwrap_or(false)
+            {
                 let _ = fs::remove_dir(&space_dir);
             }
-            if account_dir.exists() && fs::read_dir(&account_dir).map(|mut i| i.next().is_none()).unwrap_or(false) {
+            if account_dir.exists()
+                && fs::read_dir(&account_dir)
+                    .map(|mut i| i.next().is_none())
+                    .unwrap_or(false)
+            {
                 let _ = fs::remove_dir(&account_dir);
             }
             Ok(())
@@ -1671,12 +1698,30 @@ fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandRes
     let registry = SpaceRegistry::new(state.paths.clone());
     if let Ok(repo) = registry.resolve(&name) {
         let scope = TaskScope::from_repo(&repo);
-        let space_staging = state.paths.staging.join(&scope.account_id).join(&scope.space_id);
+        let store = TaskStore::open(&state.paths.database).map_err(to_err)?;
+        if store.list_summaries().map_err(to_err)?.iter().any(|task| {
+            task.account_id == scope.account_id
+                && task.space_id == scope.space_id
+                && task_state_is_active(&task.state)
+        }) {
+            return Err(CommandError::invalid_input(
+                "cannot remove a space while one of its tasks is active",
+            ));
+        }
+        let space_staging = state
+            .paths
+            .staging
+            .join(&scope.account_id)
+            .join(&scope.space_id);
         if space_staging.exists() {
             let _ = fs::remove_dir_all(&space_staging);
         }
         let account_staging = state.paths.staging.join(&scope.account_id);
-        if account_staging.exists() && fs::read_dir(&account_staging).map(|mut i| i.next().is_none()).unwrap_or(false) {
+        if account_staging.exists()
+            && fs::read_dir(&account_staging)
+                .map(|mut i| i.next().is_none())
+                .unwrap_or(false)
+        {
             let _ = fs::remove_dir(&account_staging);
         }
     }

@@ -68,12 +68,20 @@ pub fn cleanup_task_staging(
     }
     report.add(remove_path_counting(&task_staging)?);
     let space_dir = staging_root.join(account_id).join(space_id);
-    if space_dir.exists() && fs::read_dir(&space_dir).map(|mut iter| iter.next().is_none()).unwrap_or(false) {
+    if space_dir.exists()
+        && fs::read_dir(&space_dir)
+            .map(|mut iter| iter.next().is_none())
+            .unwrap_or(false)
+    {
         let _ = fs::remove_dir(&space_dir);
         report.dirs_removed += 1;
     }
     let account_dir = staging_root.join(account_id);
-    if account_dir.exists() && fs::read_dir(&account_dir).map(|mut iter| iter.next().is_none()).unwrap_or(false) {
+    if account_dir.exists()
+        && fs::read_dir(&account_dir)
+            .map(|mut iter| iter.next().is_none())
+            .unwrap_or(false)
+    {
         let _ = fs::remove_dir(&account_dir);
         report.dirs_removed += 1;
     }
@@ -85,7 +93,7 @@ pub fn cleanup_all_inactive_staging(
     active_task_ids: &HashSet<Uuid>,
 ) -> Result<CacheCleanupReport> {
     let staging_root = staging_root.as_ref();
-    let mut report = cleanup_temporary_staging(staging_root)?;
+    let mut report = cleanup_temporary_staging_except_active(staging_root, active_task_ids)?;
     if !staging_root.exists() {
         return Ok(report);
     }
@@ -98,9 +106,6 @@ pub fn cleanup_all_inactive_staging(
     for entry in entries.flatten() {
         let entry_path = entry.path();
         if !entry_path.is_dir() {
-            if let Ok(file_report) = remove_file_counting(&entry_path) {
-                report.add(file_report);
-            }
             continue;
         }
 
@@ -111,9 +116,6 @@ pub fn cleanup_all_inactive_staging(
         }
 
         if !is_scope_hex(&name) {
-            if let Ok(dir_report) = remove_path_counting(&entry_path) {
-                report.add(dir_report);
-            }
             continue;
         }
 
@@ -134,9 +136,6 @@ pub fn cleanup_all_inactive_staging(
             let space_file_name = space_entry.file_name();
             let space_name = space_file_name.to_string_lossy();
             if !is_scope_hex(&space_name) {
-                if let Ok(dir_report) = remove_path_counting(&space_path) {
-                    report.add(dir_report);
-                }
                 continue;
             }
 
@@ -147,27 +146,30 @@ pub fn cleanup_all_inactive_staging(
 
             for task_entry in task_entries.flatten() {
                 let task_path = task_entry.path();
-                let task_file_name = task_entry.file_name();
-                let task_name = task_file_name.to_string_lossy();
-                let is_active = match Uuid::parse_str(&task_name) {
-                    Ok(uuid) => active_task_ids.contains(&uuid),
-                    Err(_) => false,
-                };
-                if !is_active {
-                    if let Ok(task_report) = remove_path_counting(&task_path) {
-                        report.add(task_report);
+                let task_name = task_entry.file_name().to_string_lossy().into_owned();
+                if let Ok(uuid) = Uuid::parse_str(&task_name) {
+                    if !active_task_ids.contains(&uuid) {
+                        if let Ok(task_report) = remove_path_counting(&task_path) {
+                            report.add(task_report);
+                        }
                     }
                 }
             }
 
-            if fs::read_dir(&space_path).map(|mut iter| iter.next().is_none()).unwrap_or(false) {
+            if fs::read_dir(&space_path)
+                .map(|mut iter| iter.next().is_none())
+                .unwrap_or(false)
+            {
                 if fs::remove_dir(&space_path).is_ok() {
                     report.dirs_removed += 1;
                 }
             }
         }
 
-        if fs::read_dir(&entry_path).map(|mut iter| iter.next().is_none()).unwrap_or(false) {
+        if fs::read_dir(&entry_path)
+            .map(|mut iter| iter.next().is_none())
+            .unwrap_or(false)
+        {
             if fs::remove_dir(&entry_path).is_ok() {
                 report.dirs_removed += 1;
             }
@@ -177,8 +179,63 @@ pub fn cleanup_all_inactive_staging(
     Ok(report)
 }
 
+fn cleanup_temporary_staging_except_active(
+    staging: &Path,
+    active_task_ids: &HashSet<Uuid>,
+) -> Result<CacheCleanupReport> {
+    let mut report = CacheCleanupReport::default();
+    if !staging.exists() {
+        return Ok(report);
+    }
+
+    let tmp_dir = staging.join(".tmp");
+    if tmp_dir.exists() {
+        report.add(remove_path_counting(&tmp_dir)?);
+    }
+
+    let mut interrupted = Vec::new();
+    for entry in WalkDir::new(staging) {
+        let entry = entry?;
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|ext| ext.to_str()) == Some("download")
+            && !path_is_in_active_task(staging, entry.path(), active_task_ids)
+        {
+            interrupted.push(entry.path().to_path_buf());
+        }
+    }
+    for path in interrupted {
+        report.add(remove_file_counting(&path)?);
+    }
+
+    Ok(report)
+}
+
+fn path_is_in_active_task(staging: &Path, path: &Path, active_task_ids: &HashSet<Uuid>) -> bool {
+    let Ok(relative) = path.strip_prefix(staging) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let (
+        Some(Component::Normal(account)),
+        Some(Component::Normal(space)),
+        Some(Component::Normal(task)),
+    ) = (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    if !is_scope_hex(&account.to_string_lossy()) || !is_scope_hex(&space.to_string_lossy()) {
+        return false;
+    }
+    task.to_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .is_some_and(|task_id| active_task_ids.contains(&task_id))
+}
+
 fn is_scope_hex(name: &str) -> bool {
-    name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    name.len() == 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 pub fn prune_unreferenced_staging(
@@ -281,7 +338,9 @@ pub fn remove_file_counting(path: &Path) -> Result<CacheCleanupReport> {
             dirs_removed: 0,
             bytes_removed: bytes,
         }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(CacheCleanupReport::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(CacheCleanupReport::default())
+        }
         Err(error) => Err(LiosError::Io(error)),
     }
 }

@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use lios_core::catalog::{
-    Catalog, CatalogIntegrityReport,
-    CatalogRemoteIntegrityReport, CatalogSelection, CatalogTreeNode, CatalogTreeNodeKind,
-    ConflictAction, ConflictResolution, SourceFileSnapshot, CATALOG_FILE,
+    Catalog, CatalogIntegrityReport, CatalogRemoteIntegrityReport, CatalogSelection,
+    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution, SourceFileSnapshot,
+    CATALOG_FILE,
 };
 use lios_core::catalog_transaction::{
     probe_catalog_sha256, CatalogBlobCheckpointState, CatalogTransactionOutcome,
@@ -365,14 +365,6 @@ impl Application {
             ));
         }
         self.task_manager.cancel(task_id).await;
-        if let Ok(Some(spec)) = store.load_spec(task_id) {
-            let _ = lios_core::cache::cleanup_task_staging(
-                &self.paths.staging,
-                spec.account_id(),
-                spec.space_id(),
-                task_id,
-            );
-        }
         summary_for(&self.paths, task_id)
     }
 
@@ -1276,10 +1268,7 @@ impl Application {
             .await
             .map_err(to_err)?;
         if let Some(expected) = expected_revision.as_deref() {
-            let current_commit = started_revision
-                .commit_id
-                .as_deref()
-                .unwrap_or("");
+            let current_commit = started_revision.commit_id.as_deref().unwrap_or("");
             if expected != current_commit {
                 return Err(CommandError::new(
                     CommandErrorCode::RemoteConflict,
@@ -1300,7 +1289,8 @@ impl Application {
             .iter()
             .filter(|obj| {
                 obj.path.starts_with("recovery/nodes/")
-                    || (obj.path.starts_with("objects/files/") && obj.path.ends_with("/manifest.enc"))
+                    || (obj.path.starts_with("objects/files/")
+                        && obj.path.ends_with("/manifest.enc"))
             })
             .cloned()
             .collect::<Vec<_>>();
