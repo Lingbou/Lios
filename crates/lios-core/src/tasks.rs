@@ -13,7 +13,6 @@ use crate::{LiosError, Result};
 
 const TASK_SCHEMA_VERSION: i64 = 4;
 const INVALID_TASK_SPEC_MESSAGE: &str = "persisted task specification is invalid";
-const DEFAULT_TASK_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const TERMINAL_TASK_RETENTION_DAYS: i64 = 30;
 const MAX_TERMINAL_TASKS: usize = 500;
 
@@ -146,9 +145,7 @@ pub enum TaskSpec {
         repo: RepoConfig,
         parent_node_id: String,
         source_paths: Vec<PathBuf>,
-        #[serde(default)]
-        source_snapshot: Option<SourceSnapshotReport>,
-        #[serde(default = "default_task_chunk_size")]
+        source_snapshot: SourceSnapshotReport,
         chunk_size: usize,
         conflict_resolutions: Vec<ConflictResolution>,
     },
@@ -2140,8 +2137,4 @@ fn validate_sha256(value: &str, field: &str) -> Result<()> {
 
 fn now_timestamp() -> String {
     chrono::Utc::now().to_rfc3339()
-}
-
-fn default_task_chunk_size() -> usize {
-    DEFAULT_TASK_CHUNK_SIZE
 }

@@ -484,7 +484,7 @@ mod tests {
             repo,
             parent_node_id: "root".to_string(),
             source_paths: vec![source_path.clone()],
-            source_snapshot: None,
+            source_snapshot: SourceSnapshotReport::default(),
             chunk_size: 128 * 1024 * 1024,
             conflict_resolutions: Vec::new(),
         };
@@ -540,7 +540,7 @@ mod tests {
             repo,
             parent_node_id: "root".to_string(),
             source_paths: vec![source_path.clone()],
-            source_snapshot: Some(snapshot.clone()),
+            source_snapshot: snapshot.clone(),
             chunk_size: 128 * 1024 * 1024,
             conflict_resolutions: Vec::new(),
         };
@@ -579,7 +579,7 @@ mod tests {
             repo,
             parent_node_id: "root".to_string(),
             source_paths: vec![source_dir.clone()],
-            source_snapshot: Some(snapshot.clone()),
+            source_snapshot: snapshot.clone(),
             chunk_size: 128 * 1024 * 1024,
             conflict_resolutions: Vec::new(),
         };
@@ -685,7 +685,7 @@ mod tests {
             repo,
             parent_node_id: "root".to_string(),
             source_paths: vec![source_path.clone()],
-            source_snapshot: Some(snapshot.clone()),
+            source_snapshot: snapshot.clone(),
             chunk_size: 128 * 1024 * 1024,
             conflict_resolutions: Vec::new(),
         };
@@ -747,7 +747,7 @@ mod tests {
             repo,
             parent_node_id: "root".to_string(),
             source_paths: vec![first_path, second_path],
-            source_snapshot: None,
+            source_snapshot: SourceSnapshotReport::default(),
             chunk_size: 4,
             conflict_resolutions: Vec::new(),
         };

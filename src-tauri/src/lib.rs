@@ -1891,7 +1891,7 @@ async fn enqueue_upload_to_folder(
         repo,
         parent_node_id,
         source_paths: upload_paths,
-        source_snapshot: Some(source_snapshot.clone()),
+        source_snapshot: source_snapshot.clone(),
         chunk_size: config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
         conflict_resolutions,
     };
@@ -2479,7 +2479,7 @@ mod task_center_backend_tests {
             },
             parent_node_id: "root".to_string(),
             source_paths: vec![sentinel.clone()],
-            source_snapshot: None,
+            source_snapshot: Default::default(),
             chunk_size: 1,
             conflict_resolutions: Vec::new(),
         };

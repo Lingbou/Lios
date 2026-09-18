@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use lios_core::catalog::{
     Catalog, CatalogIntegrityReport, CatalogRemoteIntegrityReport, CatalogSelection,
-    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution, SourceFileSnapshot,
+    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution, SourceSnapshotReport,
     CATALOG_FILE,
 };
 use lios_core::catalog_transaction::{
@@ -74,7 +74,7 @@ impl Application {
             repo,
             parent_node_id,
             source_paths,
-            source_snapshot: Some(source_snapshot.clone()),
+            source_snapshot: source_snapshot.clone(),
             chunk_size: config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
             conflict_resolutions,
         };
@@ -470,16 +470,13 @@ impl Application {
                 conflict_resolutions,
                 ..
             } => {
-                let snapshot = source_snapshot.ok_or_else(|| {
-                    CommandError::invalid_input("upload task has no saved source snapshot")
-                })?;
                 self.run_upload(
                     task_paths,
                     task,
                     repo,
                     parent_node_id,
                     source_paths,
-                    snapshot.files,
+                    source_snapshot,
                     chunk_size,
                     conflict_resolutions,
                 )
@@ -856,32 +853,14 @@ impl Application {
         repo: RepoConfig,
         parent_node_id: String,
         source_paths: Vec<PathBuf>,
-        _source_files: Vec<SourceFileSnapshot>,
+        source_snapshot: SourceSnapshotReport,
         chunk_size: usize,
         conflict_resolutions: Vec<ConflictResolution>,
     ) -> CommandResult<Vec<String>> {
         let config = LiosConfig::load(&paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
-        let expected_snapshot = match TaskStore::open(&paths.database)
-            .map_err(to_err)?
-            .load_spec(task.id)
-            .map_err(to_err)?
-        {
-            Some(TaskSpec::Upload {
-                source_snapshot: Some(snapshot),
-                ..
-            }) => snapshot,
-            _ => {
-                return Err(CommandError::new(
-                    CommandErrorCode::CorruptedData,
-                    "upload source snapshot is missing",
-                    false,
-                    None,
-                ))
-            }
-        };
-        validate_task_sources(&source_paths, &expected_snapshot, &task.items).map_err(to_err)?;
+        validate_task_sources(&source_paths, &source_snapshot, &task.items).map_err(to_err)?;
         let (catalog, baseline) = download_catalog_baseline(paths, &key, &adapter, &repo).await?;
         let remote_inventory = baseline.remote_objects.clone();
         let report = catalog

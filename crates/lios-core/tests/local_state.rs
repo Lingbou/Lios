@@ -1026,7 +1026,7 @@ fn task_store_persists_specs_items_and_checkpoints() {
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("album.bin")],
-        source_snapshot: None,
+        source_snapshot: SourceSnapshotReport::default(),
         chunk_size: 128 * 1024 * 1024,
         conflict_resolutions: vec![ConflictResolution {
             source_path: tmp.path().join("album.bin").to_string_lossy().into_owned(),
@@ -1564,7 +1564,7 @@ fn task_store_rolls_back_submission_when_any_item_is_invalid() {
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("album.bin")],
-        source_snapshot: None,
+        source_snapshot: SourceSnapshotReport::default(),
         chunk_size: 128 * 1024 * 1024,
         conflict_resolutions: Vec::new(),
     };
@@ -1649,7 +1649,7 @@ fn task_store_schedules_automatic_retry_and_requeues_manual_retry() {
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("album.bin")],
-        source_snapshot: None,
+        source_snapshot: SourceSnapshotReport::default(),
         chunk_size: 128 * 1024 * 1024,
         conflict_resolutions: Vec::new(),
     };
@@ -1720,7 +1720,7 @@ fn task_store_does_not_requeue_failed_tasks_with_malformed_specs() {
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("album.bin")],
-        source_snapshot: None,
+        source_snapshot: SourceSnapshotReport::default(),
         chunk_size: 128 * 1024 * 1024,
         conflict_resolutions: Vec::new(),
     };
@@ -1825,7 +1825,7 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
         },
         parent_node_id: "root".to_string(),
         source_paths: vec![tmp.path().join("source.bin")],
-        source_snapshot: None,
+        source_snapshot: SourceSnapshotReport::default(),
         chunk_size: 128 * 1024 * 1024,
         conflict_resolutions: Vec::new(),
     };
@@ -2164,35 +2164,6 @@ fn task_store_lists_valid_queued_specs_and_claims_each_task_once() {
 }
 
 #[test]
-fn legacy_upload_task_spec_defaults_to_128mb_chunks() {
-    let spec: TaskSpec = serde_json::from_value(serde_json::json!({
-        "kind": "upload",
-        "account_id": "account-a",
-        "space_id": "novix/cold",
-        "repo": {
-            "namespace": "novix",
-            "dataset": "cold",
-            "endpoint": "https://modelscope.cn"
-        },
-        "parent_node_id": "root",
-        "source_paths": ["C:\\source.bin"],
-        "conflict_resolutions": []
-    }))
-    .unwrap();
-
-    let TaskSpec::Upload {
-        chunk_size,
-        source_snapshot,
-        ..
-    } = spec
-    else {
-        panic!("expected upload task spec");
-    };
-    assert_eq!(chunk_size, 128 * 1024 * 1024);
-    assert_eq!(source_snapshot, None);
-}
-
-#[test]
 fn verify_task_labels_distinguish_quick_and_full_checks() {
     let repo = RepoConfig {
         namespace: "novix".to_string(),
@@ -2280,7 +2251,7 @@ fn upload_task_spec_roundtrips_the_persisted_source_snapshot() {
         },
         parent_node_id: "root".to_string(),
         source_paths: vec!["C:/source".into()],
-        source_snapshot: Some(snapshot.clone()),
+        source_snapshot: snapshot.clone(),
         chunk_size: 128 * 1024 * 1024,
         conflict_resolutions: Vec::new(),
     };
@@ -2294,7 +2265,7 @@ fn upload_task_spec_roundtrips_the_persisted_source_snapshot() {
         panic!("expected upload task");
     };
 
-    assert_eq!(source_snapshot, Some(snapshot));
+    assert_eq!(source_snapshot, snapshot);
 }
 
 #[test]
