@@ -1318,7 +1318,7 @@ fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandRes
     let registry = SpaceRegistry::new(state.paths.clone());
     let resolved = registry.resolve(&name).ok();
     if let Some(repo) = &resolved {
-        let scope = TaskScope::from_repo(&repo);
+        let scope = TaskScope::from_repo(repo);
         let store = TaskStore::open(&state.paths.database).map_err(to_err)?;
         if store.list_summaries().map_err(to_err)?.iter().any(|task| {
             task.account_id == scope.account_id
