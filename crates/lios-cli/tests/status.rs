@@ -51,3 +51,26 @@ fn status_reports_a_fresh_home_without_initializing_it() {
     );
     assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn lios_home_environment_overrides_the_default_state_root() {
+    let home = TempHome::new();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lios"))
+        .arg("status")
+        .env("LIOS_HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = home.path().join(".lios").display().to_string();
+    assert!(
+        stdout.contains(&expected),
+        "expected state home {expected:?} in status output: {stdout}"
+    );
+}
