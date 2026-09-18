@@ -35,22 +35,6 @@ use crate::task_support::{
 use crate::transfer_request::fingerprint_path;
 use crate::{remote_to_staging_path, to_err, CommandError, CommandErrorCode, CommandResult};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForegroundProgress {
-    pub task_id: Uuid,
-    pub phase: String,
-    pub completed: u64,
-    pub total: u64,
-    pub bytes_done: u64,
-    pub bytes_total: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct TaskRunResult {
-    pub summary: TaskSummary,
-    pub notices: Vec<String>,
-}
-
 impl Application {
     pub fn list_tasks(&self) -> CommandResult<Vec<TaskSummary>> {
         TaskStore::open(&self.paths.database)
@@ -195,14 +179,7 @@ impl Application {
         summary_for(&self.paths, task.id)
     }
 
-    pub async fn run_task<F>(
-        &self,
-        task_id: Uuid,
-        mut on_progress: F,
-    ) -> CommandResult<TaskRunResult>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    pub async fn run_task(&self, task_id: Uuid) -> CommandResult<()> {
         let preview_spec = TaskStore::open(&self.paths.database)
             .map_err(to_err)?
             .load_spec(task_id)
@@ -215,11 +192,8 @@ impl Application {
             .map_err(CommandError::from)?;
         let _catalog_guard = self.catalog_gate.lock_mutation().await;
 
-        if let Some(result) = self
-            .prepare_task_for_run(task_id, &preview_spec, &mut on_progress)
-            .await?
-        {
-            return Ok(result);
+        if self.prepare_task_for_run(task_id, &preview_spec).await? {
+            return Ok(());
         }
 
         let spec = TaskStore::open(&self.paths.database)
@@ -251,9 +225,7 @@ impl Application {
             .map_err(to_err)?;
         let account_id = spec.account_id().to_string();
         let space_id_str = spec.space_id().to_string();
-        let result = self
-            .execute_task_spec(&task_paths, &mut task, spec, &mut on_progress)
-            .await;
+        let result = self.execute_task_spec(&task_paths, &mut task, spec).await;
         let store = TaskStore::open(&self.paths.database).map_err(to_err)?;
         match result {
             Ok(notices) => {
@@ -271,10 +243,7 @@ impl Application {
                     &space_id_str,
                     task_id,
                 );
-                Ok(TaskRunResult {
-                    summary: summary_for(&self.paths, task_id)?,
-                    notices,
-                })
+                Ok(())
             }
             Err(error) => {
                 let persisted = store.get_summary(task_id).map_err(to_err)?;
@@ -292,18 +261,6 @@ impl Application {
                 Err(error)
             }
         }
-    }
-
-    pub async fn resume_task<F>(
-        &self,
-        task_id: Uuid,
-        on_progress: F,
-    ) -> CommandResult<TaskRunResult>
-    where
-        F: FnMut(ForegroundProgress),
-    {
-        self.requeue_paused_task(task_id)?;
-        self.run_task(task_id, on_progress).await
     }
 
     pub fn requeue_paused_task(&self, task_id: Uuid) -> CommandResult<TaskSummary> {
@@ -329,14 +286,6 @@ impl Application {
             ));
         }
         summary_for(&self.paths, task_id)
-    }
-
-    pub async fn retry_task<F>(&self, task_id: Uuid, on_progress: F) -> CommandResult<TaskRunResult>
-    where
-        F: FnMut(ForegroundProgress),
-    {
-        self.requeue_failed_task(task_id)?;
-        self.run_task(task_id, on_progress).await
     }
 
     pub fn requeue_failed_task(&self, task_id: Uuid) -> CommandResult<TaskSummary> {
@@ -405,19 +354,11 @@ impl Application {
         store.delete(task_id).map_err(to_err)
     }
 
-    async fn prepare_task_for_run<F>(
-        &self,
-        task_id: Uuid,
-        spec: &TaskSpec,
-        on_progress: &mut F,
-    ) -> CommandResult<Option<TaskRunResult>>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    async fn prepare_task_for_run(&self, task_id: Uuid, spec: &TaskSpec) -> CommandResult<bool> {
         let summary = summary_for(&self.paths, task_id)?;
         let mut store = TaskStore::open(&self.paths.database).map_err(to_err)?;
         match summary.state {
-            TaskState::Queued => Ok(None),
+            TaskState::Queued => Ok(false),
             TaskState::Paused => {
                 if !store
                     .transition_state(task_id, TaskState::Paused, TaskState::Queued)
@@ -427,13 +368,13 @@ impl Application {
                         "paused task could not be resumed",
                     ));
                 }
-                Ok(None)
+                Ok(false)
             }
             TaskState::Failed => {
                 if !store.requeue_failed(task_id).map_err(to_err)? {
                     return Err(CommandError::invalid_input("failed task cannot be retried"));
                 }
-                Ok(None)
+                Ok(false)
             }
             TaskState::Preparing | TaskState::Running | TaskState::Retrying => {
                 if !store.requeue_interrupted(task_id).map_err(to_err)? {
@@ -441,21 +382,14 @@ impl Application {
                         "interrupted task could not be resumed",
                     ));
                 }
-                Ok(None)
+                Ok(false)
             }
             TaskState::Committing => {
                 let decision = self.reconcile_committing_task(task_id, spec).await?;
                 match decision {
                     CatalogReconcileDecision::Committed => {
                         store.complete_reconciled_commit(task_id).map_err(to_err)?;
-                        on_progress(progress_from_summary(summary_for(&self.paths, task_id)?));
-                        Ok(Some(TaskRunResult {
-                            summary: summary_for(&self.paths, task_id)?,
-                            notices: vec![
-                                "the remote catalog confirms the interrupted commit completed"
-                                    .to_string(),
-                            ],
-                        }))
+                        Ok(true)
                     }
                     CatalogReconcileDecision::Replay => {
                         if !store.requeue_committing(task_id).map_err(to_err)? {
@@ -463,7 +397,7 @@ impl Application {
                                 "interrupted commit could not be replayed",
                             ));
                         }
-                        Ok(None)
+                        Ok(false)
                     }
                     CatalogReconcileDecision::Conflict => {
                         store
@@ -478,10 +412,7 @@ impl Application {
                     }
                 }
             }
-            TaskState::Completed => Ok(Some(TaskRunResult {
-                summary,
-                notices: Vec::new(),
-            })),
+            TaskState::Completed => Ok(true),
             TaskState::Canceled => Err(CommandError::invalid_input(
                 "canceled task cannot be resumed",
             )),
@@ -519,19 +450,15 @@ impl Application {
         Ok(reconcile_catalog_hash(&checkpoint, remote.as_deref()))
     }
 
-    async fn execute_task_spec<F>(
+    async fn execute_task_spec(
         &self,
         task_paths: &LiosPaths,
         task: &mut TaskRecord,
         spec: TaskSpec,
-        on_progress: &mut F,
-    ) -> CommandResult<Vec<String>>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    ) -> CommandResult<Vec<String>> {
         match spec {
             TaskSpec::Copy { repo, plan, .. } | TaskSpec::Sync { repo, plan, .. } => {
-                self.run_persisted_transfer(task_paths, task, repo, plan, on_progress)
+                self.run_persisted_transfer(task_paths, task, repo, plan)
                     .await
             }
             TaskSpec::Upload {
@@ -555,13 +482,11 @@ impl Application {
                     snapshot.files,
                     chunk_size,
                     conflict_resolutions,
-                    on_progress,
                 )
                 .await
             }
             TaskSpec::Delete { repo, node_ids, .. } => {
-                self.run_delete(task_paths, task, repo, node_ids, on_progress)
-                    .await
+                self.run_delete(task_paths, task, repo, node_ids).await
             }
             TaskSpec::Download {
                 repo,
@@ -569,39 +494,32 @@ impl Application {
                 output_dir,
                 ..
             } => {
-                self.run_download(task_paths, task, repo, node_ids, output_dir, on_progress)
+                self.run_download(task_paths, task, repo, node_ids, output_dir)
                     .await
             }
             TaskSpec::VerifySpace { repo, full, .. } => {
-                self.run_verify(task_paths, task, repo, full, on_progress)
-                    .await
+                self.run_verify(task_paths, repo, full).await
             }
             TaskSpec::RebuildCatalog {
                 repo,
                 expected_revision,
                 ..
             } => {
-                self.run_rebuild(task_paths, task, repo, expected_revision, on_progress)
+                self.run_rebuild(task_paths, task, repo, expected_revision)
                     .await
             }
         }
     }
 
-    async fn run_persisted_transfer<F>(
+    async fn run_persisted_transfer(
         &self,
         paths: &LiosPaths,
         task: &mut TaskRecord,
         repo: RepoConfig,
         plan: PersistedTransferPlan,
-        on_progress: &mut F,
-    ) -> CommandResult<Vec<String>>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    ) -> CommandResult<Vec<String>> {
         if plan.direction == TransferDirection::Pull {
-            return self
-                .run_persisted_pull(paths, task, repo, plan, on_progress)
-                .await;
+            return self.run_persisted_pull(paths, task, repo, plan).await;
         }
         let config = LiosConfig::load(&paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
@@ -748,33 +666,21 @@ impl Application {
                 .map_err(to_err)?
                 .update_transfer(task.id, done, total, bytes_done, bytes_total, 0)
                 .map_err(to_err)?;
-            on_progress(ForegroundProgress {
-                task_id: task.id,
-                phase: "applying_plan".to_string(),
-                completed: done,
-                total,
-                bytes_done,
-                bytes_total,
-            });
         }
 
         let work = plan_catalog_sync(paths, &catalog, &key, baseline)?;
         persist_sync_checkpoints(paths, task.id, &work)?;
-        self.publish_sync(paths, task.id, &adapter, &repo, work, on_progress)
+        self.publish_sync(paths, task.id, &adapter, &repo, work)
             .await
     }
 
-    async fn run_persisted_pull<F>(
+    async fn run_persisted_pull(
         &self,
         paths: &LiosPaths,
         task: &mut TaskRecord,
         repo: RepoConfig,
         plan: PersistedTransferPlan,
-        on_progress: &mut F,
-    ) -> CommandResult<Vec<String>>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    ) -> CommandResult<Vec<String>> {
         let config = LiosConfig::load(&paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
@@ -938,20 +844,12 @@ impl Application {
                 .map_err(to_err)?
                 .update_transfer(task.id, done, total, bytes_done, bytes_total, 0)
                 .map_err(to_err)?;
-            on_progress(ForegroundProgress {
-                task_id: task.id,
-                phase: "applying_plan".to_string(),
-                completed: done,
-                total,
-                bytes_done,
-                bytes_total,
-            });
         }
         Ok(Vec::new())
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn run_upload<F>(
+    async fn run_upload(
         &self,
         paths: &LiosPaths,
         task: &mut TaskRecord,
@@ -961,11 +859,7 @@ impl Application {
         _source_files: Vec<SourceFileSnapshot>,
         chunk_size: usize,
         conflict_resolutions: Vec<ConflictResolution>,
-        on_progress: &mut F,
-    ) -> CommandResult<Vec<String>>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    ) -> CommandResult<Vec<String>> {
         let config = LiosConfig::load(&paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
@@ -1022,35 +916,23 @@ impl Application {
                             );
                         }
                     }
-                    on_progress(ForegroundProgress {
-                        task_id: task.id,
-                        phase: "preparing".to_string(),
-                        completed: pack.completed_chunks,
-                        total: pack.total_chunks,
-                        bytes_done: pack.completed_bytes,
-                        bytes_total: pack.total_bytes,
-                    });
                 },
             )
             .map_err(to_err)?;
         report.ensure_no_skipped_paths().map_err(to_err)?;
         let work = plan_catalog_sync(paths, &catalog, &key, baseline)?;
         persist_sync_checkpoints(paths, task.id, &work)?;
-        self.publish_sync(paths, task.id, &adapter, &repo, work, on_progress)
+        self.publish_sync(paths, task.id, &adapter, &repo, work)
             .await
     }
 
-    async fn run_delete<F>(
+    async fn run_delete(
         &self,
         paths: &LiosPaths,
         task: &TaskRecord,
         repo: RepoConfig,
         node_ids: Vec<String>,
-        on_progress: &mut F,
-    ) -> CommandResult<Vec<String>>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    ) -> CommandResult<Vec<String>> {
         let config = LiosConfig::load(&paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
@@ -1058,22 +940,18 @@ impl Application {
         catalog.delete_nodes(&node_ids, &key).map_err(to_err)?;
         let work = plan_catalog_sync(paths, &catalog, &key, baseline)?;
         persist_sync_checkpoints(paths, task.id, &work)?;
-        self.publish_sync(paths, task.id, &adapter, &repo, work, on_progress)
+        self.publish_sync(paths, task.id, &adapter, &repo, work)
             .await
     }
 
-    async fn publish_sync<F>(
+    async fn publish_sync(
         &self,
         paths: &LiosPaths,
         task_id: Uuid,
         adapter: &ModelScopeAdapter,
         repo: &RepoConfig,
         work: crate::catalog_sync::SyncWork,
-        on_progress: &mut F,
-    ) -> CommandResult<Vec<String>>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    ) -> CommandResult<Vec<String>> {
         let store = TaskStore::open(&paths.database).map_err(to_err)?;
         if !store
             .set_transaction_state(task_id, TaskState::Committing)
@@ -1101,7 +979,6 @@ impl Application {
                     observation.speed_bps,
                     observation.eta_seconds,
                 )?;
-                on_progress(progress_from_transaction(task_id, &progress));
                 Ok(())
             },
         )
@@ -1117,18 +994,14 @@ impl Application {
         }
     }
 
-    async fn run_download<F>(
+    async fn run_download(
         &self,
         paths: &LiosPaths,
         task: &mut TaskRecord,
         repo: RepoConfig,
         node_ids: Vec<String>,
         output_dir: PathBuf,
-        on_progress: &mut F,
-    ) -> CommandResult<Vec<String>>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    ) -> CommandResult<Vec<String>> {
         let config = LiosConfig::load(&paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
@@ -1206,14 +1079,6 @@ impl Application {
             store
                 .update_eta(task.id, observation.eta_seconds)
                 .map_err(to_err)?;
-            on_progress(ForegroundProgress {
-                task_id: task.id,
-                phase: "downloading".to_string(),
-                completed,
-                total,
-                bytes_done,
-                bytes_total,
-            });
         }
         store
             .update_phase(task.id, Some("restoring".to_string()))
@@ -1231,28 +1096,16 @@ impl Application {
         store
             .update_transfer(task.id, total, total, bytes_done, bytes_total, 0)
             .map_err(to_err)?;
-        on_progress(ForegroundProgress {
-            task_id: task.id,
-            phase: "completed".to_string(),
-            completed: total,
-            total,
-            bytes_done,
-            bytes_total,
-        });
         Ok(Vec::new())
     }
 
-    async fn run_rebuild<F>(
+    async fn run_rebuild(
         &self,
         paths: &LiosPaths,
         task: &TaskRecord,
         repo: RepoConfig,
         expected_revision: Option<String>,
-        on_progress: &mut F,
-    ) -> CommandResult<Vec<String>>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    ) -> CommandResult<Vec<String>> {
         let config = LiosConfig::load(&paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
@@ -1288,38 +1141,13 @@ impl Application {
             .cloned()
             .collect::<Vec<_>>();
 
-        let total_objects = metadata_objects.len() as u64;
-        let total_bytes = metadata_objects
-            .iter()
-            .fold(0u64, |sum, obj| sum.saturating_add(obj.size));
-        let mut completed_bytes = 0u64;
-
-        for (index, obj) in metadata_objects.iter().enumerate() {
+        for obj in &metadata_objects {
             let local_path = remote_to_staging_path(&paths.staging, &obj.path)?;
             adapter
                 .download_object(&repo.namespace, &repo.dataset, &obj.path, &local_path)
                 .await
                 .map_err(to_err)?;
-            completed_bytes = completed_bytes.saturating_add(obj.size);
-            let completed = (index + 1) as u64;
-            on_progress(ForegroundProgress {
-                task_id: task.id,
-                phase: "downloading_recovery_metadata".to_string(),
-                completed,
-                total: total_objects,
-                bytes_done: completed_bytes,
-                bytes_total: total_bytes,
-            });
         }
-
-        on_progress(ForegroundProgress {
-            task_id: task.id,
-            phase: "rebuilding_catalog".to_string(),
-            completed: total_objects,
-            total: total_objects,
-            bytes_done: completed_bytes,
-            bytes_total: total_bytes,
-        });
 
         let staging_dir = paths.staging.clone();
         let key_clone = key.clone();
@@ -1352,7 +1180,7 @@ impl Application {
         work.expected_revision = Some(started_revision);
         persist_sync_checkpoints(paths, task.id, &work)?;
         let mut warnings = self
-            .publish_sync(paths, task.id, &adapter, &repo, work, on_progress)
+            .publish_sync(paths, task.id, &adapter, &repo, work)
             .await?;
         if report.unreferenced_managed_objects > 0 {
             warnings.push(format!(
@@ -1363,17 +1191,12 @@ impl Application {
         Ok(warnings)
     }
 
-    async fn run_verify<F>(
+    async fn run_verify(
         &self,
         paths: &LiosPaths,
-        task: &TaskRecord,
         repo: RepoConfig,
         full: bool,
-        on_progress: &mut F,
-    ) -> CommandResult<Vec<String>>
-    where
-        F: FnMut(ForegroundProgress),
-    {
+    ) -> CommandResult<Vec<String>> {
         let config = LiosConfig::load(&paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
@@ -1391,42 +1214,17 @@ impl Application {
             .verify_remote_inventory(&key, &remote_objects)
             .map_err(to_err)?;
         if !full {
-            on_progress(ForegroundProgress {
-                task_id: task.id,
-                phase: "verified".to_string(),
-                completed: remote.verified_objects,
-                total: remote.expected_objects,
-                bytes_done: remote.encoded_bytes_verified,
-                bytes_total: remote.encoded_bytes_verified,
-            });
             return Ok(vec![format_remote_report(&remote)]);
         }
         let files = catalog
             .remote_files_for_selection(&CatalogSelection::All, &key)
             .map_err(to_err)?;
-        let bytes_total = files.iter().fold(0u64, |total, file| {
-            total.saturating_add(file.expected_size.unwrap_or(0))
-        });
-        let mut bytes_done = 0u64;
-        for (index, file) in files.iter().enumerate() {
+        for file in &files {
             let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
             adapter
                 .download_object(&repo.namespace, &repo.dataset, &file.path, &local_path)
                 .await
                 .map_err(to_err)?;
-            bytes_done = bytes_done.saturating_add(
-                std::fs::metadata(&local_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0),
-            );
-            on_progress(ForegroundProgress {
-                task_id: task.id,
-                phase: "verifying".to_string(),
-                completed: index as u64 + 1,
-                total: files.len() as u64,
-                bytes_done,
-                bytes_total,
-            });
         }
         let local = catalog.verify_staged_integrity(&key).map_err(to_err)?;
         Ok(vec![
@@ -1918,31 +1716,6 @@ fn persist_transaction_progress(
         speed_bps,
     )?;
     store.update_eta(task_id, eta_seconds)
-}
-
-fn progress_from_transaction(
-    task_id: Uuid,
-    progress: &CatalogTransactionProgress,
-) -> ForegroundProgress {
-    ForegroundProgress {
-        task_id,
-        phase: phase_label(progress.phase).to_string(),
-        completed: progress.completed_items,
-        total: progress.total_items,
-        bytes_done: progress.bytes_done,
-        bytes_total: progress.bytes_total,
-    }
-}
-
-fn progress_from_summary(summary: TaskSummary) -> ForegroundProgress {
-    ForegroundProgress {
-        task_id: summary.id,
-        phase: summary.phase.unwrap_or_else(|| "completed".to_string()),
-        completed: summary.progress_done,
-        total: summary.progress_total,
-        bytes_done: summary.bytes_done,
-        bytes_total: summary.bytes_total,
-    }
 }
 
 fn format_remote_report(report: &CatalogRemoteIntegrityReport) -> String {

@@ -79,7 +79,7 @@ async fn run_one_task(
     task_id: Uuid,
 ) -> lios_application::CommandResult<bool> {
     let runner = application.clone();
-    let mut execution = Box::pin(runner.run_task(task_id, |_| {}));
+    let mut execution = Box::pin(runner.run_task(task_id));
     loop {
         tokio::select! {
             result = &mut execution => {

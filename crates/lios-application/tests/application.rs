@@ -83,10 +83,7 @@ async fn second_frontend_gets_a_typed_busy_error_for_the_same_space() {
     let space_id = task.space_id.clone();
     let _first_frontend = paths.try_lock_space(&space_id).unwrap();
 
-    let error = application
-        .run_task(task.id, |_progress| {})
-        .await
-        .unwrap_err();
+    let error = application.run_task(task.id).await.unwrap_err();
 
     assert_eq!(error.code, CommandErrorCode::Busy);
     assert!(error.retryable);
