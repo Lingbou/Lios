@@ -245,15 +245,6 @@ impl Application {
         import_recovery_key_for_paths(&self.paths, &self.config_gate, candidate).await
     }
 
-    pub async fn list_children_in(
-        &self,
-        repo: RepoConfig,
-        parent_node_id: &str,
-    ) -> CommandResult<Vec<DriveItem>> {
-        let (catalog, key) = self.download_catalog_for(repo).await?;
-        catalog.list_children(parent_node_id, &key).map_err(to_err)
-    }
-
     pub async fn search_in(&self, repo: RepoConfig, query: &str) -> CommandResult<Vec<DriveItem>> {
         let (catalog, key) = self.download_catalog_for(repo).await?;
         catalog.search(query, &key).map_err(to_err)

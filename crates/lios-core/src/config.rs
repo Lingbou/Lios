@@ -101,17 +101,6 @@ impl Drop for ConfigLock {
     }
 }
 
-pub fn lios_home() -> PathBuf {
-    UserDirs::new()
-        .and_then(|dirs| dirs.home_dir().canonicalize().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".lios")
-}
-
-pub fn config_path() -> PathBuf {
-    lios_home().join("config.yaml")
-}
-
 impl LiosPaths {
     pub fn from_home(home: impl AsRef<Path>) -> Self {
         let home = home.as_ref().join(".lios");

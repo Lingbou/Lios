@@ -693,20 +693,6 @@ impl Catalog {
         tree_node_v1(&catalog.catalog, &catalog.catalog.root_id)
     }
 
-    pub fn list_children(&self, parent_id: &str, key: &KeyFile) -> Result<Vec<DriveItem>> {
-        let loaded = self.load_catalog_v1(key)?;
-        let parent = catalog_node(&loaded.catalog, parent_id)?;
-        match parent.descriptor.kind {
-            NodeDescriptorKindV1::Directory => child_ids(&loaded.catalog, parent_id)
-                .into_iter()
-                .map(|id| drive_item_v1(&loaded.catalog, id))
-                .collect(),
-            NodeDescriptorKindV1::File { .. } => Err(LiosError::Unsupported(
-                "cannot list children for a file".to_string(),
-            )),
-        }
-    }
-
     pub fn search(&self, query: &str, key: &KeyFile) -> Result<Vec<DriveItem>> {
         let query = query.trim().to_lowercase();
         if query.is_empty() {
