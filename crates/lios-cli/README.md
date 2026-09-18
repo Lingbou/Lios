@@ -91,7 +91,7 @@ worker stop
 ```
 
 `cp` copies and `sync` computes a source-wins difference. Direction comes only from operand order;
-0.2 supports local-to-Space and Space-to-local transfers, not Space-to-Space. Directory operands
+0.1 supports local-to-Space and Space-to-local transfers, not Space-to-Space. Directory operands
 use rsync trailing-slash semantics: `dir` copies the directory itself and `dir/` copies its
 contents.
 
@@ -101,7 +101,7 @@ entries inside the selected target subtree; excluded paths are protected from de
 deletion removes Catalog references and does not promise ModelScope capacity reclamation.
 `--exclude` and `--exclude-from` patterns are matched relative to the selected source root.
 
-Symlinks and junctions are rejected. Lios 0.2 does not preserve permissions, ownership, or
+Symlinks and junctions are rejected. Lios 0.1 does not preserve permissions, ownership, or
 modification times.
 
 ## Durable worker

@@ -31,7 +31,7 @@ An encrypted logical drive stored in one Dataset Repository and described by a v
 _Avoid_: Dataset Repository when no valid Lios Catalog exists
 
 **Space Name**:
-A 2–32-character lowercase, local alias in one Lios Home that maps to exactly one Repository Address. CLI operands use the alias as `name:` or `name:/absolute/catalog/path`. The alias is not the remote identity and may be renamed without changing the Lios Space.
+A 1–32-character lowercase, local alias in one Lios Home that maps to exactly one Repository Address. CLI operands use the alias as `name:` or `name:/absolute/catalog/path`. The alias is not the remote identity and may be renamed without changing the Lios Space.
 _Avoid_: Repository Address, Dataset Name, remote ID
 
 **Catalog**:
