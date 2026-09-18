@@ -12,8 +12,7 @@ use lios_core::tasks::{
 };
 use lios_core::{LiosError, Result as CoreResult};
 use sha2::{Digest, Sha256};
-use tokio::sync::{AcquireError, Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{AcquireError, Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 pub const MAX_CONCURRENT_TRANSFERS: usize = 2;
@@ -430,7 +429,6 @@ impl TaskScope {
 #[derive(Clone)]
 pub struct TaskManager {
     gate: Arc<TaskExecutionGate>,
-    controls: Arc<TaskControlRegistry>,
 }
 
 impl Default for TaskManager {
@@ -443,7 +441,6 @@ impl TaskManager {
     pub fn new() -> Self {
         Self {
             gate: Arc::new(TaskExecutionGate::new()),
-            controls: Arc::new(TaskControlRegistry::default()),
         }
     }
 
@@ -470,110 +467,6 @@ impl TaskManager {
         permit: &mut TaskExecutionPermit,
     ) -> Result<(), AcquireError> {
         self.gate.restore_transfer(permit).await
-    }
-
-    pub async fn register(&self, task_id: Uuid) -> TaskControl {
-        self.controls.register(task_id).await
-    }
-
-    pub async fn cancel(&self, task_id: Uuid) -> bool {
-        self.controls.cancel(task_id).await
-    }
-
-    pub async fn remove(&self, control: &TaskControl) {
-        self.controls.remove(control).await;
-    }
-
-    pub async fn is_running(&self, task_id: Uuid) -> bool {
-        self.controls.is_registered(task_id).await
-    }
-
-    pub async fn wait_until_stopped(&self, task_id: Uuid) {
-        self.controls.wait_until_stopped(task_id).await;
-    }
-}
-
-#[derive(Default)]
-pub struct TaskControlRegistry {
-    tokens: Mutex<HashMap<Uuid, TaskControlEntry>>,
-    stopped: Notify,
-}
-
-struct TaskControlEntry {
-    generation: Uuid,
-    token: CancellationToken,
-}
-
-pub struct TaskControl {
-    task_id: Uuid,
-    generation: Uuid,
-    token: CancellationToken,
-}
-
-impl TaskControl {
-    pub fn token(&self) -> &CancellationToken {
-        &self.token
-    }
-}
-
-impl TaskControlRegistry {
-    pub async fn register(&self, task_id: Uuid) -> TaskControl {
-        let generation = Uuid::new_v4();
-        let token = CancellationToken::new();
-        if let Some(previous) = self.tokens.lock().await.insert(
-            task_id,
-            TaskControlEntry {
-                generation,
-                token: token.clone(),
-            },
-        ) {
-            previous.token.cancel();
-        }
-        TaskControl {
-            task_id,
-            generation,
-            token,
-        }
-    }
-
-    pub async fn cancel(&self, task_id: Uuid) -> bool {
-        let token = self
-            .tokens
-            .lock()
-            .await
-            .get(&task_id)
-            .map(|entry| entry.token.clone());
-        if let Some(token) = token {
-            token.cancel();
-            true
-        } else {
-            false
-        }
-    }
-
-    pub async fn remove(&self, control: &TaskControl) {
-        let mut tokens = self.tokens.lock().await;
-        if tokens
-            .get(&control.task_id)
-            .is_some_and(|entry| entry.generation == control.generation)
-        {
-            tokens.remove(&control.task_id);
-            self.stopped.notify_waiters();
-        }
-    }
-
-    pub async fn is_registered(&self, task_id: Uuid) -> bool {
-        self.tokens.lock().await.contains_key(&task_id)
-    }
-
-    pub async fn wait_until_stopped(&self, task_id: Uuid) {
-        loop {
-            let stopped = self.stopped.notified();
-            if !self.is_registered(task_id).await {
-                return;
-            }
-            stopped.await;
-        }
     }
 }
 
@@ -674,7 +567,7 @@ mod tests {
 
     use super::{
         apply_pack_progress, ensure_source_snapshot_complete, persist_submission,
-        validate_task_sources, TaskControlRegistry, TaskExecutionGate, TaskScope,
+        validate_task_sources, TaskExecutionGate, TaskScope,
     };
 
     #[tokio::test]
@@ -784,55 +677,6 @@ mod tests {
         drop(second);
         third.await.unwrap();
         same.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn task_control_cancels_the_registered_worker_and_is_removed_on_finish() {
-        let controls = TaskControlRegistry::default();
-        let task_id = Uuid::new_v4();
-        let control = controls.register(task_id).await;
-
-        assert!(controls.cancel(task_id).await);
-        control.token().cancelled().await;
-        controls.remove(&control).await;
-        assert!(!controls.cancel(task_id).await);
-    }
-
-    #[tokio::test]
-    async fn an_old_worker_cannot_remove_a_replacement_control_registration() {
-        let controls = TaskControlRegistry::default();
-        let task_id = Uuid::new_v4();
-        let first = controls.register(task_id).await;
-        let replacement = controls.register(task_id).await;
-        assert!(first.token().is_cancelled());
-
-        controls.remove(&first).await;
-
-        assert!(controls.cancel(task_id).await);
-        replacement.token().cancelled().await;
-    }
-
-    #[tokio::test]
-    async fn wait_until_stopped_unblocks_only_after_the_current_control_is_removed() {
-        let controls = Arc::new(TaskControlRegistry::default());
-        let task_id = Uuid::new_v4();
-        let control = controls.register(task_id).await;
-        let waiting_controls = Arc::clone(&controls);
-        let (done_tx, mut done_rx) = oneshot::channel();
-        let waiter = tokio::spawn(async move {
-            waiting_controls.wait_until_stopped(task_id).await;
-            done_tx.send(()).unwrap();
-        });
-
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            done_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-
-        controls.remove(&control).await;
-        done_rx.await.unwrap();
-        waiter.await.unwrap();
     }
 
     #[test]

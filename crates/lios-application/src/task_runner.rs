@@ -364,7 +364,6 @@ impl Application {
                 "only queued or running tasks can pause",
             ));
         }
-        self.task_manager.cancel(task_id).await;
         summary_for(&self.paths, task_id)
     }
 
@@ -378,7 +377,6 @@ impl Application {
                 "only non-terminal tasks can be canceled",
             ));
         }
-        self.task_manager.cancel(task_id).await;
         summary_for(&self.paths, task_id)
     }
 
