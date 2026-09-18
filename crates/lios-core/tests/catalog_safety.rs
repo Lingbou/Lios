@@ -7,7 +7,7 @@ use lios_core::{
         PackOutcome, SkippedPathReason,
     },
     crypto::KeyFile,
-    pack::{PackOptions, PackSource},
+    pack::PackOptions,
     LiosError,
 };
 use tempfile::tempdir;
@@ -300,7 +300,7 @@ fn directory_pack_skips_linked_directory_subtrees() {
 
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let outcome = Catalog::pack_with_report(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -336,7 +336,7 @@ fn root_source_link_returns_local_report_without_catalog() {
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
 
     let outcome = Catalog::pack_with_report(
-        PackSource::Path(linked.clone()),
+        linked.clone(),
         &key,
         PackOptions {
             chunk_size: 4,
@@ -375,7 +375,7 @@ fn catalog_pack_fails_when_nested_path_is_skipped() {
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
 
     let result = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -399,7 +399,7 @@ fn catalog_pack_with_progress_fails_when_nested_path_is_skipped() {
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
 
     let result = Catalog::pack_with_progress(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -421,7 +421,7 @@ fn catalog_only_pack_rejects_root_source_link() {
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
 
     let result = Catalog::pack(
-        PackSource::Path(linked.clone()),
+        linked.clone(),
         &key,
         PackOptions {
             chunk_size: 4,
@@ -443,7 +443,7 @@ fn root_link_is_classified_before_reserved_name_validation() {
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
 
     let outcome = Catalog::pack_with_report(
-        PackSource::Path(linked.clone()),
+        linked.clone(),
         &key,
         PackOptions {
             chunk_size: 4,
@@ -499,7 +499,7 @@ fn folder_upload_skips_linked_directory_and_continues() {
 }
 
 #[test]
-fn folder_upload_compatibility_api_fails_when_path_is_skipped() {
+fn folder_upload_test_helper_fails_when_path_is_skipped() {
     let tmp = tempdir().unwrap();
     let staging = tmp.path().join("staging");
     let outside = tmp.path().join("outside");
@@ -525,7 +525,7 @@ fn folder_upload_compatibility_api_fails_when_path_is_skipped() {
 }
 
 #[test]
-fn folder_upload_progress_compatibility_api_fails_when_path_is_skipped() {
+fn folder_upload_progress_test_helper_fails_when_path_is_skipped() {
     let tmp = tempdir().unwrap();
     let staging = tmp.path().join("staging");
     let outside = tmp.path().join("outside");

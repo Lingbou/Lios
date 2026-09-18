@@ -6,7 +6,7 @@ use lios_core::{
     catalog::{Catalog, CatalogSelection, CATALOG_FILE},
     crypto::KeyFile,
     modelscope::ModelScopeAdapter,
-    pack::{PackOptions, PackSource},
+    pack::PackOptions,
     restore::{RestoreConflictPolicy, RestoreOptions},
     storage::{
         current_catalog_sha256, BlobSpec, BlobValidation, CommitPlan, RemoteAction,
@@ -177,7 +177,7 @@ async fn modelscope_private_dataset_roundtrip() {
     let result = async {
         let key = KeyFile::generate_to_path(tmp.path().join("recovery.key"))?;
         let catalog = Catalog::pack(
-            PackSource::Path(source_dir.clone()),
+            source_dir.clone(),
             &key,
             PackOptions {
                 chunk_size: 17,

@@ -4,17 +4,17 @@ use std::path::PathBuf;
 
 use lios_core::catalog::{Catalog, ConflictResolution, PackOutcome, PackReport};
 use lios_core::crypto::KeyFile;
-use lios_core::pack::{PackOptions, PackProgress, PackSource};
+use lios_core::pack::{PackOptions, PackProgress};
 use lios_core::Result;
 
 pub trait CatalogPackTestExt {
-    fn pack(source: PackSource, key: &KeyFile, options: PackOptions) -> Result<Catalog> {
+    fn pack(source: PathBuf, key: &KeyFile, options: PackOptions) -> Result<Catalog> {
         Self::pack_with_progress_and_report(source, key, options, |_| {})
             .and_then(PackOutcome::into_catalog)
     }
 
     fn pack_with_report(
-        source: PackSource,
+        source: PathBuf,
         key: &KeyFile,
         options: PackOptions,
     ) -> Result<PackOutcome> {
@@ -22,7 +22,7 @@ pub trait CatalogPackTestExt {
     }
 
     fn pack_with_progress(
-        source: PackSource,
+        source: PathBuf,
         key: &KeyFile,
         options: PackOptions,
         on_progress: impl FnMut(PackProgress),
@@ -32,7 +32,7 @@ pub trait CatalogPackTestExt {
     }
 
     fn pack_with_progress_and_report(
-        source: PackSource,
+        source: PathBuf,
         key: &KeyFile,
         options: PackOptions,
         on_progress: impl FnMut(PackProgress),
@@ -41,7 +41,7 @@ pub trait CatalogPackTestExt {
 
 impl CatalogPackTestExt for Catalog {
     fn pack_with_progress_and_report(
-        source: PackSource,
+        source: PathBuf,
         key: &KeyFile,
         options: PackOptions,
         on_progress: impl FnMut(PackProgress),

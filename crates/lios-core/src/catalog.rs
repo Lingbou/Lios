@@ -16,7 +16,7 @@ use crate::format_v1::{
 use crate::framed_v1::{
     decode_chunk_stream_v1, encode_chunk_stream_with_compression_v1, ChunkDecodeLimitsV1, ChunkIdV1,
 };
-use crate::pack::{PackOptions, PackProgress, PackSource};
+use crate::pack::{PackOptions, PackProgress};
 use crate::restore::{RestoreConflictPolicy, RestoreOptions};
 use crate::storage::StorageObject;
 use crate::{LiosError, Result};
@@ -588,16 +588,16 @@ impl Catalog {
     }
 
     pub fn pack_with_progress_and_report(
-        source: PackSource,
+        source_path: PathBuf,
         key: &KeyFile,
         options: PackOptions,
         mut on_progress: impl FnMut(PackProgress),
     ) -> Result<PackOutcome> {
-        Self::pack_with_optional_progress(source, key, options, Some(&mut on_progress))
+        Self::pack_with_optional_progress(source_path, key, options, Some(&mut on_progress))
     }
 
     fn pack_with_optional_progress(
-        source: PackSource,
+        source_path: PathBuf,
         key: &KeyFile,
         options: PackOptions,
         on_progress: Option<&mut dyn FnMut(PackProgress)>,
@@ -608,7 +608,6 @@ impl Catalog {
             ));
         }
 
-        let PackSource::Path(source_path) = source;
         let source_kind = packable_path_kind(&source_path)?;
         let mut report = PackReport::default();
         if source_kind.is_none() {

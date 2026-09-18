@@ -1,11 +1,6 @@
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
-pub enum PackSource {
-    Path(PathBuf),
-}
-
-#[derive(Clone, Debug)]
 pub struct PackOptions {
     pub chunk_size: usize,
     pub staging_dir: PathBuf,

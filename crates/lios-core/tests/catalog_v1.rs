@@ -10,7 +10,7 @@ use lios_core::{
     },
     crypto::KeyFile,
     format_v1::{decrypt_envelope_v1, encrypt_envelope_v1, parse_envelope_v1, EnvelopeKindV1},
-    pack::{PackOptions, PackSource},
+    pack::PackOptions,
     restore::{RestoreConflictPolicy, RestoreOptions},
     storage::StorageObject,
 };
@@ -608,7 +608,7 @@ fn independent_fresh_spaces_randomize_ids_and_ciphertext_for_same_content() {
     let second_staging = tmp.path().join("second-staging");
 
     let first = Catalog::pack(
-        PackSource::Path(source.clone()),
+        source.clone(),
         &key,
         PackOptions {
             chunk_size: 64 * 1024,
@@ -617,7 +617,7 @@ fn independent_fresh_spaces_randomize_ids_and_ciphertext_for_same_content() {
     )
     .unwrap();
     let second = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 64 * 1024,
@@ -739,7 +739,7 @@ fn restore_rejects_unknown_manifest_version_and_wrong_envelope_kind() {
     write_file(&source, b"manifest integrity");
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 8,
@@ -807,7 +807,7 @@ fn v1_catalog_rejects_non_normal_remote_paths_before_restore() {
     write_file(&source, b"safe path");
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -856,7 +856,7 @@ fn v1_storage_object_id_requires_canonical_lowercase_hex() {
     write_file(&source, b"canonical object id");
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 8,
@@ -932,7 +932,7 @@ fn v1_catalog_rejects_child_of_file() {
     write_file(&source, b"file parent");
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 8,

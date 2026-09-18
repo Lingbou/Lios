@@ -8,7 +8,7 @@ use lios_core::{
     },
     crypto::KeyFile,
     format_v1::{decrypt_envelope_v1, encrypt_envelope_v1, EnvelopeKindV1},
-    pack::{PackOptions, PackProgress, PackSource},
+    pack::{PackOptions, PackProgress},
     restore::{RestoreConflictPolicy, RestoreOptions},
     storage::StorageObject,
     LiosError,
@@ -108,7 +108,7 @@ fn packed_file_restores_to_identical_bytes() {
 
     let key = KeyFile::generate_to_path(&key_path).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source.clone()),
+        source.clone(),
         &key,
         PackOptions {
             chunk_size: 257,
@@ -140,7 +140,7 @@ fn full_integrity_check_authenticates_descriptors_manifests_chunks_and_whole_fil
     write_file(&source, &data);
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 257,
@@ -172,7 +172,7 @@ fn full_integrity_check_rejects_authenticated_object_corruption() {
     write_file(&source, b"integrity payload");
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -202,7 +202,7 @@ fn full_integrity_check_rejects_authenticated_manifest_corruption() {
     write_file(&source, b"integrity payload");
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -233,7 +233,7 @@ fn full_integrity_check_rejects_authenticated_descriptor_corruption() {
     write_file(&source, b"integrity payload");
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -258,7 +258,7 @@ fn full_integrity_check_rejects_missing_native_v1_descriptor_hash() {
     write_file(&source, b"integrity payload");
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -285,7 +285,7 @@ fn quick_inventory_enumeration_rejects_missing_native_v1_descriptor_hash() {
     write_file(&source, b"integrity payload");
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -315,7 +315,7 @@ fn full_integrity_check_rejects_linked_staging_ancestor() {
     write_file(&source, b"integrity payload");
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -338,7 +338,7 @@ fn remote_inventory_check_authenticates_current_references_and_reports_stale_obj
     write_file(&source, b"remote inventory payload");
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -375,7 +375,7 @@ fn remote_inventory_check_rejects_missing_referenced_object() {
     write_file(&source, b"remote inventory payload");
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -400,7 +400,7 @@ fn remote_inventory_check_rejects_size_and_lfs_oid_mismatch() {
     write_file(&source, b"remote inventory payload");
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -448,7 +448,7 @@ fn pack_reports_progress_for_each_chunk() {
     let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
     let mut events = Vec::<PackProgress>::new();
     Catalog::pack_with_progress(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -499,7 +499,7 @@ fn wrong_key_cannot_decrypt_catalog_or_chunks() {
     let good_key = KeyFile::generate_to_path(tmp.path().join("good.key")).unwrap();
     let wrong_key = KeyFile::generate_to_path(tmp.path().join("wrong.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &good_key,
         PackOptions {
             chunk_size: 5,
@@ -530,7 +530,7 @@ fn corrupted_restore_leaves_no_final_or_partial_file() {
 
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -581,7 +581,7 @@ fn whole_file_hash_mismatch_leaves_no_final_or_partial_file() {
 
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -658,7 +658,7 @@ fn encrypted_manifest_does_not_contain_plaintext_names() {
 
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -799,7 +799,7 @@ fn directory_restore_preserves_tree_and_renames_conflicts() {
 
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source_dir),
+        source_dir,
         &key,
         PackOptions {
             chunk_size: 2,
@@ -840,7 +840,7 @@ fn file_restore_rejects_link_at_final_output_path() {
 
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -876,7 +876,7 @@ fn directory_restore_rejects_linked_descendant_without_writing_outside_root() {
 
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -909,7 +909,7 @@ fn catalog_exposes_decrypted_tree_and_remote_files_for_selected_node() {
     let staging = tmp.path().join("staging");
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source_dir),
+        source_dir,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -953,7 +953,7 @@ fn fresh_spaces_randomize_chunk_ciphertext_under_file_object_directories() {
 
     let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
     let first_catalog = Catalog::pack(
-        PackSource::Path(first),
+        first,
         &key,
         PackOptions {
             chunk_size: 4,
@@ -962,7 +962,7 @@ fn fresh_spaces_randomize_chunk_ciphertext_under_file_object_directories() {
     )
     .unwrap();
     let second_catalog = Catalog::pack(
-        PackSource::Path(second),
+        second,
         &key,
         PackOptions {
             chunk_size: 4,

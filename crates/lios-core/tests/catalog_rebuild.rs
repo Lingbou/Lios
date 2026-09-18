@@ -9,7 +9,7 @@ use lios_core::{
     },
     crypto::KeyFile,
     format_v1::{decrypt_envelope_v1, encrypt_envelope_v1, parse_envelope_v1, EnvelopeKindV1},
-    pack::{PackOptions, PackSource},
+    pack::PackOptions,
     storage::StorageObject,
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -60,7 +60,7 @@ fn recovery_fixture() -> RecoveryFixture {
     let staging = tmp.path().join("staging");
     let key = KeyFile::generate_to_path(tmp.path().join("recovery.key")).unwrap();
     let catalog = Catalog::pack(
-        PackSource::Path(source),
+        source,
         &key,
         PackOptions {
             chunk_size: 7,
