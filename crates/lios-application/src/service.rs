@@ -18,9 +18,7 @@ use crate::catalog_mutation_gate::CatalogMutationGate;
 use crate::catalog_probe::{ensure_space_can_initialize, map_catalog_load_error};
 use crate::catalog_sync::{download_catalog_baseline, sync_current_catalog, CatalogBaseline};
 use crate::config_mutation_gate::ConfigMutationGate;
-use crate::production_config::{
-    configured_endpoint, prepare_startup_config, validate_repo, SetupWarning,
-};
+use crate::production_config::{configured_endpoint, prepare_startup_config, validate_repo};
 use crate::recovery_key_service::{
     export_recovery_key_for_paths, import_recovery_key_for_paths, verify_recovery_key_for_paths,
     RecoveryKeyVerification,
@@ -36,7 +34,6 @@ pub struct SetupSnapshot {
     pub config: LiosConfig,
     pub recovery_key: RecoveryKeyStatus,
     pub has_token: bool,
-    pub warning: Option<SetupWarning>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,35 +93,29 @@ impl Application {
 
     pub fn setup(&self) -> CommandResult<SetupSnapshot> {
         self.paths.ensure_dirs().map_err(to_err)?;
-        let (config, warning) = {
+        let config = {
             let _guard = self.config_gate.lock()?;
             let _process_guard = self.paths.try_lock_config().map_err(CommandError::from)?;
             let mut config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
-            let warning = prepare_startup_config(&self.paths, &mut config)?;
-            (config, warning)
+            prepare_startup_config(&self.paths, &mut config)?;
+            config
         };
-        Ok(self.setup_snapshot(config, true, warning))
+        Ok(self.setup_snapshot(config, true))
     }
 
     pub fn inspect_setup(&self) -> CommandResult<SetupSnapshot> {
         let initialized = self.paths.config.is_file();
         let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
-        Ok(self.setup_snapshot(config, initialized, None))
+        Ok(self.setup_snapshot(config, initialized))
     }
 
-    fn setup_snapshot(
-        &self,
-        config: LiosConfig,
-        initialized: bool,
-        warning: Option<SetupWarning>,
-    ) -> SetupSnapshot {
+    fn setup_snapshot(&self, config: LiosConfig, initialized: bool) -> SetupSnapshot {
         SetupSnapshot {
             paths: self.paths.clone(),
             initialized,
             recovery_key: recovery_key_status(&config),
             config,
             has_token: self.paths.credentials.is_file(),
-            warning,
         }
     }
 

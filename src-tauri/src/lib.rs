@@ -56,7 +56,7 @@ use lios_core::storage::{RepoRevision, StorageAdapter, StorageObject};
 #[cfg(test)]
 use lios_core::tasks::{CheckpointState, TaskItemState, TaskObjectCheckpoint};
 use lios_core::tasks::{TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary};
-use production_config::{configured_endpoint, prepare_startup_config, validate_repo, SetupWarning};
+use production_config::{configured_endpoint, prepare_startup_config, validate_repo};
 use recovery_key_service::{
     export_recovery_key_for_paths, import_recovery_key_for_paths, recovery_key_status,
     verify_recovery_key_for_paths, RecoveryKeyStatus, RecoveryKeyVerification,
@@ -133,7 +133,6 @@ struct SetupSnapshot {
     recovery_key: RecoveryKeyStatus,
     has_token: bool,
     spaces: Vec<RegisteredSpaceDto>,
-    warning: Option<SetupWarning>,
 }
 
 #[derive(Serialize)]
@@ -1582,11 +1581,11 @@ async fn head_revision_with_cancellation(
 #[tauri::command]
 fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnapshot> {
     state.paths.ensure_dirs().map_err(to_err)?;
-    let (config, warning) = {
+    let config = {
         let _config_guard = state.config_mutation_gate.lock()?;
         let mut config = load_config(&state.paths)?;
-        let warning = prepare_startup_config(&state.paths, &mut config)?;
-        (config, warning)
+        prepare_startup_config(&state.paths, &mut config)?;
+        config
     };
     let spaces = config
         .spaces
@@ -1599,7 +1598,6 @@ fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnap
         config,
         has_token: state.paths.credentials.exists(),
         spaces,
-        warning,
     })
 }
 
@@ -2615,7 +2613,6 @@ mod task_center_backend_tests {
             config,
             has_token: false,
             spaces: Vec::new(),
-            warning: None,
         };
         let event = TaskUpdateEvent::Upsert {
             task: Box::new(task),

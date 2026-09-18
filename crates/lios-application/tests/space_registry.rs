@@ -58,7 +58,6 @@ fn startup_initializes_clean_spaces_configuration() {
     let application = lios_application::service::Application::new(paths.clone()).unwrap();
     let snapshot = application.setup().unwrap();
     assert!(snapshot.config.spaces.is_empty());
-    assert!(snapshot.warning.is_none());
 }
 
 #[test]

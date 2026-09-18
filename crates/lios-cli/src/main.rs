@@ -97,7 +97,6 @@ async fn run_inner(cli: Cli) -> CliResult<CommandOutput> {
                 "recovery_key": setup.recovery_key,
                 "spaces": setup.config.spaces,
                 "has_token": setup.has_token,
-                "warning": setup.warning,
             }))
             .human(format!(
                 "Lios state initialized at {}",

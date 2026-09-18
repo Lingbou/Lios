@@ -1,23 +1,10 @@
 //! Validation and persistence for user-facing application configuration.
 
+use crate::command_error::CommandError;
 use lios_core::config::{
     ensure_default_key_binding, validate_modelscope_production_endpoint, LiosConfig, LiosPaths,
     RepoConfig, MODELSCOPE_ENDPOINT,
 };
-use serde::Serialize;
-
-use crate::command_error::CommandError;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub enum SetupWarningCode {
-    ReconnectRequired,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SetupWarning {
-    pub code: SetupWarningCode,
-    pub message: String,
-}
 
 pub fn configured_endpoint(
     _config: &LiosConfig,
@@ -88,12 +75,12 @@ pub fn persist_config(paths: &LiosPaths, config: &mut LiosConfig) -> Result<(), 
 pub fn prepare_startup_config(
     paths: &LiosPaths,
     config: &mut LiosConfig,
-) -> Result<Option<SetupWarning>, CommandError> {
+) -> Result<(), CommandError> {
     let key_bound = ensure_default_key_binding(paths, config)?;
     if key_bound {
         persist_config(paths, config)?;
     }
-    Ok(None)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -180,8 +167,7 @@ mod tests {
         let paths = LiosPaths::from_home(temp.path());
         paths.ensure_dirs().unwrap();
         let mut config = LiosConfig::default();
-        let warning = prepare_startup_config(&paths, &mut config).unwrap();
-        assert!(warning.is_none());
+        prepare_startup_config(&paths, &mut config).unwrap();
         assert_eq!(config.key_file_path, Some(paths.home.join("recovery.key")));
         assert!(paths.home.join("recovery.key").exists());
     }
