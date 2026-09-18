@@ -3448,6 +3448,56 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+pub fn is_precompressed_path(path: &Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "zip"
+                | "gz"
+                | "tgz"
+                | "tar"
+                | "xz"
+                | "7z"
+                | "bz2"
+                | "zst"
+                | "lz4"
+                | "mp4"
+                | "mkv"
+                | "mov"
+                | "avi"
+                | "webm"
+                | "flv"
+                | "wmv"
+                | "mp3"
+                | "flac"
+                | "aac"
+                | "ogg"
+                | "m4a"
+                | "wav"
+                | "jpg"
+                | "jpeg"
+                | "png"
+                | "webp"
+                | "gif"
+                | "heic"
+                | "avif"
+                | "iso"
+                | "dmg"
+                | "apk"
+                | "ipa"
+                | "whl"
+                | "jar"
+                | "war"
+                | "pdf"
+                | "docx"
+                | "xlsx"
+                | "pptx"
+        )
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]
@@ -3512,55 +3562,5 @@ mod tests {
             "failed to create junction: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-}
-
-pub fn is_precompressed_path(path: &Path) -> bool {
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "zip"
-                | "gz"
-                | "tgz"
-                | "tar"
-                | "xz"
-                | "7z"
-                | "bz2"
-                | "zst"
-                | "lz4"
-                | "mp4"
-                | "mkv"
-                | "mov"
-                | "avi"
-                | "webm"
-                | "flv"
-                | "wmv"
-                | "mp3"
-                | "flac"
-                | "aac"
-                | "ogg"
-                | "m4a"
-                | "wav"
-                | "jpg"
-                | "jpeg"
-                | "png"
-                | "webp"
-                | "gif"
-                | "heic"
-                | "avif"
-                | "iso"
-                | "dmg"
-                | "apk"
-                | "ipa"
-                | "whl"
-                | "jar"
-                | "war"
-                | "pdf"
-                | "docx"
-                | "xlsx"
-                | "pptx"
-        )
-    } else {
-        false
     }
 }
