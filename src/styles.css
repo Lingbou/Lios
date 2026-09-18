@@ -144,6 +144,29 @@ select:focus {
   flex: 1 1 auto;
 }
 
+.titlebarAction {
+  width: 38px;
+  min-height: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+}
+
+.titlebarAction:hover:not(:disabled),
+.titlebarAction.active {
+  background: rgba(255, 226, 240, 0.9);
+  color: var(--pink-strong);
+}
+
+.titlebarAction svg {
+  width: 16px;
+  height: 16px;
+}
+
 .windowControls {
   height: 100%;
   display: flex;

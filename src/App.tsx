@@ -1274,6 +1274,15 @@ function App() {
           <span>Lios</span>
         </div>
         <div className="windowDragRegion" data-tauri-drag-region onMouseDown={startWindowDrag} />
+        <button
+          className={`titlebarAction ${view === "settings" ? "active" : ""}`}
+          onClick={openSettings}
+          title="设置"
+          aria-label="设置"
+          aria-pressed={view === "settings"}
+        >
+          <Settings aria-hidden />
+        </button>
         <div className="windowControls">
           <button onClick={minimizeWindow} title="最小化" aria-label="最小化">
             <Minus aria-hidden />
@@ -1317,14 +1326,6 @@ function App() {
             >
               <HardDrive aria-hidden />
               空间
-            </button>
-            <button
-              className={view === "settings" ? "active" : ""}
-              onClick={() => setView("settings")}
-              title="设置"
-            >
-              <Settings aria-hidden />
-              设置
             </button>
           </div>
         </aside>
