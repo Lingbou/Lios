@@ -17,7 +17,7 @@ use crate::framed_v1::{
     decode_chunk_stream_v1, encode_chunk_stream_with_compression_v1, ChunkDecodeLimitsV1, ChunkIdV1,
 };
 use crate::pack::{PackOptions, PackProgress};
-use crate::restore::{RestoreConflictPolicy, RestoreOptions};
+use crate::restore::RestoreOptions;
 use crate::storage::StorageObject;
 use crate::{LiosError, Result};
 
@@ -2482,7 +2482,7 @@ fn restore_node_v1(
         } => {
             let requested_path = parent.join(node_name);
             ensure_restore_descendants_safe(restore_root, &requested_path)?;
-            let output_path = resolve_restore_path(&requested_path, &options.conflict_policy);
+            let output_path = resolve_restore_path(&requested_path);
             ensure_restore_descendants_safe(restore_root, &output_path)?;
             if let Some(output_parent) = output_path.parent() {
                 ensure_restore_descendants_safe(restore_root, output_parent)?;
@@ -3033,31 +3033,27 @@ fn available_name(existing: &[&str], name: &str) -> String {
     unreachable!()
 }
 
-fn resolve_restore_path(path: &Path, conflict_policy: &RestoreConflictPolicy) -> PathBuf {
+fn resolve_restore_path(path: &Path) -> PathBuf {
     if !path.exists() {
         return path.to_path_buf();
     }
-    match conflict_policy {
-        RestoreConflictPolicy::Rename => {
-            let parent = path.parent().unwrap_or_else(|| Path::new(""));
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("restored");
-            let extension = path.extension().and_then(|e| e.to_str());
-            for index in 1.. {
-                let file_name = match extension {
-                    Some(extension) => format!("{stem} (restored {index}).{extension}"),
-                    None => format!("{stem} (restored {index})"),
-                };
-                let candidate = parent.join(file_name);
-                if !candidate.exists() {
-                    return candidate;
-                }
-            }
-            unreachable!()
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("restored");
+    let extension = path.extension().and_then(|e| e.to_str());
+    for index in 1.. {
+        let file_name = match extension {
+            Some(extension) => format!("{stem} (restored {index}).{extension}"),
+            None => format!("{stem} (restored {index})"),
+        };
+        let candidate = parent.join(file_name);
+        if !candidate.exists() {
+            return candidate;
         }
     }
+    unreachable!()
 }
 
 fn file_name(path: &Path) -> Result<String> {

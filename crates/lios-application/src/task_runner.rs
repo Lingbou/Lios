@@ -13,7 +13,7 @@ use lios_core::catalog_transaction::{
 use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
 use lios_core::modelscope::ModelScopeAdapter;
 use lios_core::pack::PackOptions;
-use lios_core::restore::{RestoreConflictPolicy, RestoreOptions};
+use lios_core::restore::RestoreOptions;
 use lios_core::storage::StorageAdapter;
 use lios_core::tasks::{
     CheckpointState, PersistedTransferAction, PersistedTransferPlan, TaskItem, TaskItemState,
@@ -1008,14 +1008,7 @@ impl Application {
             .update_phase(task.id, Some("restoring".to_string()))
             .map_err(to_err)?;
         catalog
-            .restore(
-                selection,
-                &key,
-                RestoreOptions {
-                    output_dir,
-                    conflict_policy: RestoreConflictPolicy::Rename,
-                },
-            )
+            .restore(selection, &key, RestoreOptions { output_dir })
             .map_err(to_err)?;
         store
             .update_transfer(task.id, total, total, bytes_done, bytes_total, 0)
@@ -1448,7 +1441,6 @@ fn apply_pull_action(
                     key,
                     RestoreOptions {
                         output_dir: restore_dir.clone(),
-                        conflict_policy: RestoreConflictPolicy::Rename,
                     },
                 )
                 .map_err(to_err)?;

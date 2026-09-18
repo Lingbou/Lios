@@ -9,7 +9,7 @@ use lios_core::{
     crypto::KeyFile,
     format_v1::{decrypt_envelope_v1, encrypt_envelope_v1, EnvelopeKindV1},
     pack::{PackOptions, PackProgress},
-    restore::{RestoreConflictPolicy, RestoreOptions},
+    restore::RestoreOptions,
     storage::StorageObject,
     LiosError,
 };
@@ -123,7 +123,6 @@ fn packed_file_restores_to_identical_bytes() {
             &key,
             RestoreOptions {
                 output_dir: restore.clone(),
-                conflict_policy: RestoreConflictPolicy::Rename,
             },
         )
         .unwrap();
@@ -513,7 +512,6 @@ fn wrong_key_cannot_decrypt_catalog_or_chunks() {
         &wrong_key,
         RestoreOptions {
             output_dir: tmp.path().join("restore"),
-            conflict_policy: RestoreConflictPolicy::Rename,
         },
     );
 
@@ -554,7 +552,6 @@ fn corrupted_restore_leaves_no_final_or_partial_file() {
         &key,
         RestoreOptions {
             output_dir: restore.clone(),
-            conflict_policy: RestoreConflictPolicy::Rename,
         },
     );
 
@@ -632,7 +629,6 @@ fn whole_file_hash_mismatch_leaves_no_final_or_partial_file() {
         &key,
         RestoreOptions {
             output_dir: restore.clone(),
-            conflict_policy: RestoreConflictPolicy::Rename,
         },
     );
 
@@ -814,7 +810,6 @@ fn directory_restore_preserves_tree_and_renames_conflicts() {
             &key,
             RestoreOptions {
                 output_dir: restore.clone(),
-                conflict_policy: RestoreConflictPolicy::Rename,
             },
         )
         .unwrap();
@@ -855,7 +850,6 @@ fn file_restore_rejects_link_at_final_output_path() {
         &key,
         RestoreOptions {
             output_dir: restore,
-            conflict_policy: RestoreConflictPolicy::Rename,
         },
     );
 
@@ -891,7 +885,6 @@ fn directory_restore_rejects_linked_descendant_without_writing_outside_root() {
         &key,
         RestoreOptions {
             output_dir: restore,
-            conflict_policy: RestoreConflictPolicy::Rename,
         },
     );
 

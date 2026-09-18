@@ -1606,7 +1606,6 @@ async fn preview_file_node(
 
     let restore_options = lios_core::restore::RestoreOptions {
         output_dir: temp_preview_path,
-        conflict_policy: lios_core::restore::RestoreConflictPolicy::Rename,
     };
     catalog
         .restore(

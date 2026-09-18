@@ -7,7 +7,7 @@ use lios_core::{
     crypto::KeyFile,
     modelscope::ModelScopeAdapter,
     pack::PackOptions,
-    restore::{RestoreConflictPolicy, RestoreOptions},
+    restore::RestoreOptions,
     storage::{
         current_catalog_sha256, BlobSpec, BlobValidation, CommitPlan, RemoteAction,
         RemoteDeleteCapability, StorageAdapter,
@@ -226,7 +226,6 @@ async fn modelscope_private_dataset_roundtrip() {
             &key,
             RestoreOptions {
                 output_dir: restore_dir.clone(),
-                conflict_policy: RestoreConflictPolicy::Rename,
             },
         )?;
 

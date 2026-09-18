@@ -11,7 +11,7 @@ use lios_core::{
     crypto::KeyFile,
     format_v1::{decrypt_envelope_v1, encrypt_envelope_v1, parse_envelope_v1, EnvelopeKindV1},
     pack::PackOptions,
-    restore::{RestoreConflictPolicy, RestoreOptions},
+    restore::RestoreOptions,
     storage::StorageObject,
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -771,7 +771,6 @@ fn restore_rejects_unknown_manifest_version_and_wrong_envelope_kind() {
             &key,
             RestoreOptions {
                 output_dir: tmp.path().join("unknown-version"),
-                conflict_policy: RestoreConflictPolicy::Rename,
             },
         )
         .unwrap_err();
@@ -789,7 +788,6 @@ fn restore_rejects_unknown_manifest_version_and_wrong_envelope_kind() {
             &key,
             RestoreOptions {
                 output_dir: tmp.path().join("wrong-kind"),
-                conflict_policy: RestoreConflictPolicy::Rename,
             },
         )
         .unwrap_err();
