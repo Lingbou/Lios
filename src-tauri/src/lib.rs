@@ -1423,7 +1423,7 @@ async fn initialize_space(
             "space was not found or is not visible",
         ));
     }
-    let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
+    let _catalog_mutation_guard = state.catalog_mutation_gate.lock().await;
     ensure_space_can_initialize(
         &adapter,
         &repo.namespace,
@@ -2013,7 +2013,7 @@ fn list_task_items(
 async fn cleanup_local_cache(
     state: tauri::State<'_, AppContext>,
 ) -> CommandResult<CacheCleanupReport> {
-    let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
+    let _shared_staging_guard = state.catalog_mutation_gate.lock().await;
     match cleanup_if_idle(&state.paths, || {
         cleanup_current_staging_cache(&state.paths, true, false)
     })

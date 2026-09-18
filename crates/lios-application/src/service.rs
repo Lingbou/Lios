@@ -164,7 +164,7 @@ impl Application {
                 "space was not found or is not visible",
             ));
         }
-        let _catalog_guard = self.catalog_gate.lock_mutation().await;
+        let _catalog_guard = self.catalog_gate.lock().await;
         ensure_space_can_initialize(
             &adapter,
             &repo.namespace,
@@ -320,7 +320,7 @@ impl Application {
             .paths
             .try_lock_space(&scope.space_id)
             .map_err(CommandError::from)?;
-        let _catalog_guard = self.catalog_gate.lock_mutation().await;
+        let _catalog_guard = self.catalog_gate.lock().await;
         let (catalog, baseline) =
             download_catalog_baseline(&self.paths, &key, &adapter, &repo).await?;
         mutation(&catalog, &key)?;

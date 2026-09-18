@@ -135,7 +135,7 @@ impl Application {
             .paths
             .try_lock_space(&space_id)
             .map_err(CommandError::from)?;
-        let _catalog_guard = self.catalog_gate.lock_mutation().await;
+        let _catalog_guard = self.catalog_gate.lock().await;
 
         if self.prepare_task_for_run(task_id, &preview_spec).await? {
             return Ok(());

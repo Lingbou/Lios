@@ -14,11 +14,7 @@ pub struct CatalogMutationGate {
 }
 
 impl CatalogMutationGate {
-    pub async fn lock_mutation(&self) -> MutexGuard<'_, ()> {
-        self.mutex.lock().await
-    }
-
-    pub async fn lock_shared_staging(&self) -> MutexGuard<'_, ()> {
+    pub async fn lock(&self) -> MutexGuard<'_, ()> {
         self.mutex.lock().await
     }
 }
@@ -34,11 +30,11 @@ mod tests {
     #[tokio::test]
     async fn catalog_mutation_sections_do_not_overlap() {
         let gate = Arc::new(CatalogMutationGate::default());
-        let first_guard = gate.lock_mutation().await;
+        let first_guard = gate.lock().await;
         let second_gate = Arc::clone(&gate);
         let (entered_tx, mut entered_rx) = oneshot::channel();
         let second = tokio::spawn(async move {
-            let _guard = second_gate.lock_mutation().await;
+            let _guard = second_gate.lock().await;
             entered_tx.send(()).unwrap();
         });
 
@@ -56,11 +52,11 @@ mod tests {
     #[tokio::test]
     async fn mutation_blocks_shared_staging_read_or_download_section() {
         let gate = Arc::new(CatalogMutationGate::default());
-        let mutation_guard = gate.lock_mutation().await;
+        let mutation_guard = gate.lock().await;
         let read_gate = Arc::clone(&gate);
         let (entered_tx, mut entered_rx) = oneshot::channel();
         let read = tokio::spawn(async move {
-            let _guard = read_gate.lock_shared_staging().await;
+            let _guard = read_gate.lock().await;
             entered_tx.send(()).unwrap();
         });
 
