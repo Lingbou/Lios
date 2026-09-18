@@ -460,39 +460,6 @@ impl TaskStore {
         Ok(())
     }
 
-    pub fn mark_running_interrupted(&self, message: &str) -> Result<()> {
-        self.connection.execute(
-            r#"
-            UPDATE tasks
-            SET state = ?1, phase = NULL, error = ?2, updated_at = ?3
-            WHERE state IN (?4, ?5, ?6, ?7)
-            "#,
-            rusqlite::params![
-                TaskState::Failed.as_str(),
-                message,
-                now_timestamp(),
-                TaskState::Preparing.as_str(),
-                TaskState::Running.as_str(),
-                TaskState::Retrying.as_str(),
-                TaskState::Committing.as_str(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_progress(&self, id: Uuid, done: u64, total: u64) -> Result<()> {
-        self.connection.execute(
-            "UPDATE tasks SET progress_done = ?2, progress_total = ?3, updated_at = ?4 WHERE id = ?1",
-            rusqlite::params![
-                id.to_string(),
-                sqlite_integer(done, "task progress completed")?,
-                sqlite_integer(total, "task progress total")?,
-                now_timestamp()
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn update_transfer(
         &self,
         id: Uuid,
@@ -673,29 +640,6 @@ impl TaskStore {
             ],
         )?;
         Ok(changed == 1)
-    }
-
-    pub fn record_reconciliation_wait(&self, id: Uuid, attempt: u32, error: &str) -> Result<()> {
-        self.connection.execute(
-            r#"
-            UPDATE tasks
-            SET phase = 'reconciling',
-                speed_bps = 0,
-                eta_seconds = NULL,
-                attempt = ?2,
-                error = ?3,
-                updated_at = ?4
-            WHERE id = ?1 AND state = ?5
-            "#,
-            rusqlite::params![
-                id.to_string(),
-                i64::from(attempt),
-                error,
-                now_timestamp(),
-                TaskState::Committing.as_str(),
-            ],
-        )?;
-        Ok(())
     }
 
     pub fn requeue_failed(&mut self, id: Uuid) -> Result<bool> {
@@ -978,45 +922,6 @@ impl TaskStore {
         }
         transaction.commit()?;
         Ok(changed == 1)
-    }
-
-    pub fn fail_queued_tasks_in_space(&mut self, space_id: &str, error: &str) -> Result<usize> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        transaction.execute(
-            r#"
-            UPDATE task_items
-            SET state = ?1, phase = NULL, error = ?2
-            WHERE task_id IN (
-                SELECT id FROM tasks WHERE space_id = ?3 AND state = ?4
-            ) AND state IN (?5, ?6)
-            "#,
-            rusqlite::params![
-                TaskItemState::Failed.as_str(),
-                error,
-                space_id,
-                TaskState::Queued.as_str(),
-                TaskItemState::Queued.as_str(),
-                TaskItemState::Running.as_str(),
-            ],
-        )?;
-        let changed = transaction.execute(
-            r#"
-            UPDATE tasks
-            SET state = ?1, phase = NULL, error = ?2, updated_at = ?3
-            WHERE space_id = ?4 AND state = ?5
-            "#,
-            rusqlite::params![
-                TaskState::Failed.as_str(),
-                error,
-                now_timestamp(),
-                space_id,
-                TaskState::Queued.as_str(),
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(changed)
     }
 
     pub fn insert_with_spec(&self, task: &TaskRecord, spec: &TaskSpec) -> Result<()> {
@@ -1309,20 +1214,6 @@ impl TaskStore {
             });
         }
         Ok(checkpoints)
-    }
-
-    pub fn mark_checkpoints_committed(&self, task_id: Uuid) -> Result<()> {
-        self.connection.execute(
-            "UPDATE task_object_checkpoints SET state = ?2 WHERE task_id = ?1",
-            rusqlite::params![task_id.to_string(), CheckpointState::Committed.as_str()],
-        )?;
-        Ok(())
-    }
-
-    pub fn upsert_catalog_checkpoint(&self, checkpoint: &TaskCatalogCheckpoint) -> Result<()> {
-        validate_task_catalog_checkpoint(checkpoint)?;
-        upsert_task_catalog_checkpoint_on(&self.connection, checkpoint)?;
-        Ok(())
     }
 
     pub fn load_catalog_checkpoint(&self, task_id: Uuid) -> Result<Option<TaskCatalogCheckpoint>> {

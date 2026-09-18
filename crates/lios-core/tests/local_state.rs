@@ -356,7 +356,7 @@ fn task_store_persists_progress_and_terminal_state() {
     let task = TaskRecord::queued("upload album", 4096);
 
     store.insert(&task).unwrap();
-    store.update_progress(task.id, 1024, 4096).unwrap();
+    store.update_transfer(task.id, 1024, 4096, 0, 0, 0).unwrap();
     store
         .update_state(
             task.id,
@@ -415,37 +415,6 @@ fn task_store_persists_transfer_bytes_and_speed() {
     assert_eq!(tasks[0].bytes_done, 256);
     assert_eq!(tasks[0].bytes_total, 1024);
     assert_eq!(tasks[0].speed_bps, 128);
-}
-
-#[test]
-fn task_store_marks_running_tasks_interrupted() {
-    let tmp = tempdir().unwrap();
-    let db_path = tmp.path().join("lios.db");
-    let store = TaskStore::open(&db_path).unwrap();
-    let running = TaskRecord::queued("upload", 0);
-    let completed = TaskRecord::queued("download", 1);
-
-    store.insert(&running).unwrap();
-    store.insert(&completed).unwrap();
-    store
-        .update_state(running.id, TaskState::Running, None)
-        .unwrap();
-    store
-        .update_phase(running.id, Some("preparing".to_string()))
-        .unwrap();
-    store
-        .update_state(completed.id, TaskState::Completed, None)
-        .unwrap();
-
-    store.mark_running_interrupted("app exited").unwrap();
-
-    let tasks = store.list().unwrap();
-    let running = tasks.iter().find(|task| task.id == running.id).unwrap();
-    let completed = tasks.iter().find(|task| task.id == completed.id).unwrap();
-    assert_eq!(running.state, TaskState::Failed);
-    assert_eq!(running.phase, None);
-    assert_eq!(running.error.as_deref(), Some("app exited"));
-    assert_eq!(completed.state, TaskState::Completed);
 }
 
 #[test]
@@ -1127,29 +1096,6 @@ fn task_store_persists_specs_items_and_checkpoints() {
 }
 
 #[test]
-fn task_store_persists_catalog_commit_checkpoint_hashes() {
-    let tmp = tempdir().unwrap();
-    let db_path = tmp.path().join("lios.db");
-    let store = TaskStore::open(&db_path).unwrap();
-    let task = TaskRecord::queued("upload", 1);
-    store.insert(&task).unwrap();
-    let checkpoint = TaskCatalogCheckpoint {
-        task_id: task.id,
-        base_catalog_sha256: Some("a".repeat(64)),
-        target_catalog_sha256: "b".repeat(64),
-    };
-
-    store.upsert_catalog_checkpoint(&checkpoint).unwrap();
-    drop(store);
-
-    let reopened = TaskStore::open(&db_path).unwrap();
-    assert_eq!(
-        reopened.load_catalog_checkpoint(task.id).unwrap(),
-        Some(checkpoint)
-    );
-}
-
-#[test]
 fn task_store_replaces_catalog_transaction_checkpoints_atomically() {
     let tmp = tempdir().unwrap();
     let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
@@ -1526,47 +1472,6 @@ fn task_store_makes_committing_monotonic_against_pause_cancel_and_progress() {
         store.get(canceled.id).unwrap().unwrap().state,
         TaskState::Canceled
     );
-}
-
-#[test]
-fn task_store_fails_later_queued_tasks_when_a_space_conflicts() {
-    let tmp = tempdir().unwrap();
-    let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
-    let make_spec = |space_id: &str| TaskSpec::Delete {
-        account_id: "a".repeat(64),
-        space_id: space_id.to_string(),
-        repo: RepoConfig {
-            namespace: "novix".to_string(),
-            dataset: "cold".to_string(),
-            endpoint: "https://modelscope.cn".to_string(),
-            title: None,
-        },
-        node_ids: vec!["node-a".to_string()],
-    };
-    let blocked_spec = make_spec(&"b".repeat(64));
-    let other_spec = make_spec(&"c".repeat(64));
-    let blocked_a = TaskRecord::queued_for_spec(&blocked_spec);
-    let blocked_b = TaskRecord::queued_for_spec(&blocked_spec);
-    let other = TaskRecord::queued_for_spec(&other_spec);
-    store.insert_with_spec(&blocked_a, &blocked_spec).unwrap();
-    store.insert_with_spec(&blocked_b, &blocked_spec).unwrap();
-    store.insert_with_spec(&other, &other_spec).unwrap();
-
-    assert_eq!(
-        store
-            .fail_queued_tasks_in_space(&"b".repeat(64), "remote catalog conflict")
-            .unwrap(),
-        2
-    );
-
-    assert!(store.list().unwrap().into_iter().all(|task| {
-        if task.space_id == "b".repeat(64) {
-            task.state == TaskState::Failed
-                && task.error.as_deref() == Some("remote catalog conflict")
-        } else {
-            task.state == TaskState::Queued
-        }
-    }));
 }
 
 #[test]
