@@ -169,32 +169,32 @@ pub fn cleanup_all_inactive_staging(
             for task_entry in task_entries.flatten() {
                 let task_path = task_entry.path();
                 let task_name = task_entry.file_name().to_string_lossy().into_owned();
-                if let Ok(uuid) = Uuid::parse_str(&task_name) {
-                    if !active_task_ids.contains(&uuid) {
-                        if let Ok(task_report) = remove_path_counting(&task_path) {
-                            report.add(task_report);
-                        }
-                    }
+                let Ok(uuid) = Uuid::parse_str(&task_name) else {
+                    continue;
+                };
+                if active_task_ids.contains(&uuid) {
+                    continue;
+                }
+                if let Ok(task_report) = remove_path_counting(&task_path) {
+                    report.add(task_report);
                 }
             }
 
             if fs::read_dir(&space_path)
                 .map(|mut iter| iter.next().is_none())
                 .unwrap_or(false)
+                && fs::remove_dir(&space_path).is_ok()
             {
-                if fs::remove_dir(&space_path).is_ok() {
-                    report.dirs_removed += 1;
-                }
+                report.dirs_removed += 1;
             }
         }
 
         if fs::read_dir(&entry_path)
             .map(|mut iter| iter.next().is_none())
             .unwrap_or(false)
+            && fs::remove_dir(&entry_path).is_ok()
         {
-            if fs::remove_dir(&entry_path).is_ok() {
-                report.dirs_removed += 1;
-            }
+            report.dirs_removed += 1;
         }
     }
 
