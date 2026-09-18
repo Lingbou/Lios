@@ -197,23 +197,6 @@ pub enum PackOutcome {
     },
 }
 
-impl PackOutcome {
-    pub fn into_catalog(self) -> Result<Catalog> {
-        match self {
-            Self::Packed { catalog, report } => {
-                report.ensure_no_skipped_paths()?;
-                Ok(catalog)
-            }
-            Self::Skipped { report } => {
-                report.ensure_no_skipped_paths()?;
-                Err(LiosError::Unsupported(
-                    "packing produced no catalog".to_string(),
-                ))
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkippedPath {
     pub path: PathBuf,
