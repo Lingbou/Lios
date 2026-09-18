@@ -412,6 +412,36 @@ fn catalog_pack_with_progress_fails_when_nested_path_is_skipped() {
 }
 
 #[test]
+fn interruptible_catalog_pack_stops_between_chunks() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("source.bin");
+    fs::write(&source, b"data").unwrap();
+    let key = KeyFile::generate_to_path(tmp.path().join("key")).unwrap();
+    let canceled = std::rc::Rc::new(std::cell::Cell::new(false));
+    let canceled_for_progress = std::rc::Rc::clone(&canceled);
+
+    let result = Catalog::pack_with_progress_and_report_interruptible(
+        source,
+        &key,
+        PackOptions {
+            chunk_size: 1,
+            staging_dir: tmp.path().join("staging"),
+        },
+        move |progress| {
+            if progress.completed_chunks > 0 {
+                canceled_for_progress.set(true);
+            }
+        },
+        move || canceled.get(),
+    );
+
+    assert!(matches!(
+        result,
+        Err(LiosError::Unsupported(message)) if message == "packing canceled"
+    ));
+}
+
+#[test]
 fn catalog_only_pack_rejects_root_source_link() {
     let tmp = tempdir().unwrap();
     let outside = tmp.path().join("outside");

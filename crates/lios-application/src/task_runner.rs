@@ -192,15 +192,25 @@ impl Application {
             }
             Err(error) => {
                 let persisted = store.get_summary(task_id).map_err(to_err)?;
-                let state = match persisted.as_ref().map(|summary| &summary.state) {
-                    Some(TaskState::Committing) => TaskState::Committing,
-                    Some(TaskState::Paused) => TaskState::Paused,
-                    Some(TaskState::Canceled) => TaskState::Canceled,
-                    _ => TaskState::Failed,
+                let canceled = task_paths.worker_cancel_path(task_id).exists();
+                let paused = task_paths.worker_pause_path(task_id).exists();
+                let state = if canceled {
+                    TaskState::Canceled
+                } else if paused {
+                    TaskState::Paused
+                } else {
+                    match persisted.as_ref().map(|summary| &summary.state) {
+                        Some(TaskState::Committing) => TaskState::Committing,
+                        _ => TaskState::Failed,
+                    }
                 };
-                store
-                    .update_state(task_id, state, Some(error.message.clone()))
-                    .map_err(to_err)?;
+                if matches!(state, TaskState::Paused | TaskState::Canceled) {
+                    let _ = store.interrupt_task(task_id, state)?;
+                } else {
+                    store
+                        .update_state(task_id, state, Some(error.message.clone()))
+                        .map_err(to_err)?;
+                }
                 Err(error)
             }
         }
@@ -806,8 +816,10 @@ impl Application {
         validate_task_sources(&source_paths, &source_snapshot, &task.items).map_err(to_err)?;
         let (catalog, baseline) = download_catalog_baseline(paths, &key, &adapter, &repo).await?;
         let remote_inventory = baseline.remote_objects.clone();
+        let pause_path = paths.worker_pause_path(task.id);
+        let cancel_path = paths.worker_cancel_path(task.id);
         let report = catalog
-            .add_paths_to_folder_with_remote_inventory_and_progress_and_report(
+            .add_paths_to_folder_with_remote_inventory_and_progress_and_report_interruptible(
                 &parent_node_id,
                 &source_paths,
                 &conflict_resolutions,
@@ -839,6 +851,7 @@ impl Application {
                         }
                     }
                 },
+                || pause_path.exists() || cancel_path.exists(),
             )
             .map_err(to_err)?;
         report.ensure_no_skipped_paths().map_err(to_err)?;

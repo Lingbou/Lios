@@ -576,14 +576,31 @@ impl Catalog {
         options: PackOptions,
         mut on_progress: impl FnMut(PackProgress),
     ) -> Result<PackOutcome> {
-        Self::pack_with_optional_progress(source_path, key, options, Some(&mut on_progress))
+        Self::pack_with_optional_progress(source_path, key, options, Some(&mut on_progress), None)
     }
 
-    fn pack_with_optional_progress(
+    pub fn pack_with_progress_and_report_interruptible(
         source_path: PathBuf,
         key: &KeyFile,
         options: PackOptions,
-        on_progress: Option<&mut dyn FnMut(PackProgress)>,
+        mut on_progress: impl FnMut(PackProgress),
+        mut should_cancel: impl FnMut() -> bool,
+    ) -> Result<PackOutcome> {
+        Self::pack_with_optional_progress(
+            source_path,
+            key,
+            options,
+            Some(&mut on_progress),
+            Some(&mut should_cancel),
+        )
+    }
+
+    fn pack_with_optional_progress<'a>(
+        source_path: PathBuf,
+        key: &KeyFile,
+        options: PackOptions,
+        on_progress: Option<&'a mut dyn FnMut(PackProgress)>,
+        should_cancel: Option<&'a mut dyn FnMut() -> bool>,
     ) -> Result<PackOutcome> {
         if options.chunk_size == 0 {
             return Err(LiosError::Unsupported(
@@ -600,7 +617,8 @@ impl Catalog {
         let name = file_name(&source_path)?;
 
         fs::create_dir_all(options.staging_dir.join(FILES_DIR))?;
-        let mut tracker = PackProgressTracker::new(on_progress);
+        let mut tracker = PackProgressTracker::new(on_progress, should_cancel);
+        tracker.ensure_not_canceled()?;
         tracker.add_total(pack_stats(&source_path, options.chunk_size)?);
         let mut plain = CatalogV1 {
             version: 1,
@@ -882,6 +900,7 @@ impl Catalog {
             options,
             remote_objects,
             None,
+            None,
         )?;
         report.ensure_no_skipped_paths()
     }
@@ -905,11 +924,12 @@ impl Catalog {
             options,
             remote_objects,
             Some(&mut on_progress),
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn add_paths_to_folder_with_optional_progress(
+    pub fn add_paths_to_folder_with_remote_inventory_and_progress_and_report_interruptible(
         &self,
         parent_id: &str,
         paths: &[PathBuf],
@@ -917,7 +937,32 @@ impl Catalog {
         key: &KeyFile,
         options: PackOptions,
         remote_objects: &[StorageObject],
-        on_progress: Option<&mut dyn FnMut(PackProgress)>,
+        mut on_progress: impl FnMut(PackProgress),
+        mut should_cancel: impl FnMut() -> bool,
+    ) -> Result<PackReport> {
+        self.add_paths_to_folder_with_optional_progress(
+            parent_id,
+            paths,
+            resolutions,
+            key,
+            options,
+            remote_objects,
+            Some(&mut on_progress),
+            Some(&mut should_cancel),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_paths_to_folder_with_optional_progress<'a>(
+        &self,
+        parent_id: &str,
+        paths: &[PathBuf],
+        resolutions: &[ConflictResolution],
+        key: &KeyFile,
+        options: PackOptions,
+        remote_objects: &[StorageObject],
+        on_progress: Option<&'a mut dyn FnMut(PackProgress)>,
+        should_cancel: Option<&'a mut dyn FnMut() -> bool>,
     ) -> Result<PackReport> {
         if options.chunk_size == 0 {
             return Err(LiosError::Unsupported(
@@ -927,7 +972,7 @@ impl Catalog {
         fs::create_dir_all(options.staging_dir.join(FILES_DIR))?;
         let mut loaded = self.load_catalog_v1(key)?;
         ensure_directory_v1(&loaded.catalog, parent_id)?;
-        let mut tracker = PackProgressTracker::new(on_progress);
+        let mut tracker = PackProgressTracker::new(on_progress, should_cancel);
         let mut report = PackReport::default();
         let resolution_by_source = resolutions
             .iter()
@@ -939,6 +984,7 @@ impl Catalog {
             bytes: 0,
         };
         for path in paths {
+            tracker.ensure_not_canceled()?;
             let target_name = file_name(path)?;
             let Some(_) = packable_path_kind(path)? else {
                 continue;
@@ -972,6 +1018,7 @@ impl Catalog {
         }
 
         for path in paths {
+            tracker.ensure_not_canceled()?;
             let source_name = file_name(path)?;
             let source_relative_path = PathBuf::from(&source_name);
             let mut target_name = source_name;
@@ -1933,16 +1980,21 @@ struct PackProgressTracker<'a> {
     completed_bytes: u64,
     total_bytes: u64,
     on_progress: Option<&'a mut dyn FnMut(PackProgress)>,
+    should_cancel: Option<&'a mut dyn FnMut() -> bool>,
 }
 
 impl<'a> PackProgressTracker<'a> {
-    fn new(on_progress: Option<&'a mut dyn FnMut(PackProgress)>) -> Self {
+    fn new(
+        on_progress: Option<&'a mut dyn FnMut(PackProgress)>,
+        should_cancel: Option<&'a mut dyn FnMut() -> bool>,
+    ) -> Self {
         Self {
             completed_chunks: 0,
             total_chunks: 0,
             completed_bytes: 0,
             total_bytes: 0,
             on_progress,
+            should_cancel,
         }
     }
 
@@ -1952,10 +2004,23 @@ impl<'a> PackProgressTracker<'a> {
         self.emit();
     }
 
-    fn complete_chunk(&mut self, bytes: u64) {
+    fn ensure_not_canceled(&mut self) -> Result<()> {
+        if self
+            .should_cancel
+            .as_mut()
+            .is_some_and(|should_cancel| should_cancel())
+        {
+            return Err(LiosError::Unsupported("packing canceled".to_string()));
+        }
+        Ok(())
+    }
+
+    fn complete_chunk(&mut self, bytes: u64) -> Result<()> {
+        self.ensure_not_canceled()?;
         self.completed_chunks += 1;
         self.completed_bytes += bytes;
         self.emit();
+        Ok(())
     }
 
     fn emit(&mut self) {
@@ -2052,6 +2117,7 @@ fn pack_path_v1(
             );
             let entries = source_directory_entries(path)?;
             for entry in entries {
+                progress.ensure_not_canceled()?;
                 let child_path = entry.path();
                 let Some(_) = packable_path_kind(&child_path)? else {
                     report.skipped_paths.push(skipped_link(&child_path));
@@ -2142,6 +2208,7 @@ fn pack_content_object_v1(
         let mut total_size = 0u64;
 
         loop {
+            progress.ensure_not_canceled()?;
             let at_eof = source.fill_buf()?.is_empty();
             if at_eof && !chunks.is_empty() {
                 break;
@@ -2187,7 +2254,7 @@ fn pack_content_object_v1(
                 encoded_sha256: hex::encode(stats.encoded_sha256),
                 format_version: 1,
             });
-            progress.complete_chunk(stats.original_bytes);
+            progress.complete_chunk(stats.original_bytes)?;
             if at_eof {
                 break;
             }
