@@ -25,10 +25,10 @@ pub fn validate_repo_identifier(name: &str, field: &'static str) -> Result<(), C
             "{field} cannot be empty"
         )));
     }
-    if !name.is_ascii()
-        || name
-            .chars()
-            .any(|c| c.is_ascii_whitespace() || c == '/' || c == '\\' || c.is_ascii_control())
+    if matches!(name, "." | "..")
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(CommandError::invalid_input(format!(
             "{field} `{name}` contains invalid or non-ASCII characters; ModelScope datasets must use ASCII letters, numbers, hyphens, and underscores (Chinese characters are not supported by ModelScope Git endpoints)"
@@ -114,6 +114,21 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, CommandErrorCode::InvalidInput);
         assert!(error.message.contains("non-ASCII"));
+    }
+
+    #[test]
+    fn rejects_repository_identifiers_that_change_url_segments() {
+        for name in [".", "..", "name?query", "name#fragment", "name%2fescape"] {
+            let error = validate_repo(RepoConfig {
+                namespace: "novix".to_string(),
+                dataset: name.to_string(),
+                endpoint: "https://modelscope.cn".to_string(),
+                title: None,
+            })
+            .unwrap_err();
+
+            assert_eq!(error.code, CommandErrorCode::InvalidInput, "{name}");
+        }
     }
 
     #[test]
