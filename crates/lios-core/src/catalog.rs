@@ -87,12 +87,6 @@ pub struct CatalogIntegrityReport {
     pub original_bytes_verified: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CatalogIntegrityOutcome {
-    Completed(CatalogIntegrityReport),
-    Canceled(CatalogIntegrityReport),
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CatalogRemoteIntegrityReport {
     pub expected_objects: u64,
@@ -111,15 +105,6 @@ pub struct CatalogRebuildReport {
     pub chunks_referenced: u64,
     pub original_bytes_referenced: u64,
     pub unreferenced_managed_objects: u64,
-}
-
-#[derive(Clone, Debug)]
-pub enum CatalogRebuildOutcome {
-    Completed {
-        catalog: Catalog,
-        report: CatalogRebuildReport,
-    },
-    Canceled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -402,24 +387,7 @@ impl Catalog {
         staging_dir: impl Into<PathBuf>,
         remote_objects: &[StorageObject],
     ) -> Result<(Self, CatalogRebuildReport)> {
-        match Self::rebuild_from_recovery_with_cancel(key, staging_dir, remote_objects, || false)? {
-            CatalogRebuildOutcome::Completed { catalog, report } => Ok((catalog, report)),
-            CatalogRebuildOutcome::Canceled => Err(LiosError::Unsupported(
-                "catalog rebuild was unexpectedly canceled".to_string(),
-            )),
-        }
-    }
-
-    pub fn rebuild_from_recovery_with_cancel(
-        key: &KeyFile,
-        staging_dir: impl Into<PathBuf>,
-        remote_objects: &[StorageObject],
-        mut should_cancel: impl FnMut() -> bool,
-    ) -> Result<CatalogRebuildOutcome> {
         let staging_dir = staging_dir.into();
-        if should_cancel() {
-            return Ok(CatalogRebuildOutcome::Canceled);
-        }
         let remote_by_path = index_remote_inventory(remote_objects)?;
         if remote_objects
             .iter()
@@ -445,9 +413,6 @@ impl Catalog {
         let mut nodes = BTreeMap::new();
         let mut expected_remote_paths = HashSet::new();
         for (path_node_id, remote) in descriptor_objects {
-            if should_cancel() {
-                return Ok(CatalogRebuildOutcome::Canceled);
-            }
             let expected_sha256 = required_remote_sha256(remote, "node descriptor")?;
             let encrypted = read_verified_encrypted_file(
                 &staging_dir,
@@ -507,9 +472,6 @@ impl Catalog {
         let mut files_rebuilt = 0u64;
         let mut referenced_objects = BTreeMap::<String, (String, u64)>::new();
         for node in nodes.values() {
-            if should_cancel() {
-                return Ok(CatalogRebuildOutcome::Canceled);
-            }
             match &node.descriptor.kind {
                 NodeDescriptorKindV1::Directory => {
                     directories_rebuilt = directories_rebuilt.checked_add(1).ok_or_else(|| {
@@ -546,25 +508,18 @@ impl Catalog {
         let mut chunks_referenced = 0u64;
         let mut original_bytes_referenced = 0u64;
         for (object_id, (content_sha256, original_size)) in referenced_objects {
-            if should_cancel() {
-                return Ok(CatalogRebuildOutcome::Canceled);
-            }
             let reference = RecoveredContentReference {
                 object_id: &object_id,
                 content_sha256: &content_sha256,
                 original_size,
             };
-            let Some(object) = rebuild_content_object_from_manifest(
+            let object = rebuild_content_object_from_manifest(
                 key,
                 &staging_dir,
                 &remote_by_path,
                 reference,
                 &mut expected_remote_paths,
-                &mut should_cancel,
-            )?
-            else {
-                return Ok(CatalogRebuildOutcome::Canceled);
-            };
+            )?;
             let StorageRef::V1(storage) = &object.storage;
             let object_chunks = u64::try_from(storage.chunks.len()).map_err(|_| {
                 LiosError::DataCorruption("recovered chunk count overflowed".to_string())
@@ -593,9 +548,6 @@ impl Catalog {
         };
         rebuild_content_index(&mut plain);
         validate_catalog_v1(&plain, true)?;
-        if should_cancel() {
-            return Ok(CatalogRebuildOutcome::Canceled);
-        }
 
         let unreferenced_managed_objects = u64::try_from(
             remote_objects
@@ -621,9 +573,9 @@ impl Catalog {
         let encrypted = encrypt_envelope_v1(key, EnvelopeKindV1::Catalog, &serialized)?;
         write_atomic_new(&catalog.encrypted_catalog_path, &encrypted)?;
 
-        Ok(CatalogRebuildOutcome::Completed {
+        Ok((
             catalog,
-            report: CatalogRebuildReport {
+            CatalogRebuildReport {
                 nodes_rebuilt,
                 directories_rebuilt,
                 files_rebuilt,
@@ -632,7 +584,7 @@ impl Catalog {
                 original_bytes_referenced,
                 unreferenced_managed_objects,
             },
-        })
+        ))
     }
 
     pub fn pack(source: PackSource, key: &KeyFile, options: PackOptions) -> Result<Self> {
@@ -1389,25 +1341,9 @@ impl Catalog {
     }
 
     pub fn verify_staged_integrity(&self, key: &KeyFile) -> Result<CatalogIntegrityReport> {
-        match self.verify_staged_integrity_with_cancel(key, || false)? {
-            CatalogIntegrityOutcome::Completed(report) => Ok(report),
-            CatalogIntegrityOutcome::Canceled(_) => Err(LiosError::Unsupported(
-                "integrity verification was unexpectedly canceled".to_string(),
-            )),
-        }
-    }
-
-    pub fn verify_staged_integrity_with_cancel(
-        &self,
-        key: &KeyFile,
-        mut should_cancel: impl FnMut() -> bool,
-    ) -> Result<CatalogIntegrityOutcome> {
         let loaded = self.load_catalog_v1(key)?;
         let mut report = CatalogIntegrityReport::default();
         for (node_id, node) in &loaded.catalog.nodes {
-            if should_cancel() {
-                return Ok(CatalogIntegrityOutcome::Canceled(report));
-            }
             let expected_sha256 = node.descriptor_encrypted_sha256.as_ref().ok_or_else(|| {
                 LiosError::DataCorruption(format!(
                     "native v1 node descriptor hash is missing: {node_id}"
@@ -1434,17 +1370,7 @@ impl Catalog {
         }
 
         for object in loaded.catalog.content_objects.values() {
-            if should_cancel()
-                || !verify_content_object_integrity(
-                    object,
-                    key,
-                    &self.staging_dir,
-                    &mut report,
-                    &mut should_cancel,
-                )?
-            {
-                return Ok(CatalogIntegrityOutcome::Canceled(report));
-            }
+            verify_content_object_integrity(object, key, &self.staging_dir, &mut report)?;
             report.objects_verified = report.objects_verified.checked_add(1).ok_or_else(|| {
                 LiosError::DataCorruption("verified object count overflowed".to_string())
             })?;
@@ -1455,7 +1381,7 @@ impl Catalog {
                     LiosError::DataCorruption("verified original byte count overflowed".to_string())
                 })?;
         }
-        Ok(CatalogIntegrityOutcome::Completed(report))
+        Ok(report)
     }
 
     pub fn restore(
@@ -1628,16 +1554,12 @@ fn rebuild_content_object_from_manifest(
     remote_by_path: &HashMap<&str, &StorageObject>,
     reference: RecoveredContentReference<'_>,
     expected_remote_paths: &mut HashSet<String>,
-    should_cancel: &mut impl FnMut() -> bool,
-) -> Result<Option<ContentObject>> {
+) -> Result<ContentObject> {
     let RecoveredContentReference {
         object_id,
         content_sha256,
         original_size,
     } = reference;
-    if should_cancel() {
-        return Ok(None);
-    }
     validate_opaque_id_v1(object_id, "object")?;
     validate_lower_hex_id(content_sha256, 64, "content SHA-256")?;
     let manifest_path = format!("{FILES_DIR}/{object_id}/{FILE_MANIFEST}");
@@ -1695,9 +1617,6 @@ fn rebuild_content_object_from_manifest(
     }
     let mut chunk_original_bytes = 0u64;
     for chunk in &storage.chunks {
-        if should_cancel() {
-            return Ok(None);
-        }
         validate_lower_hex_id(&chunk.original_sha256, 64, "chunk original SHA-256")?;
         validate_lower_hex_id(&chunk.encoded_sha256, 64, "chunk encoded SHA-256")?;
         chunk_original_bytes = chunk_original_bytes
@@ -1736,7 +1655,7 @@ fn rebuild_content_object_from_manifest(
         )));
     }
     expected_remote_paths.insert(manifest_path);
-    Ok(Some(object))
+    Ok(object)
 }
 
 fn validate_catalog_v1(catalog: &CatalogV1, require_canonical_node_ids: bool) -> Result<()> {
@@ -2925,13 +2844,9 @@ fn verify_content_object_integrity(
     key: &KeyFile,
     staging_dir: &Path,
     report: &mut CatalogIntegrityReport,
-    should_cancel: &mut impl FnMut() -> bool,
-) -> Result<bool> {
+) -> Result<()> {
     let mut file_hasher = Sha256::new();
     let mut restored_size = 0u64;
-    if should_cancel() {
-        return Ok(false);
-    }
     let StorageRef::V1(storage) = &object.storage;
     let expected_manifest = expected_v1_manifest(object, storage);
     let expected_manifest_size =
@@ -2953,9 +2868,6 @@ fn verify_content_object_integrity(
     let mut chunks = storage.chunks.iter().collect::<Vec<_>>();
     chunks.sort_by_key(|chunk| chunk.index);
     for chunk in chunks {
-        if should_cancel() {
-            return Ok(false);
-        }
         if chunk.format_version != 1 {
             return Err(LiosError::Unsupported(format!(
                 "unknown chunk format version: {}",
@@ -3001,7 +2913,7 @@ fn verify_content_object_integrity(
     {
         return Err(LiosError::Crypto);
     }
-    Ok(true)
+    Ok(())
 }
 
 fn validate_v1_manifest(

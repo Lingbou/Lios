@@ -3,8 +3,8 @@ use std::path::Path;
 
 use lios_core::{
     catalog::{
-        Catalog, CatalogIntegrityOutcome, CatalogSelection, CatalogTreeNodeKind, CatalogV1,
-        NodeDescriptorKindV1, ObjectManifestV1, StorageRef,
+        Catalog, CatalogSelection, CatalogTreeNodeKind, CatalogV1, NodeDescriptorKindV1,
+        ObjectManifestV1, StorageRef,
     },
     crypto::KeyFile,
     format_v1::{decrypt_envelope_v1, encrypt_envelope_v1, EnvelopeKindV1},
@@ -325,33 +325,6 @@ fn full_integrity_check_rejects_linked_staging_ancestor() {
     create_directory_link(&linked_target, &staging.join("recovery"));
 
     assert!(catalog.verify_staged_integrity(&key).is_err());
-}
-
-#[test]
-fn full_integrity_check_can_cancel_before_scanning_objects() {
-    let tmp = tempdir().unwrap();
-    let source = tmp.path().join("source.bin");
-    let staging = tmp.path().join("staging");
-    write_file(&source, b"cancel integrity payload");
-    let key = KeyFile::generate_to_path(tmp.path().join("lios.key")).unwrap();
-    let catalog = Catalog::pack(
-        PackSource::Path(source),
-        &key,
-        PackOptions {
-            chunk_size: 4,
-            staging_dir: staging,
-        },
-    )
-    .unwrap();
-
-    let outcome = catalog
-        .verify_staged_integrity_with_cancel(&key, || true)
-        .unwrap();
-
-    assert_eq!(
-        outcome,
-        CatalogIntegrityOutcome::Canceled(Default::default())
-    );
 }
 
 #[test]

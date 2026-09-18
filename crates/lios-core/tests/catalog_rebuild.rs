@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use lios_core::{
     catalog::{
-        Catalog, CatalogRebuildOutcome, CatalogRebuildReport, CatalogSelection, CatalogTreeNode,
-        CatalogTreeNodeKind, NodeDescriptorV1, ObjectManifestV1,
+        Catalog, CatalogRebuildReport, CatalogSelection, CatalogTreeNode, CatalogTreeNodeKind,
+        NodeDescriptorV1, ObjectManifestV1,
     },
     crypto::KeyFile,
     format_v1::{decrypt_envelope_v1, encrypt_envelope_v1, parse_envelope_v1, EnvelopeKindV1},
@@ -435,24 +435,4 @@ fn rejects_missing_or_tampered_chunk_inventory() {
     assert!(
         Catalog::rebuild_from_recovery(&fixture.key, &fixture.staging, &fixture.remote).is_err()
     );
-}
-
-#[test]
-fn canceled_rebuild_does_not_publish_a_local_catalog() {
-    let fixture = recovery_fixture();
-    let mut checks = 0usize;
-
-    let outcome = Catalog::rebuild_from_recovery_with_cancel(
-        &fixture.key,
-        &fixture.staging,
-        &fixture.remote,
-        || {
-            checks += 1;
-            checks > 1
-        },
-    )
-    .unwrap();
-
-    assert!(matches!(outcome, CatalogRebuildOutcome::Canceled));
-    assert!(!fixture.staging.join("catalog.enc").exists());
 }
