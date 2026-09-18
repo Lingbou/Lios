@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  isActiveTask,
+  isLiveTask,
+  isTerminalTask,
   newCatalogMutationCompletions,
   seedCatalogMutationCompletions,
   taskItemProgressPercent,
@@ -12,6 +15,24 @@ import {
   taskStatusText,
   taskActionsForTask
 } from "../src/features/tasks/taskPresentation.ts";
+
+test("task state predicates distinguish interactive, live, and terminal states", () => {
+  assert.equal(isActiveTask({ state: "Paused" }), true);
+  assert.equal(isLiveTask({ state: "Paused" }), false);
+  assert.equal(isTerminalTask({ state: "Completed" }), true);
+
+  for (const state of ["Queued", "Preparing", "Running", "Retrying", "Committing"] as const) {
+    assert.equal(isActiveTask({ state }), true);
+    assert.equal(isLiveTask({ state }), true);
+    assert.equal(isTerminalTask({ state }), false);
+  }
+
+  for (const state of ["Failed", "Completed", "Canceled"] as const) {
+    assert.equal(isActiveTask({ state }), false);
+    assert.equal(isLiveTask({ state }), false);
+    assert.equal(isTerminalTask({ state }), true);
+  }
+});
 
 test("task states expose only their real supported actions", () => {
   assert.deepEqual(taskActionsForTask({ state: "Queued", can_retry: false }), ["pause", "cancel"]);

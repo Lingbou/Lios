@@ -1,4 +1,33 @@
-import type { TaskAction, TaskItem, TaskSummary } from "./taskTypes.ts";
+import type { TaskAction, TaskItem, TaskState, TaskSummary } from "./taskTypes.ts";
+
+const activeTaskStates = new Set<TaskState>([
+  "Queued",
+  "Preparing",
+  "Running",
+  "Paused",
+  "Retrying",
+  "Committing"
+]);
+const terminalTaskStates = new Set<TaskState>(["Failed", "Completed", "Canceled"]);
+const liveTaskStates = new Set<TaskState>([
+  "Queued",
+  "Preparing",
+  "Running",
+  "Retrying",
+  "Committing"
+]);
+
+export function isActiveTask(task: Pick<TaskSummary, "state">) {
+  return activeTaskStates.has(task.state);
+}
+
+export function isTerminalTask(task: Pick<TaskSummary, "state">) {
+  return terminalTaskStates.has(task.state);
+}
+
+export function isLiveTask(task: Pick<TaskSummary, "state">) {
+  return liveTaskStates.has(task.state);
+}
 
 export type TaskPresentationRecord = Pick<
   TaskSummary,

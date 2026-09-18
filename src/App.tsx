@@ -56,6 +56,7 @@ import {
 import { TaskCenter } from "./features/tasks/TaskCenter.tsx";
 import { createTaskApi } from "./features/tasks/taskApi.ts";
 import {
+  isActiveTask,
   newCatalogMutationCompletions,
   seedCatalogMutationCompletions
 } from "./features/tasks/taskPresentation.ts";
@@ -117,14 +118,6 @@ const naturalNameCollator = new Intl.Collator(undefined, {
   numeric: true,
   sensitivity: "base"
 });
-const activeTaskStates = new Set([
-  "Queued",
-  "Preparing",
-  "Running",
-  "Paused",
-  "Retrying",
-  "Committing"
-]);
 
 function App() {
   const [view, setView] = useState<View>("spaces");
@@ -293,9 +286,7 @@ function App() {
   const selectedCount = selectedIds.size;
   const activeTasks = useMemo(
     () =>
-      tasks.filter((task) =>
-        activeTaskStates.has(task.state)
-      ).length,
+      tasks.filter(isActiveTask).length,
     [tasks]
   );
   const rebuildTaskActive = useMemo(
@@ -303,7 +294,7 @@ function App() {
       tasks.some(
         (task) =>
           task.label === "rebuild" &&
-          activeTaskStates.has(task.state)
+          isActiveTask(task)
       ),
     [tasks]
   );

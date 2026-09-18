@@ -26,6 +26,8 @@ import {
   useState
 } from "react";
 import {
+  isTerminalTask,
+  isLiveTask,
   taskActionsForTask,
   taskItemProgressPercent,
   taskItemProgressText,
@@ -48,8 +50,6 @@ const TASK_PANEL_COLLAPSED_HEIGHT = 40;
 const TASK_PANEL_MAX_RATIO = 0.6;
 const WORKSPACE_MIN_HEIGHT = 240;
 
-const activeStates = new Set<TaskState>(["Queued", "Preparing", "Running", "Retrying", "Committing"]);
-const terminalStates = new Set<TaskState>(["Failed", "Completed", "Canceled"]);
 const runningStates = new Set<TaskState>(["Preparing", "Running", "Retrying", "Committing"]);
 
 function readStoredTaskPanelHeight() {
@@ -155,7 +155,7 @@ function TaskDetails({
   const mountedRef = useRef(true);
   const [pages, setPages] = useState<Map<number, TaskItem[]>>(new Map());
   const [total, setTotal] = useState(task.item_count);
-  const isActiveTask = activeStates.has(task.state);
+  const shouldRefreshDetails = isLiveTask(task);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -261,17 +261,22 @@ function TaskDetails({
   }, [loadPage, virtualKey]);
 
   useEffect(() => {
-    if (!isActiveTask) return;
+    if (!shouldRefreshDetails) return;
     const timer = window.setInterval(() => {
       for (const pageIndex of visiblePages.current) void loadPage(pageIndex, true);
     }, ACTIVE_DETAIL_REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [isActiveTask, loadPage]);
+  }, [loadPage, shouldRefreshDetails]);
 
   useEffect(() => {
     const previousState = previousTaskState.current;
     previousTaskState.current = task.state;
-    if (terminalStates.has(previousState) || !terminalStates.has(task.state)) return;
+    if (
+      isTerminalTask({ state: previousState }) ||
+      !isTerminalTask(task)
+    ) {
+      return;
+    }
     for (const pageIndex of visiblePages.current) void loadPage(pageIndex, true);
   }, [loadPage, task.state]);
 

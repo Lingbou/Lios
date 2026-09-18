@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isLiveTask } from "./taskPresentation.ts";
 import type {
   TaskAction,
   TaskApi,
@@ -18,18 +19,6 @@ type ListRequest = {
   revision: number;
   sequence: number;
 };
-
-const activeStates = new Set([
-  "Queued",
-  "Preparing",
-  "Running",
-  "Retrying",
-  "Committing"
-]);
-
-function isActiveTask(task: TaskSummary) {
-  return activeStates.has(task.state);
-}
 
 export function useTasks({
   api,
@@ -82,7 +71,7 @@ export function useTasks({
 
   const syncActiveHeartbeats = useCallback((nextTasks: TaskSummary[], now = Date.now()) => {
     const activeIds = new Set(
-      nextTasks.filter(isActiveTask).map((task) => task.id)
+      nextTasks.filter(isLiveTask).map((task) => task.id)
     );
     for (const taskId of activeIds) {
       if (!activeHeartbeatRef.current.has(taskId)) {
@@ -188,7 +177,7 @@ export function useTasks({
       if (event.kind === "remove") {
         return removeTasksForApi(requestApi, event.task_ids);
       }
-      if (isActiveTask(event.task)) {
+      if (isLiveTask(event.task)) {
         activeHeartbeatRef.current.set(event.task.id, now);
       } else {
         activeHeartbeatRef.current.delete(event.task.id);
@@ -271,7 +260,7 @@ export function useTasks({
   const activeTaskKey = useMemo(
     () =>
       tasks
-        .filter(isActiveTask)
+        .filter(isLiveTask)
         .map((task) => task.id)
         .sort()
         .join("|"),
@@ -285,7 +274,7 @@ export function useTasks({
 
     const schedule = () => {
       if (!active) return;
-      const activeTasks = tasksRef.current.filter(isActiveTask);
+      const activeTasks = tasksRef.current.filter(isLiveTask);
       if (activeTasks.length === 0) return;
       const now = Date.now();
       const nextDue = Math.min(
@@ -300,7 +289,7 @@ export function useTasks({
     const check = async () => {
       if (!active) return;
       const now = Date.now();
-      const activeTasks = tasksRef.current.filter(isActiveTask);
+      const activeTasks = tasksRef.current.filter(isLiveTask);
       const stale = activeTasks.some(
         (task) =>
           now - (activeHeartbeatRef.current.get(task.id) ?? now) >=
@@ -313,7 +302,7 @@ export function useTasks({
           // Events remain primary; fallback failures stay quiet.
         }
         const checkedAt = Date.now();
-        for (const task of tasksRef.current.filter(isActiveTask)) {
+        for (const task of tasksRef.current.filter(isLiveTask)) {
           activeHeartbeatRef.current.set(task.id, checkedAt);
         }
       }
