@@ -239,7 +239,12 @@ function App() {
 
   const rawCrumbs = breadcrumb(catalogTree, currentFolderId);
   const crumbs = rawCrumbs.map((crumb, index) =>
-    index === 0 && !crumb.name ? { ...crumb, name: (activeSpace?.title || activeSpace?.dataset) ?? "根目录" } : crumb
+    index === 0
+      ? {
+          ...crumb,
+          name: activeSpace?.title || activeSpace?.dataset || crumb.name || "根目录"
+        }
+      : crumb
   );
   const crumbPaths = crumbs.map((_crumb, index) =>
     crumbs
