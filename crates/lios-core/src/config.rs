@@ -16,7 +16,7 @@ use crate::{LiosError, Result};
 
 pub const MODELSCOPE_ENDPOINT: &str = "https://modelscope.cn";
 pub const MODELSCOPE_WWW_ENDPOINT: &str = "https://www.modelscope.cn";
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 
 pub fn validate_modelscope_production_endpoint(endpoint: &str) -> Result<String> {
     match endpoint.trim() {
@@ -43,7 +43,6 @@ pub struct LiosPaths {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiosConfig {
-    #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     #[serde(default)]
     pub spaces: BTreeMap<String, RepoConfig>,
@@ -51,10 +50,6 @@ pub struct LiosConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<PathBuf>,
     pub chunk_size: Option<usize>,
-}
-
-const fn default_schema_version() -> u32 {
-    CONFIG_SCHEMA_VERSION
 }
 
 impl Default for LiosConfig {

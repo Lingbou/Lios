@@ -133,7 +133,7 @@ fn config_roundtrips_as_yaml_without_token_material() {
         Some(tmp.path().join("backups/recovery.key").as_path())
     );
     assert!(raw_yaml.contains("backup_path:"));
-    assert!(raw_yaml.contains("schema_version: 2"));
+    assert!(raw_yaml.contains(&format!("schema_version: {CONFIG_SCHEMA_VERSION}")));
     assert!(raw_yaml.contains("spaces:"));
     assert!(!raw_yaml.contains("active_repo"));
     assert!(!raw_yaml.contains("token"));

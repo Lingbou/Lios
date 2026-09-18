@@ -18,7 +18,7 @@ impl SpaceRegistry {
     }
 
     pub fn list(&self) -> CommandResult<BTreeMap<String, RepoConfig>> {
-        let config = self.load_v2()?;
+        let config = self.load_current()?;
         validate_unique_addresses(&config.spaces)?;
         Ok(config.spaces)
     }
@@ -82,14 +82,14 @@ impl SpaceRegistry {
         mutation: impl FnOnce(&mut BTreeMap<String, RepoConfig>) -> CommandResult<()>,
     ) -> CommandResult<()> {
         let _lock = self.paths.try_lock_config().map_err(CommandError::from)?;
-        let mut config = self.load_v2()?;
+        let mut config = self.load_current()?;
         validate_unique_addresses(&config.spaces)?;
         mutation(&mut config.spaces)?;
         validate_unique_addresses(&config.spaces)?;
         config.save(&self.paths.config).map_err(to_err)
     }
 
-    fn load_v2(&self) -> CommandResult<LiosConfig> {
+    fn load_current(&self) -> CommandResult<LiosConfig> {
         let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
         if config.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(CommandError::invalid_input(
