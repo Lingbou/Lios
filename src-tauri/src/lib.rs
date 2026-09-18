@@ -505,18 +505,17 @@ async fn clear_task_record(paths: &LiosPaths, task_id: Uuid) -> CommandResult<()
         return Err(CommandError::invalid_input("active task cannot be cleared"));
     }
     if let Some(spec) = store.load_spec(task_id).map_err(to_err)? {
-        if let Some(cleanup_label) = terminal_staging_cleanup_label(&spec) {
-            let task_paths = paths
-                .for_task(spec.account_id(), spec.space_id(), task_id)
-                .map_err(to_err)?;
-            if let Err(error) = cleanup_terminal_task_staging(&task_paths, &spec, task_id) {
-                append_task_warning(
-                    &task_paths,
-                    task_id,
-                    &format!("{cleanup_label} staging cleanup failed: {}", error.message),
-                )?;
-                return Err(error);
-            }
+        let cleanup_label = terminal_staging_cleanup_label(&spec);
+        let task_paths = paths
+            .for_task(spec.account_id(), spec.space_id(), task_id)
+            .map_err(to_err)?;
+        if let Err(error) = cleanup_terminal_task_staging(&task_paths, &spec, task_id) {
+            append_task_warning(
+                &task_paths,
+                task_id,
+                &format!("{cleanup_label} staging cleanup failed: {}", error.message),
+            )?;
+            return Err(error);
         }
     }
     store.delete(task_id).map_err(to_err)
@@ -534,15 +533,15 @@ fn task_state_is_active(state: &TaskState) -> bool {
     }
 }
 
-fn terminal_staging_cleanup_label(spec: &TaskSpec) -> Option<&'static str> {
+fn terminal_staging_cleanup_label(spec: &TaskSpec) -> &'static str {
     match spec {
-        TaskSpec::VerifySpace { .. } => Some("verification"),
-        TaskSpec::RebuildCatalog { .. } => Some("catalog rebuild"),
-        TaskSpec::Copy { .. } => Some("copy"),
-        TaskSpec::Sync { .. } => Some("sync"),
-        TaskSpec::Upload { .. } => Some("upload"),
-        TaskSpec::Delete { .. } => Some("delete"),
-        TaskSpec::Download { .. } => Some("download"),
+        TaskSpec::VerifySpace { .. } => "verification",
+        TaskSpec::RebuildCatalog { .. } => "catalog rebuild",
+        TaskSpec::Copy { .. } => "copy",
+        TaskSpec::Sync { .. } => "sync",
+        TaskSpec::Upload { .. } => "upload",
+        TaskSpec::Delete { .. } => "delete",
+        TaskSpec::Download { .. } => "download",
     }
 }
 
@@ -551,9 +550,6 @@ fn cleanup_terminal_task_staging(
     spec: &TaskSpec,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    if terminal_staging_cleanup_label(spec).is_none() {
-        return Ok(());
-    }
     let Some(task) = task_store(paths)?.get_summary(task_id).map_err(to_err)? else {
         return Ok(());
     };
@@ -647,9 +643,7 @@ fn cleanup_terminal_task_staging_and_record(
     spec: &TaskSpec,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    let Some(cleanup_label) = terminal_staging_cleanup_label(spec) else {
-        return Ok(());
-    };
+    let cleanup_label = terminal_staging_cleanup_label(spec);
     if let Err(error) = cleanup_terminal_task_staging(paths, spec, task_id) {
         append_task_warning(
             paths,
@@ -669,9 +663,6 @@ fn cleanup_terminal_task_staging_after_restart(paths: &LiosPaths) -> lios_core::
         let Some(spec) = store.load_spec(task.id)? else {
             continue;
         };
-        if terminal_staging_cleanup_label(&spec).is_none() {
-            continue;
-        }
         let task_paths = paths.for_task(spec.account_id(), spec.space_id(), task.id)?;
         cleanup_terminal_task_staging_and_record(&task_paths, &spec, task.id)
             .map_err(|error| lios_core::LiosError::Storage(error.message))?;
