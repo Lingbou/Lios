@@ -208,7 +208,6 @@ pub fn sanitize_persisted_message(message: String) -> String {
     const SAFE_REMOTE_PREFIXES: &[&str] = &[
         "invalid remote object path in catalog:",
         "invalid recovery node descriptor path:",
-        "legacy path is outside the managed objects prefix:",
         "catalog object is unavailable locally and remotely:",
         "blob oid must be exactly 64 lowercase hexadecimal characters:",
         "the desired upload list contains a delete action for ",
