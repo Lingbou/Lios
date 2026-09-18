@@ -192,13 +192,11 @@ impl Application {
             }
             Err(error) => {
                 let persisted = store.get_summary(task_id).map_err(to_err)?;
-                let state = if persisted
-                    .as_ref()
-                    .is_some_and(|summary| summary.state == TaskState::Committing)
-                {
-                    TaskState::Committing
-                } else {
-                    TaskState::Failed
+                let state = match persisted.as_ref().map(|summary| &summary.state) {
+                    Some(TaskState::Committing) => TaskState::Committing,
+                    Some(TaskState::Paused) => TaskState::Paused,
+                    Some(TaskState::Canceled) => TaskState::Canceled,
+                    _ => TaskState::Failed,
                 };
                 store
                     .update_state(task_id, state, Some(error.message.clone()))
