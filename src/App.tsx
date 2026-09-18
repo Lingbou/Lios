@@ -1742,13 +1742,15 @@ function App() {
             </>
           )}
 
-          <TaskCenter
-            tasks={tasks}
-            pendingActions={pendingActions}
-            onAction={runTaskAction}
-            listTaskItems={listTaskItems}
-            onError={handleTaskError}
-          />
+          {view !== "settings" && (
+            <TaskCenter
+              tasks={tasks}
+              pendingActions={pendingActions}
+              onAction={runTaskAction}
+              listTaskItems={listTaskItems}
+              onError={handleTaskError}
+            />
+          )}
         </section>
 
         <ContextMenu
