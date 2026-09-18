@@ -209,11 +209,6 @@ impl Application {
             .map_err(to_err)?
             .ok_or_else(|| CommandError::invalid_input("task has no resumable specification"))?;
         let space_id = preview_spec.space_id().to_string();
-        let _execution_permit = self
-            .task_manager
-            .acquire(space_id.clone())
-            .await
-            .map_err(|_| CommandError::invalid_input("task manager is shutting down"))?;
         let _process_lock = self
             .paths
             .try_lock_space(&space_id)

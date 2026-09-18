@@ -1,7 +1,6 @@
 //! Foreground task scheduling and resumability primitives.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use lios_core::catalog::{snapshot_source_files, SourceFileSnapshot, SourceSnapshotReport};
@@ -12,10 +11,8 @@ use lios_core::tasks::{
 };
 use lios_core::{LiosError, Result as CoreResult};
 use sha2::{Digest, Sha256};
-use tokio::sync::{AcquireError, Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
-pub const MAX_CONCURRENT_TRANSFERS: usize = 2;
 pub const MAX_AUTOMATIC_RETRIES: u32 = 5;
 const TRANSFER_SPEED_WINDOW: Duration = Duration::from_secs(5);
 const TRANSFER_PUBLISH_INTERVAL: Duration = Duration::from_millis(200);
@@ -385,26 +382,6 @@ pub fn apply_pack_progress(
     Ok(changed)
 }
 
-pub struct TaskExecutionGate {
-    transfers: Arc<Semaphore>,
-    spaces: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
-}
-
-pub struct TaskExecutionPermit {
-    _space: OwnedMutexGuard<()>,
-    transfer: Option<OwnedSemaphorePermit>,
-}
-
-impl TaskExecutionPermit {
-    pub fn release_transfer(&mut self) {
-        self.transfer.take();
-    }
-}
-
-pub struct SpaceMutationPermit {
-    _space: OwnedMutexGuard<()>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskScope {
     pub account_id: String,
@@ -426,119 +403,6 @@ impl TaskScope {
     }
 }
 
-#[derive(Clone)]
-pub struct TaskManager {
-    gate: Arc<TaskExecutionGate>,
-}
-
-impl Default for TaskManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TaskManager {
-    pub fn new() -> Self {
-        Self {
-            gate: Arc::new(TaskExecutionGate::new()),
-        }
-    }
-
-    pub async fn acquire(
-        &self,
-        space_id: impl Into<String>,
-    ) -> Result<TaskExecutionPermit, AcquireError> {
-        self.gate.acquire(space_id).await
-    }
-
-    pub async fn acquire_space(&self, space_id: impl Into<String>) -> SpaceMutationPermit {
-        self.gate.acquire_space(space_id).await
-    }
-
-    pub async fn promote_space(
-        &self,
-        permit: SpaceMutationPermit,
-    ) -> Result<TaskExecutionPermit, AcquireError> {
-        self.gate.promote_space(permit).await
-    }
-
-    pub async fn restore_transfer(
-        &self,
-        permit: &mut TaskExecutionPermit,
-    ) -> Result<(), AcquireError> {
-        self.gate.restore_transfer(permit).await
-    }
-}
-
-impl TaskExecutionGate {
-    pub fn new() -> Self {
-        Self {
-            transfers: Arc::new(Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
-            spaces: StdMutex::new(HashMap::new()),
-        }
-    }
-
-    pub async fn acquire(
-        &self,
-        space_id: impl Into<String>,
-    ) -> Result<TaskExecutionPermit, AcquireError> {
-        let space = self.space_lock(space_id.into());
-        let space = space.lock_owned().await;
-        let transfer = Arc::clone(&self.transfers).acquire_owned().await?;
-        Ok(TaskExecutionPermit {
-            _space: space,
-            transfer: Some(transfer),
-        })
-    }
-
-    pub async fn acquire_space(&self, space_id: impl Into<String>) -> SpaceMutationPermit {
-        SpaceMutationPermit {
-            _space: self.space_lock(space_id.into()).lock_owned().await,
-        }
-    }
-
-    pub async fn promote_space(
-        &self,
-        permit: SpaceMutationPermit,
-    ) -> Result<TaskExecutionPermit, AcquireError> {
-        let transfer = Arc::clone(&self.transfers).acquire_owned().await?;
-        Ok(TaskExecutionPermit {
-            _space: permit._space,
-            transfer: Some(transfer),
-        })
-    }
-
-    pub async fn restore_transfer(
-        &self,
-        permit: &mut TaskExecutionPermit,
-    ) -> Result<(), AcquireError> {
-        if permit.transfer.is_none() {
-            permit.transfer = Some(Arc::clone(&self.transfers).acquire_owned().await?);
-        }
-        Ok(())
-    }
-
-    fn space_lock(&self, space_id: String) -> Arc<Mutex<()>> {
-        let mut spaces = self
-            .spaces
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        spaces.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = spaces.get(&space_id).and_then(Weak::upgrade) {
-            return lock;
-        }
-        let lock = Arc::new(Mutex::new(()));
-        spaces.insert(space_id, Arc::downgrade(&lock));
-        lock
-    }
-}
-
-impl Default for TaskExecutionGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn hash_scope<'a>(domain: &str, parts: impl IntoIterator<Item = &'a String>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain.as_bytes());
@@ -551,10 +415,6 @@ fn hash_scope<'a>(domain: &str, parts: impl IntoIterator<Item = &'a String>) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use tokio::sync::oneshot;
-
     use uuid::Uuid;
 
     use lios_core::catalog::{
@@ -567,117 +427,8 @@ mod tests {
 
     use super::{
         apply_pack_progress, ensure_source_snapshot_complete, persist_submission,
-        validate_task_sources, TaskExecutionGate, TaskScope,
+        validate_task_sources, TaskScope,
     };
-
-    #[tokio::test]
-    async fn different_spaces_can_use_both_global_transfer_slots() {
-        let gate = Arc::new(TaskExecutionGate::new());
-        let first = gate.acquire("space-a").await.unwrap();
-        let second = gate.acquire("space-b").await.unwrap();
-        let third_gate = Arc::clone(&gate);
-        let (entered_tx, mut entered_rx) = oneshot::channel();
-        let third = tokio::spawn(async move {
-            let _permit = third_gate.acquire("space-c").await.unwrap();
-            entered_tx.send(()).unwrap();
-        });
-
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            entered_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-
-        drop(first);
-        entered_rx.await.unwrap();
-        drop(second);
-        third.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn tasks_in_the_same_space_are_serialized_without_using_an_extra_slot() {
-        let gate = Arc::new(TaskExecutionGate::new());
-        let first = gate.acquire("space-a").await.unwrap();
-        let same_space_gate = Arc::clone(&gate);
-        let (same_tx, mut same_rx) = oneshot::channel();
-        let same_space = tokio::spawn(async move {
-            let _permit = same_space_gate.acquire("space-a").await.unwrap();
-            same_tx.send(()).unwrap();
-        });
-
-        let other = gate.acquire("space-b").await.unwrap();
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            same_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-
-        drop(first);
-        same_rx.await.unwrap();
-        drop(other);
-        same_space.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_space_only_writer_blocks_transfers_in_the_same_space() {
-        let gate = Arc::new(TaskExecutionGate::new());
-        let writer = gate.acquire_space("space-a").await;
-        let transfer_gate = Arc::clone(&gate);
-        let (entered_tx, mut entered_rx) = oneshot::channel();
-        let transfer = tokio::spawn(async move {
-            let _permit = transfer_gate.acquire("space-a").await.unwrap();
-            entered_tx.send(()).unwrap();
-        });
-
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            entered_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-
-        drop(writer);
-        entered_rx.await.unwrap();
-        transfer.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_transfer_can_release_its_global_slot_while_retaining_the_space_lock() {
-        let gate = Arc::new(TaskExecutionGate::new());
-        let mut first = gate.acquire("space-a").await.unwrap();
-        let second = gate.acquire("space-b").await.unwrap();
-        let third_gate = Arc::clone(&gate);
-        let (third_tx, mut third_rx) = oneshot::channel();
-        let third = tokio::spawn(async move {
-            let _permit = third_gate.acquire("space-c").await.unwrap();
-            third_tx.send(()).unwrap();
-        });
-
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            third_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        first.release_transfer();
-        third_rx.await.unwrap();
-
-        let same_gate = Arc::clone(&gate);
-        let (same_tx, mut same_rx) = oneshot::channel();
-        let same = tokio::spawn(async move {
-            let _permit = same_gate.acquire("space-a").await.unwrap();
-            same_tx.send(()).unwrap();
-        });
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            same_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-
-        drop(first);
-        same_rx.await.unwrap();
-        drop(second);
-        third.await.unwrap();
-        same.await.unwrap();
-    }
 
     #[test]
     fn task_scope_is_stable_domain_separated_and_path_safe() {

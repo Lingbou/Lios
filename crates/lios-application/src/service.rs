@@ -24,7 +24,7 @@ use crate::recovery_key_service::{
     RecoveryKeyVerification,
 };
 use crate::recovery_key_service::{recovery_key_status, RecoveryKeyStatus};
-use crate::task_manager::{TaskManager, TaskScope};
+use crate::task_manager::TaskScope;
 use crate::{to_err, CommandError, CommandResult};
 
 #[derive(Debug, Clone)]
@@ -56,7 +56,6 @@ pub struct Application {
     read_staging: Arc<tempfile::TempDir>,
     pub(crate) config_gate: Arc<ConfigMutationGate>,
     pub(crate) catalog_gate: Arc<CatalogMutationGate>,
-    pub(crate) task_manager: TaskManager,
 }
 
 impl Application {
@@ -75,7 +74,6 @@ impl Application {
             read_staging: Arc::new(read_staging),
             config_gate: Arc::new(ConfigMutationGate::default()),
             catalog_gate: Arc::new(CatalogMutationGate::default()),
-            task_manager: TaskManager::default(),
         })
     }
 
@@ -85,10 +83,6 @@ impl Application {
 
     pub fn paths(&self) -> &LiosPaths {
         &self.paths
-    }
-
-    pub fn task_manager(&self) -> &TaskManager {
-        &self.task_manager
     }
 
     pub fn setup(&self) -> CommandResult<SetupSnapshot> {
@@ -172,7 +166,6 @@ impl Application {
                 "space was not found or is not visible",
             ));
         }
-        let _space_guard = self.task_manager.acquire_space(scope.space_id).await;
         let _catalog_guard = self.catalog_gate.lock_mutation().await;
         ensure_space_can_initialize(
             &adapter,
@@ -329,7 +322,6 @@ impl Application {
             .paths
             .try_lock_space(&scope.space_id)
             .map_err(CommandError::from)?;
-        let _space_guard = self.task_manager.acquire_space(scope.space_id).await;
         let _catalog_guard = self.catalog_gate.lock_mutation().await;
         let (catalog, baseline) =
             download_catalog_baseline(&self.paths, &key, &adapter, &repo).await?;

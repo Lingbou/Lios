@@ -69,7 +69,7 @@ use task_center::{
     emit_removed_tasks, emit_task, list_task_items_for_paths, task_summaries_for_paths,
     task_summary_for_paths, webview_safe_task_summary, TaskItemsPageDto,
 };
-use task_manager::{persist_submission, snapshot_upload_sources, TaskManager, TaskScope};
+use task_manager::{persist_submission, snapshot_upload_sources, TaskScope};
 #[cfg(test)]
 use task_manager::{retry_backoff, TransferMetrics};
 use tauri::Manager;
@@ -85,7 +85,6 @@ struct AppContext {
     catalog_mutation_gate: CatalogMutationGate,
     config_mutation_gate: ConfigMutationGate,
     task_lifecycle_gate: Mutex<TaskLifecycleState>,
-    task_manager: TaskManager,
 }
 
 #[derive(Default)]
@@ -111,7 +110,6 @@ impl AppContext {
             catalog_mutation_gate: CatalogMutationGate::default(),
             config_mutation_gate: ConfigMutationGate::default(),
             task_lifecycle_gate: Mutex::new(TaskLifecycleState::default()),
-            task_manager: TaskManager::default(),
         }
     }
 }
@@ -1762,10 +1760,6 @@ async fn initialize_space(
             "space was not found or is not visible",
         ));
     }
-    let _space_mutation_guard = state
-        .task_manager
-        .acquire_space(TaskScope::from_repo(&repo).space_id)
-        .await;
     let _catalog_mutation_guard = state.catalog_mutation_gate.lock_mutation().await;
     ensure_space_can_initialize(
         &adapter,
@@ -2235,10 +2229,10 @@ async fn preview_rebuild_catalog(
     let key = key_from_config(&config)?;
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
-    let _space_permit = state
-        .task_manager
-        .acquire_space(scope.space_id.clone())
-        .await;
+    let _process_space_lock = state
+        .paths
+        .try_lock_space(&scope.space_id)
+        .map_err(CommandError::from)?;
     let branch_adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(&state.paths)?);
     let cancellation = CancellationToken::new();
     let started_revision = head_revision_with_cancellation(&branch_adapter, &repo, &cancellation)
