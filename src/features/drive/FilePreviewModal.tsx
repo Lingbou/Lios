@@ -20,7 +20,7 @@ export interface FilePreviewModalProps {
   onPrev?: () => void;
   onNext?: () => void;
   onClose: () => void;
-  onDownload: () => void;
+  onDownload: (item: DriveItem) => void;
 }
 
 export function FilePreviewModal({
@@ -79,7 +79,7 @@ export function FilePreviewModal({
             <button
               type="button"
               className="previewDownloadBtn"
-              onClick={onDownload}
+              onClick={() => onDownload(item)}
               title="下载到本地"
             >
               <Download aria-hidden />
@@ -114,7 +114,7 @@ export function FilePreviewModal({
           {error && !loading && (
             <div className="previewErrorState">
               <p>无法生成此文件的在线预览：{error}</p>
-              <button type="button" className="primary" onClick={onDownload}>
+              <button type="button" className="primary" onClick={() => onDownload(item)}>
                 <Download aria-hidden />
                 <span>直接下载查看</span>
               </button>
@@ -141,7 +141,7 @@ export function FilePreviewModal({
           {!loading && !error && !content && (
             <div className="previewUnsupportedState">
               <p>此格式暂不支持在线即时预览</p>
-              <button type="button" className="primary" onClick={onDownload}>
+              <button type="button" className="primary" onClick={() => onDownload(item)}>
                 <Download aria-hidden />
                 <span>下载到本地查看</span>
               </button>

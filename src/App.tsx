@@ -1123,9 +1123,9 @@ function App() {
     });
   }
 
-  async function downloadSelected() {
+  async function downloadSelected(nodeIdsOverride?: string[]) {
     if (!activeSpace) return;
-    const nodeIds = [...selectedIds];
+    const nodeIds = nodeIdsOverride ?? [...selectedIds];
     if (nodeIds.length === 0) return;
     const output = await open({ directory: true, multiple: false });
     if (typeof output !== "string") return;
@@ -1992,12 +1992,7 @@ function App() {
             setPreviewOpen(false);
             setPreviewItem(null);
           }}
-          onDownload={() => {
-            if (previewItem) {
-              setSelectedIds(new Set([previewItem.id]));
-              void downloadSelected();
-            }
-          }}
+          onDownload={(item) => void downloadSelected([item.id])}
         />
       </main>
     </div>

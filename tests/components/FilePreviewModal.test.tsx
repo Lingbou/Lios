@@ -97,7 +97,7 @@ describe("FilePreviewModal", () => {
     );
 
     fireEvent.click(screen.getByText("下载"));
-    expect(onDownload).toHaveBeenCalledOnce();
+    expect(onDownload).toHaveBeenCalledWith(mockFile);
 
     fireEvent.click(screen.getByTitle("关闭 (Esc)"));
     expect(onClose).toHaveBeenCalledOnce();
