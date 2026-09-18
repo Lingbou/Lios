@@ -42,7 +42,6 @@ node_modules/
 jspm_packages/
 target/
 .codex/
-.dev-home/
 
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/

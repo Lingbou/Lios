@@ -126,10 +126,8 @@ impl LiosPaths {
     }
 
     pub fn default_user() -> Self {
-        let home = std::env::var_os("LIOS_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| UserDirs::new().and_then(|dirs| dirs.home_dir().canonicalize().ok()))
+        let home = UserDirs::new()
+            .and_then(|dirs| dirs.home_dir().canonicalize().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         Self::from_home(home)
     }

@@ -5,7 +5,6 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "dev:app": "node scripts/dev-desktop.mjs",
     "test:frontend": "node --test tests/catalogState.test.ts tests/taskPresentation.test.ts tests/recoveryKeyPresentation.test.ts && vitest run",
     "test:components": "vitest run tests/components",
     "build": "tsc && vite build",
