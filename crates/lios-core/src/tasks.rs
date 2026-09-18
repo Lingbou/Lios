@@ -11,7 +11,7 @@ use crate::catalog::{ConflictResolution, SourceSnapshotReport};
 use crate::config::RepoConfig;
 use crate::{LiosError, Result};
 
-const TASK_SCHEMA_VERSION: i64 = 4;
+const TASK_SCHEMA_VERSION: i64 = 5;
 const INVALID_TASK_SPEC_MESSAGE: &str = "persisted task specification is invalid";
 const TERMINAL_TASK_RETENTION_DAYS: i64 = 30;
 const MAX_TERMINAL_TASKS: usize = 500;
@@ -1997,27 +1997,17 @@ fn upsert_task_catalog_checkpoint_on(
 }
 
 fn migrate_task_store(connection: &mut rusqlite::Connection) -> Result<()> {
-    let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if version > TASK_SCHEMA_VERSION {
-        return Err(LiosError::DataCorruption(format!(
-            "task database schema version {version} is newer than supported version {TASK_SCHEMA_VERSION}"
-        )));
-    }
-    if version == TASK_SCHEMA_VERSION {
-        return Ok(());
-    }
-
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let version = transaction.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-    if version > TASK_SCHEMA_VERSION {
-        return Err(LiosError::DataCorruption(format!(
-            "task database schema version {version} is newer than supported version {TASK_SCHEMA_VERSION}"
-        )));
-    }
     if version == TASK_SCHEMA_VERSION {
         transaction.commit()?;
         return Ok(());
+    }
+    if version != 0 {
+        return Err(LiosError::DataCorruption(format!(
+            "unsupported task database schema version {version}; delete the local Lios task database and retry"
+        )));
     }
 
     transaction.execute_batch(

@@ -467,6 +467,27 @@ fn task_store_can_delete_a_task_record() {
 }
 
 #[test]
+fn task_store_rejects_every_older_schema_without_migrating() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("lios.db");
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    connection.pragma_update(None, "user_version", 4).unwrap();
+    drop(connection);
+
+    let error = match TaskStore::open(&db_path) {
+        Ok(_) => panic!("older task schema must not open"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, LiosError::DataCorruption(_)));
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    let version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(version, 4);
+}
+
+#[test]
 fn task_store_prunes_only_old_or_excess_terminal_history() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("lios.db");
