@@ -14,8 +14,7 @@ use crate::format_v1::{
     decrypt_envelope_v1, encrypt_envelope_v1, envelope_encoded_len_v1, EnvelopeKindV1,
 };
 use crate::framed_v1::{
-    decode_chunk_stream_v1, encode_chunk_stream_with_compression_v1,
-    ChunkDecodeLimitsV1, ChunkIdV1,
+    decode_chunk_stream_v1, encode_chunk_stream_with_compression_v1, ChunkDecodeLimitsV1, ChunkIdV1,
 };
 use crate::pack::{PackOptions, PackProgress, PackSource};
 use crate::restore::{RestoreConflictPolicy, RestoreOptions};
@@ -3520,12 +3519,46 @@ pub fn is_precompressed_path(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
         matches!(
             ext.to_ascii_lowercase().as_str(),
-            "zip" | "gz" | "tgz" | "tar" | "xz" | "7z" | "bz2" | "zst" | "lz4"
-                | "mp4" | "mkv" | "mov" | "avi" | "webm" | "flv" | "wmv"
-                | "mp3" | "flac" | "aac" | "ogg" | "m4a" | "wav"
-                | "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "avif"
-                | "iso" | "dmg" | "apk" | "ipa" | "whl" | "jar" | "war"
-                | "pdf" | "docx" | "xlsx" | "pptx"
+            "zip"
+                | "gz"
+                | "tgz"
+                | "tar"
+                | "xz"
+                | "7z"
+                | "bz2"
+                | "zst"
+                | "lz4"
+                | "mp4"
+                | "mkv"
+                | "mov"
+                | "avi"
+                | "webm"
+                | "flv"
+                | "wmv"
+                | "mp3"
+                | "flac"
+                | "aac"
+                | "ogg"
+                | "m4a"
+                | "wav"
+                | "jpg"
+                | "jpeg"
+                | "png"
+                | "webp"
+                | "gif"
+                | "heic"
+                | "avif"
+                | "iso"
+                | "dmg"
+                | "apk"
+                | "ipa"
+                | "whl"
+                | "jar"
+                | "war"
+                | "pdf"
+                | "docx"
+                | "xlsx"
+                | "pptx"
         )
     } else {
         false

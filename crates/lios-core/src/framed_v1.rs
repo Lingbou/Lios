@@ -96,7 +96,10 @@ pub fn encode_chunk_stream_with_compression_v1<R: Read, W: Write>(
     let (_compression_id, stream_header) = if enable_compression {
         (ZSTD_ID, chunk_stream_header(chunk_id))
     } else {
-        (COMPRESSION_NONE_ID, chunk_stream_header_with_compression(chunk_id, COMPRESSION_NONE_ID))
+        (
+            COMPRESSION_NONE_ID,
+            chunk_stream_header_with_compression(chunk_id, COMPRESSION_NONE_ID),
+        )
     };
     let mut encoded_writer = HashingWriter::new(&mut output);
     encoded_writer.write_all(&stream_header)?;
@@ -320,9 +323,10 @@ impl<W: Write> DirectPassDecoder<W> {
     }
 
     fn write_data(&mut self, data: &[u8]) -> Result<()> {
-        let next = self.output_bytes.checked_add(data.len() as u64).ok_or_else(|| {
-            LiosError::DataCorruption("decoded chunk size overflow".to_string())
-        })?;
+        let next = self
+            .output_bytes
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| LiosError::DataCorruption("decoded chunk size overflow".to_string()))?;
         if next > self.max_output_bytes {
             return Err(LiosError::DataCorruption(
                 "decoded chunk size exceeds expected size".to_string(),

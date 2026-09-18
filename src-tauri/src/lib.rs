@@ -1684,7 +1684,9 @@ fn set_chunk_size(
     let mut config = load_config(&state.paths)?;
     if let Some(size) = chunk_size_bytes {
         if !(4 * 1024 * 1024..=256 * 1024 * 1024).contains(&size) {
-            return Err(CommandError::invalid_input("chunk size must be between 4MB and 256MB"));
+            return Err(CommandError::invalid_input(
+                "chunk size must be between 4MB and 256MB",
+            ));
         }
     }
     config.chunk_size = chunk_size_bytes;
@@ -3927,7 +3929,6 @@ mod remote_verification_tests {
 
     #[cfg(windows)]
     use super::cleanup_terminal_task_staging_and_record;
-    use uuid::Uuid;
     use super::{
         append_task_warning, cleanup_current_staging_cache, cleanup_terminal_task_staging,
         cleanup_terminal_task_staging_after_restart_async, clear_task_record,
@@ -3935,6 +3936,7 @@ mod remote_verification_tests {
         map_remote_integrity_error, validate_local_remote_file, verification_commit_id,
         CommandErrorCode, LocalRemoteFileValidation, TaskLifecycleState,
     };
+    use uuid::Uuid;
 
     fn verification_spec() -> TaskSpec {
         TaskSpec::VerifySpace {
@@ -4293,14 +4295,18 @@ mod remote_verification_tests {
         let mut completed_task = TaskRecord::queued("completed", 1);
         completed_task.id = completed_id;
         store.insert(&completed_task).unwrap();
-        store.update_state(completed_id, TaskState::Completed, None).unwrap();
+        store
+            .update_state(completed_id, TaskState::Completed, None)
+            .unwrap();
 
-        let completed_staged = paths.staging
+        let completed_staged = paths
+            .staging
             .join(&account_id)
             .join(&space_id)
             .join(completed_id.to_string())
             .join("chunk.lios");
-        let orphaned_staged = paths.staging
+        let orphaned_staged = paths
+            .staging
             .join(&account_id)
             .join(&space_id)
             .join(orphaned_id.to_string())
@@ -4316,7 +4322,10 @@ mod remote_verification_tests {
         assert!(!completed_staged.exists());
         assert!(!orphaned_staged.exists());
         assert_eq!(report.files_removed, 2);
-        assert_eq!(report.bytes_removed, b"completed 123".len() as u64 + b"orphaned 456".len() as u64);
+        assert_eq!(
+            report.bytes_removed,
+            b"completed 123".len() as u64 + b"orphaned 456".len() as u64
+        );
     }
 
     #[tokio::test]

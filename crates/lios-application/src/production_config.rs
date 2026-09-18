@@ -34,7 +34,9 @@ pub fn configured_endpoint(
 
 pub fn validate_repo_identifier(name: &str, field: &'static str) -> Result<(), CommandError> {
     if name.is_empty() {
-        return Err(CommandError::invalid_input(format!("{field} cannot be empty")));
+        return Err(CommandError::invalid_input(format!(
+            "{field} cannot be empty"
+        )));
     }
     if !name.is_ascii()
         || name
@@ -56,7 +58,10 @@ pub fn validate_repo(repo: RepoConfig) -> Result<RepoConfig, CommandError> {
     }
     validate_repo_identifier(namespace, "namespace")?;
     validate_repo_identifier(dataset, "dataset")?;
-    let title = repo.title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let title = repo
+        .title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
     Ok(RepoConfig {
         namespace: namespace.to_string(),
         dataset: dataset.to_string(),
@@ -98,9 +103,7 @@ mod tests {
     use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
     use tempfile::tempdir;
 
-    use super::{
-        configured_endpoint, persist_config, prepare_startup_config, validate_repo,
-    };
+    use super::{configured_endpoint, persist_config, prepare_startup_config, validate_repo};
     use crate::command_error::CommandErrorCode;
 
     #[test]
