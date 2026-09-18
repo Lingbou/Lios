@@ -1342,6 +1342,13 @@ function App() {
 
           {view === "settings" ? (
             <section className="settingsPage">
+              <div className="settingsPageHeader">
+                <div>
+                  <h2>设置</h2>
+                  <span>应用、安全与本地状态</span>
+                </div>
+              </div>
+              <div className="settingsBlocks">
               <div className="settingsBlock">
                 <div>
                   <h2>连接</h2>
@@ -1522,6 +1529,7 @@ function App() {
               </div>
 
               <AboutSection loadVersion={loadAppVersion} />
+              </div>
             </section>
           ) : view === "spaces" ? (
             <SpaceGrid
