@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import {
   type PointerEvent as ReactPointerEvent,
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -317,7 +318,7 @@ function TaskDetails({
   );
 }
 
-export function TaskCenter({
+function TaskCenterComponent({
   tasks,
   pendingActions,
   onAction,
@@ -528,3 +529,5 @@ export function TaskCenter({
     </section>
   );
 }
+
+export const TaskCenter = memo(TaskCenterComponent);
