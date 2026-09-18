@@ -62,6 +62,7 @@ import {
 } from "./features/tasks/taskPresentation.ts";
 import { type TaskSummary } from "./features/tasks/taskTypes.ts";
 import { useTasks } from "./features/tasks/useTasks.ts";
+import { useStableCallback } from "./useStableCallback.ts";
 import {
   conciseRecoveryKeyPath,
   recoveryKeyBackupText,
@@ -1252,6 +1253,12 @@ function App() {
     }
   }
 
+  const refreshSpaces = useStableCallback(() => refreshSetup(true));
+  const createSpace = useStableCallback(openCreateSpaceDialog);
+  const selectSpace = useStableCallback((space: SpaceSummary) => loadSpace(space));
+  const removeSpace = useStableCallback(handleRemoveSpace);
+  const openSettings = useStableCallback(() => setView("settings"));
+
   return (
     <div className="appFrame">
       <header className="windowTitlebar">
@@ -1582,11 +1589,11 @@ function App() {
               activeSpace={activeSpace}
               query={query}
               busy={busy !== null}
-              onRefresh={() => refreshSetup(true)}
-              onCreateSpace={openCreateSpaceDialog}
-              onSelectSpace={(space) => loadSpace(space)}
-              onRemoveSpace={handleRemoveSpace}
-              onOpenSettings={() => setView("settings")}
+              onRefresh={refreshSpaces}
+              onCreateSpace={createSpace}
+              onSelectSpace={selectSpace}
+              onRemoveSpace={removeSpace}
+              onOpenSettings={openSettings}
             />
           ) : (
             <>

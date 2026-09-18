@@ -1,4 +1,5 @@
 import { AlertTriangle, ChevronRight, Cloud, HardDrive, Plus, RefreshCw, Settings, Trash2 } from "lucide-react";
+import { memo } from "react";
 import type { SpaceSummary } from "../../appTypes.ts";
 
 export interface SpaceGridProps {
@@ -15,7 +16,7 @@ export interface SpaceGridProps {
   onOpenSettings: () => void;
 }
 
-export function SpaceGrid({
+function SpaceGridComponent({
   accountName,
   hasToken,
   spaces,
@@ -149,3 +150,5 @@ export function SpaceGrid({
     </section>
   );
 }
+
+export const SpaceGrid = memo(SpaceGridComponent);
