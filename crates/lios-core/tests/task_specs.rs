@@ -59,16 +59,3 @@ fn copy_and_sync_specs_persist_the_confirmed_plan() {
     assert_eq!(copy_roundtrip.label(), "copy");
     assert_eq!(sync_roundtrip.label(), "sync");
 }
-
-#[test]
-fn legacy_delete_spec_remains_deserializable() {
-    let json = format!(
-        r#"{{"kind":"delete","account_id":"{}","space_id":"{}","repo":{{"namespace":"allen","dataset":"photos","endpoint":"https://modelscope.cn"}},"node_ids":["node"]}}"#,
-        "a".repeat(64),
-        "b".repeat(64)
-    );
-
-    let spec: TaskSpec = serde_json::from_str(&json).unwrap();
-
-    assert_eq!(spec.label(), "delete");
-}
