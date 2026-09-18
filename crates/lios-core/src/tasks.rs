@@ -322,16 +322,6 @@ pub struct TaskCatalogCheckpoint {
     pub target_catalog_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FileContentIndexEntry {
-    pub account_id: String,
-    pub space_id: String,
-    pub content_sha256: String,
-    pub object_id: String,
-    pub size: u64,
-    pub updated_at: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskRecoveryReport {
     pub requeued: usize,
@@ -1366,66 +1356,6 @@ impl TaskStore {
         .transpose()
     }
 
-    pub fn upsert_content_index(&self, entry: &FileContentIndexEntry) -> Result<()> {
-        self.connection.execute(
-            r#"
-            INSERT INTO file_content_index
-                (account_id, space_id, content_sha256, object_id, size, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            ON CONFLICT(account_id, space_id, content_sha256) DO UPDATE SET
-                object_id = excluded.object_id,
-                size = excluded.size,
-                updated_at = excluded.updated_at
-            "#,
-            rusqlite::params![
-                &entry.account_id,
-                &entry.space_id,
-                &entry.content_sha256,
-                &entry.object_id,
-                sqlite_integer(entry.size, "file content index size")?,
-                &entry.updated_at,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn find_content_index(
-        &self,
-        account_id: &str,
-        space_id: &str,
-        content_sha256: &str,
-    ) -> Result<Option<FileContentIndexEntry>> {
-        let row = self
-            .connection
-            .query_row(
-                r#"
-                SELECT object_id, size, updated_at
-                FROM file_content_index
-                WHERE account_id = ?1 AND space_id = ?2 AND content_sha256 = ?3
-                "#,
-                rusqlite::params![account_id, space_id, content_sha256],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(|(object_id, size, updated_at)| {
-            Ok(FileContentIndexEntry {
-                account_id: account_id.to_string(),
-                space_id: space_id.to_string(),
-                content_sha256: content_sha256.to_string(),
-                object_id,
-                size: persisted_u64(size, "file content index size")?,
-                updated_at,
-            })
-        })
-        .transpose()
-    }
-
     pub fn recover_after_restart(
         &mut self,
         unrecoverable_message: &str,
@@ -2145,15 +2075,6 @@ fn migrate_task_store(connection: &mut rusqlite::Connection) -> Result<()> {
             base_catalog_sha256 TEXT,
             target_catalog_sha256 TEXT NOT NULL,
             FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS file_content_index (
-            account_id TEXT NOT NULL,
-            space_id TEXT NOT NULL,
-            content_sha256 TEXT NOT NULL,
-            object_id TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY(account_id, space_id, content_sha256)
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
         CREATE INDEX IF NOT EXISTS idx_tasks_space_state

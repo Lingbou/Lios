@@ -6,8 +6,8 @@ use lios_core::{
     credentials::{protect_to_file, unprotect_from_file},
     crypto::KeyFile,
     tasks::{
-        CheckpointState, FileContentIndexEntry, TaskCatalogCheckpoint, TaskItem, TaskItemState,
-        TaskObjectCheckpoint, TaskRecord, TaskSpec, TaskState, TaskStore,
+        CheckpointState, TaskCatalogCheckpoint, TaskItem, TaskItemState, TaskObjectCheckpoint,
+        TaskRecord, TaskSpec, TaskState, TaskStore,
     },
     LiosError,
 };
@@ -1011,7 +1011,7 @@ fn task_store_reads_item_page_with_snapshot_consistent_total_and_existence() {
 }
 
 #[test]
-fn task_store_persists_specs_items_checkpoints_and_content_index() {
+fn task_store_persists_specs_items_and_checkpoints() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("lios.db");
     let store = TaskStore::open(&db_path).unwrap();
@@ -1055,19 +1055,9 @@ fn task_store_persists_specs_items_checkpoints_and_content_index() {
         size: 1024,
         state: CheckpointState::Uploaded,
     };
-    let content = FileContentIndexEntry {
-        account_id: "account-a".to_string(),
-        space_id: "novix/cold".to_string(),
-        content_sha256: "b".repeat(64),
-        object_id: "object-a".to_string(),
-        size: 4096,
-        updated_at: "2026-07-11T00:00:00Z".to_string(),
-    };
-
     store.insert_with_spec(&task, &spec).unwrap();
     store.upsert_item(&item).unwrap();
     store.upsert_checkpoint(&checkpoint).unwrap();
-    store.upsert_content_index(&content).unwrap();
     let mut updated_task = task.clone();
     updated_task.state = TaskState::Preparing;
     updated_task.progress_total = 4;
@@ -1110,13 +1100,6 @@ fn task_store_persists_specs_items_checkpoints_and_content_index() {
         reopened.list_checkpoints(task.id).unwrap(),
         vec![checkpoint]
     );
-    assert_eq!(
-        reopened
-            .find_content_index("account-a", "novix/cold", &"b".repeat(64))
-            .unwrap(),
-        Some(content)
-    );
-
     reopened.delete(task.id).unwrap();
     assert!(reopened.list_items(task.id).unwrap().is_empty());
     assert!(reopened.list_checkpoints(task.id).unwrap().is_empty());
@@ -2086,19 +2069,6 @@ fn task_store_rejects_out_of_range_writes_and_negative_persisted_numbers() {
                 oid: "a".repeat(64),
                 size: u64::MAX,
                 state: CheckpointState::Pending,
-            })
-            .unwrap_err(),
-        LiosError::DataCorruption(_)
-    ));
-    assert!(matches!(
-        store
-            .upsert_content_index(&FileContentIndexEntry {
-                account_id: "account-a".to_string(),
-                space_id: "novix/cold".to_string(),
-                content_sha256: "b".repeat(64),
-                object_id: "object-a".to_string(),
-                size: u64::MAX,
-                updated_at: "2026-07-11T00:00:00Z".to_string(),
             })
             .unwrap_err(),
         LiosError::DataCorruption(_)
