@@ -209,6 +209,9 @@ function App() {
 
   const sortedItems = useMemo(() => {
     const items = [...visibleItems];
+    const updatedAt = new Map(
+      items.map((item) => [item.id, Date.parse(item.updated_at)])
+    );
     items.sort((a, b) => {
       if (sortField !== "kind") {
         if (a.kind === "Directory" && b.kind === "File") return -1;
@@ -229,7 +232,7 @@ function App() {
         const sizeB = b.kind === "File" ? b.size : 0;
         result = sizeA - sizeB;
       } else if (sortField === "updated_at") {
-        result = new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime();
+        result = (updatedAt.get(a.id) ?? 0) - (updatedAt.get(b.id) ?? 0);
       }
 
       return sortDirection === "asc" ? result : -result;
@@ -274,13 +277,15 @@ function App() {
     [activeSpace?.dataset, activeSpace?.title, rawCrumbs]
   );
   const crumbPaths = useMemo(
-    () =>
-      crumbs.map((_crumb, index) =>
-        crumbs
-          .slice(0, index + 1)
-          .map((crumb) => crumb.name)
-          .join(" / ")
-      ),
+    () => {
+      const paths: string[] = [];
+      let path = "";
+      for (const crumb of crumbs) {
+        path = path ? `${path} / ${crumb.name}` : crumb.name;
+        paths.push(path);
+      }
+      return paths;
+    },
     [crumbs]
   );
   const selectedCount = selectedIds.size;
