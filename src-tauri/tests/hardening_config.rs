@@ -91,6 +91,14 @@ fn worker_sidecar_is_generated_ephemerally_and_declared_for_bundling() {
         .lines()
         .any(|line| line.trim() == "src-tauri/binaries/"));
     assert!(builder.contains("lios-worker-${artifactTarget}"));
+
+    for workflow_path in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
+        let workflow = fs::read_to_string(repository.join(workflow_path)).unwrap();
+        assert!(
+            !workflow.contains("src-tauri/binaries"),
+            "{workflow_path} must rely on the Tauri build hook for the worker sidecar"
+        );
+    }
 }
 
 #[test]

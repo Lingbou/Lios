@@ -86,13 +86,6 @@ jobs:
       - name: Verify Rust formatting
         run: cargo fmt --all -- --check
 
-      - name: Build Tauri sidecar
-        shell: bash
-        run: |
-          cargo build --locked -p lios-cli --bin lios-worker
-          mkdir -p src-tauri/binaries
-          cp target/debug/lios-worker src-tauri/binaries/lios-worker-x86_64-unknown-linux-gnu
-
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
@@ -135,13 +128,6 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
-
-      - name: Build bundled Windows worker
-        shell: pwsh
-        run: |
-          cargo build --release --locked -p lios-cli --bin lios-worker --target x86_64-pc-windows-msvc
-          New-Item -ItemType Directory -Force src-tauri\binaries | Out-Null
-          Copy-Item target\x86_64-pc-windows-msvc\release\lios-worker.exe src-tauri\binaries\lios-worker-x86_64-pc-windows-msvc.exe
 
       - name: Build NSIS installer
         shell: pwsh
@@ -309,13 +295,6 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
-
-      - name: Build bundled Linux worker
-        shell: bash
-        run: |
-          cargo build --release --locked -p lios-cli --bin lios-worker
-          mkdir -p src-tauri/binaries
-          cp target/release/lios-worker src-tauri/binaries/lios-worker-x86_64-unknown-linux-gnu
 
       - name: Build Linux desktop executable
         run: npx tauri build --no-bundle
