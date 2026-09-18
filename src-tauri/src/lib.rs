@@ -36,8 +36,8 @@ use lios_application::service::Application;
 use lios_application::space_registry::SpaceRegistry;
 use lios_core::cache::{prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
-    Catalog, CatalogRebuildOutcome, CatalogRebuildReport, CatalogRemoteFile, CatalogSelection,
-    CatalogTreeNode, ConflictAction, ConflictResolution, DriveItem, UploadConflict, CATALOG_FILE,
+    Catalog, CatalogRebuildReport, CatalogRemoteFile, CatalogSelection, CatalogTreeNode,
+    ConflictAction, ConflictResolution, DriveItem, UploadConflict, CATALOG_FILE,
 };
 #[cfg(test)]
 use lios_core::catalog_transaction::{
@@ -72,7 +72,6 @@ use task_support::{persist_submission, snapshot_upload_sources, TaskScope};
 #[cfg(test)]
 use task_support::{retry_backoff, TransferMetrics};
 use tauri::Manager;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 type CommandResult<T> = std::result::Result<T, CommandError>;
@@ -238,18 +237,6 @@ fn task_store(paths: &LiosPaths) -> CommandResult<TaskStore> {
 }
 
 #[cfg(test)]
-fn task_interrupt_core(paths: &LiosPaths, id: Uuid) -> lios_core::Result<Option<TaskState>> {
-    let state = TaskStore::open(&paths.database)?
-        .get_summary(id)?
-        .map(|task| task.state);
-    match state {
-        Some(TaskState::Paused) => Ok(Some(TaskState::Paused)),
-        Some(TaskState::Canceled) => Ok(Some(TaskState::Canceled)),
-        _ => Ok(None),
-    }
-}
-
-#[cfg(test)]
 fn transaction_phase_label(phase: CatalogTransactionPhase) -> &'static str {
     match phase {
         CatalogTransactionPhase::ValidateBlobs => "validating",
@@ -372,53 +359,30 @@ fn remote_to_staging_path(staging: &Path, remote_path: &str) -> CommandResult<Pa
     Ok(staging.join(relative))
 }
 
-#[cfg(test)]
 fn sha256_hex_file(path: &Path) -> CommandResult<String> {
-    sha256_hex_file_cancellable(path, || false)?.ok_or_else(|| {
-        CommandError::new(
-            CommandErrorCode::Internal,
-            "file hashing was unexpectedly canceled",
-            false,
-            None,
-        )
-    })
-}
-
-fn sha256_hex_file_cancellable(
-    path: &Path,
-    mut should_cancel: impl FnMut() -> bool,
-) -> CommandResult<Option<String>> {
     let mut file = fs::File::open(path).map_err(to_err)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
-        if should_cancel() {
-            return Ok(None);
-        }
         let read = file.read(&mut buffer).map_err(to_err)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(Some(hex::encode(hasher.finalize())))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalRemoteFileValidation {
     Valid,
     Invalid,
-    Canceled,
 }
 
 async fn validate_local_remote_file(
     local_path: &Path,
     file: &CatalogRemoteFile,
-    cancellation: &CancellationToken,
 ) -> CommandResult<LocalRemoteFileValidation> {
-    if cancellation.is_cancelled() {
-        return Ok(LocalRemoteFileValidation::Canceled);
-    }
     let metadata = match tokio::fs::metadata(local_path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -437,23 +401,20 @@ async fn validate_local_remote_file(
         return Ok(LocalRemoteFileValidation::Valid);
     };
     let path = local_path.to_path_buf();
-    let cancellation = cancellation.clone();
-    let actual = tokio::task::spawn_blocking(move || {
-        sha256_hex_file_cancellable(&path, || cancellation.is_cancelled())
-    })
-    .await
-    .map_err(|error| {
-        CommandError::new(
-            CommandErrorCode::Internal,
-            format!("local verification worker failed: {error}"),
-            false,
-            None,
-        )
-    })??;
-    match actual {
-        Some(actual) if actual == expected => Ok(LocalRemoteFileValidation::Valid),
-        Some(_) => Ok(LocalRemoteFileValidation::Invalid),
-        None => Ok(LocalRemoteFileValidation::Canceled),
+    let actual = tokio::task::spawn_blocking(move || sha256_hex_file(&path))
+        .await
+        .map_err(|error| {
+            CommandError::new(
+                CommandErrorCode::Internal,
+                format!("local verification worker failed: {error}"),
+                false,
+                None,
+            )
+        })??;
+    if actual == expected {
+        Ok(LocalRemoteFileValidation::Valid)
+    } else {
+        Ok(LocalRemoteFileValidation::Invalid)
     }
 }
 
@@ -984,19 +945,6 @@ async fn retry_storage_operation<T>(
     }
 }
 
-#[cfg(test)]
-fn observed_task_interrupt(
-    paths: &LiosPaths,
-    task_id: Uuid,
-    cancellation: &CancellationToken,
-) -> lios_core::Result<Option<TaskState>> {
-    let persisted = task_interrupt_core(paths, task_id)?;
-    if persisted.is_some() {
-        return Ok(persisted);
-    }
-    Ok(cancellation.is_cancelled().then_some(TaskState::Canceled))
-}
-
 fn recovery_metadata_objects(
     remote_objects: &[StorageObject],
 ) -> CommandResult<Vec<StorageObject>> {
@@ -1098,9 +1046,8 @@ async fn download_recovery_metadata(
     repo: &RepoConfig,
     remote_objects: &[StorageObject],
     staging_dir: &Path,
-    cancellation: &CancellationToken,
     mut on_progress: impl FnMut(u64, u64, u64, u64) -> CommandResult<()>,
-) -> CommandResult<bool> {
+) -> CommandResult<()> {
     let metadata_objects = recovery_metadata_objects(remote_objects)?;
     let total_objects = u64::try_from(metadata_objects.len()).map_err(|_| {
         CommandError::new(
@@ -1124,9 +1071,6 @@ async fn download_recovery_metadata(
     let mut completed_bytes = 0u64;
     on_progress(0, total_objects, 0, total_bytes)?;
     for object in metadata_objects {
-        if cancellation.is_cancelled() {
-            return Ok(false);
-        }
         let local_path = remote_to_staging_path(staging_dir, &object.path)?;
         let expected = CatalogRemoteFile {
             path: object.path.clone(),
@@ -1135,30 +1079,29 @@ async fn download_recovery_metadata(
         };
         let completed_before_object = completed_bytes;
         let mut progress_error = None;
-        let download = adapter.download_object_with_progress(
-            &repo.namespace,
-            &repo.dataset,
-            &object.path,
-            &local_path,
-            |object_bytes| {
-                if progress_error.is_none() {
-                    let bytes_done = completed_before_object.saturating_add(object_bytes);
-                    if let Err(error) =
-                        on_progress(completed_objects, total_objects, bytes_done, total_bytes)
-                    {
-                        progress_error = Some(error);
+        adapter
+            .download_object_with_progress(
+                &repo.namespace,
+                &repo.dataset,
+                &object.path,
+                &local_path,
+                |object_bytes| {
+                    if progress_error.is_none() {
+                        let bytes_done = completed_before_object.saturating_add(object_bytes);
+                        if let Err(error) =
+                            on_progress(completed_objects, total_objects, bytes_done, total_bytes)
+                        {
+                            progress_error = Some(error);
+                        }
                     }
-                }
-            },
-        );
-        tokio::select! {
-            result = download => result.map_err(to_err)?,
-            _ = cancellation.cancelled() => return Ok(false),
-        }
+                },
+            )
+            .await
+            .map_err(to_err)?;
         if let Some(error) = progress_error {
             return Err(error);
         }
-        match validate_local_remote_file(&local_path, &expected, cancellation).await? {
+        match validate_local_remote_file(&local_path, &expected).await? {
             LocalRemoteFileValidation::Valid => {}
             LocalRemoteFileValidation::Invalid => {
                 return Err(CommandError::new(
@@ -1168,7 +1111,6 @@ async fn download_recovery_metadata(
                     Some(serde_json::json!({ "path": object.path })),
                 ))
             }
-            LocalRemoteFileValidation::Canceled => return Ok(false),
         }
         completed_objects = completed_objects.checked_add(1).ok_or_else(|| {
             CommandError::new(
@@ -1193,7 +1135,7 @@ async fn download_recovery_metadata(
             total_bytes,
         )?;
     }
-    Ok(true)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1203,37 +1145,21 @@ async fn build_catalog_rebuild_snapshot(
     key: &KeyFile,
     paths: &LiosPaths,
     remote_objects: Vec<StorageObject>,
-    cancellation: &CancellationToken,
     on_progress: impl FnMut(u64, u64, u64, u64) -> CommandResult<()>,
-) -> CommandResult<Option<(Catalog, CatalogRebuildReport)>> {
-    if !download_recovery_metadata(
-        adapter,
-        repo,
-        &remote_objects,
-        &paths.staging,
-        cancellation,
-        on_progress,
-    )
-    .await?
-    {
-        return Ok(None);
-    }
-    rebuild_staged_catalog(key, paths, remote_objects, cancellation).await
+) -> CommandResult<(Catalog, CatalogRebuildReport)> {
+    download_recovery_metadata(adapter, repo, &remote_objects, &paths.staging, on_progress).await?;
+    rebuild_staged_catalog(key, paths, remote_objects).await
 }
 
 async fn rebuild_staged_catalog(
     key: &KeyFile,
     paths: &LiosPaths,
     remote_objects: Vec<StorageObject>,
-    cancellation: &CancellationToken,
-) -> CommandResult<Option<(Catalog, CatalogRebuildReport)>> {
+) -> CommandResult<(Catalog, CatalogRebuildReport)> {
     let staging_dir = paths.staging.clone();
     let key = key.clone();
-    let cancellation = cancellation.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        Catalog::rebuild_from_recovery_with_cancel(&key, staging_dir, &remote_objects, || {
-            cancellation.is_cancelled()
-        })
+    tokio::task::spawn_blocking(move || {
+        Catalog::rebuild_from_recovery(&key, staging_dir, &remote_objects)
     })
     .await
     .map_err(|error| {
@@ -1244,11 +1170,7 @@ async fn rebuild_staged_catalog(
             None,
         )
     })?
-    .map_err(to_err)?;
-    match outcome {
-        CatalogRebuildOutcome::Completed { catalog, report } => Ok(Some((catalog, report))),
-        CatalogRebuildOutcome::Canceled => Ok(None),
-    }
+    .map_err(to_err)
 }
 
 #[cfg(test)]
@@ -1301,29 +1223,20 @@ async fn ensure_verification_snapshot_is_current(
     branch_adapter: &ModelScopeAdapter,
     repo: &RepoConfig,
     started: &RepoRevision,
-    cancellation: &CancellationToken,
-) -> CommandResult<bool> {
-    let Some(finished) =
-        head_revision_with_cancellation(branch_adapter, repo, cancellation).await?
-    else {
-        return Ok(false);
-    };
+) -> CommandResult<()> {
+    let finished = head_revision(branch_adapter, repo).await?;
     ensure_verification_revision_unchanged(started, &finished)?;
-    Ok(true)
+    Ok(())
 }
 
-async fn head_revision_with_cancellation(
+async fn head_revision(
     adapter: &ModelScopeAdapter,
     repo: &RepoConfig,
-    cancellation: &CancellationToken,
-) -> CommandResult<Option<RepoRevision>> {
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => Ok(None),
-        result = adapter.head_revision(&repo.namespace, &repo.dataset) => {
-            result.map(Some).map_err(to_err)
-        }
-    }
+) -> CommandResult<RepoRevision> {
+    adapter
+        .head_revision(&repo.namespace, &repo.dataset)
+        .await
+        .map_err(to_err)
 }
 
 #[tauri::command]
@@ -1984,10 +1897,7 @@ async fn preview_rebuild_catalog(
         .try_lock_space(&scope.space_id)
         .map_err(CommandError::from)?;
     let branch_adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(&state.paths)?);
-    let cancellation = CancellationToken::new();
-    let started_revision = head_revision_with_cancellation(&branch_adapter, &repo, &cancellation)
-        .await?
-        .ok_or_else(|| CommandError::invalid_input("catalog rebuild preview was canceled"))?;
+    let started_revision = head_revision(&branch_adapter, &repo).await?;
     let revision = verification_commit_id(&started_revision)?.to_string();
     let adapter = branch_adapter.clone().with_revision(revision.clone());
     let remote_objects = adapter
@@ -2016,20 +1926,10 @@ async fn preview_rebuild_catalog(
             &key,
             &preview_paths,
             remote_objects,
-            &cancellation,
             |_done, _total, _bytes_done, _bytes_total| Ok(()),
         )
-        .await?
-        .ok_or_else(|| CommandError::invalid_input("catalog rebuild preview was canceled"))?;
-        ensure_verification_snapshot_is_current(
-            &branch_adapter,
-            &repo,
-            &started_revision,
-            &cancellation,
-        )
-        .await?
-        .then_some(())
-        .ok_or_else(|| CommandError::invalid_input("catalog rebuild preview was canceled"))?;
+        .await?;
+        ensure_verification_snapshot_is_current(&branch_adapter, &repo, &started_revision).await?;
         let (catalog, report) = rebuilt;
         let tree = catalog.decrypt_tree(&key).map_err(to_err)?;
         let warnings = catalog_rebuild_warnings(&report);
@@ -2250,14 +2150,13 @@ mod task_center_backend_tests {
     use lios_core::LiosError;
     use serde_json::json;
     use tempfile::tempdir;
-    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     use super::{
-        cleanup_is_safe, clear_task_record, list_task_items_for_paths, observed_task_interrupt,
-        paths_dto, persist_submission, recover_startup_tasks, recovery_key_status,
-        submission_summary, task_summaries_for_paths, AppContext, CommandError, CommandErrorCode,
-        SetupSnapshot, TaskUpdateEvent,
+        cleanup_is_safe, clear_task_record, list_task_items_for_paths, paths_dto,
+        persist_submission, recover_startup_tasks, recovery_key_status, submission_summary,
+        task_summaries_for_paths, AppContext, CommandError, CommandErrorCode, SetupSnapshot,
+        TaskUpdateEvent,
     };
 
     fn corrupt_task_item_state(paths: &LiosPaths, item_id: Uuid) {
@@ -2600,11 +2499,6 @@ mod task_center_backend_tests {
             .unwrap();
         drop(store);
 
-        assert_eq!(super::task_interrupt_core(&paths, active.id).unwrap(), None);
-        assert_eq!(
-            observed_task_interrupt(&paths, active.id, &CancellationToken::new()).unwrap(),
-            None
-        );
         assert!(!cleanup_is_safe(&paths).unwrap());
     }
 
@@ -2618,10 +2512,6 @@ mod task_center_backend_tests {
             .interrupt_task(task.id, TaskState::Canceled)
             .unwrap();
 
-        assert_eq!(
-            observed_task_interrupt(&paths, task.id, &CancellationToken::new()).unwrap(),
-            Some(TaskState::Canceled)
-        );
         assert_eq!(
             TaskStore::open(&paths.database)
                 .unwrap()
@@ -3184,23 +3074,21 @@ mod remote_verification_tests {
     #[cfg(windows)]
     use std::process::Command;
 
+    #[cfg(windows)]
+    use super::cleanup_terminal_task_staging_and_record;
+    use super::{
+        append_task_warning, cleanup_current_staging_cache, cleanup_terminal_task_staging,
+        cleanup_terminal_task_staging_after_restart_async, clear_task_record,
+        ensure_verification_revision_unchanged, map_remote_integrity_error,
+        validate_local_remote_file, verification_commit_id, CommandErrorCode,
+        LocalRemoteFileValidation,
+    };
     use lios_core::catalog::CatalogRemoteFile;
     use lios_core::config::{LiosPaths, RepoConfig};
     use lios_core::storage::RepoRevision;
     use lios_core::tasks::{TaskRecord, TaskSpec, TaskState, TaskStore};
     use lios_core::LiosError;
     use tempfile::tempdir;
-    use tokio_util::sync::CancellationToken;
-
-    #[cfg(windows)]
-    use super::cleanup_terminal_task_staging_and_record;
-    use super::{
-        append_task_warning, cleanup_current_staging_cache, cleanup_terminal_task_staging,
-        cleanup_terminal_task_staging_after_restart_async, clear_task_record,
-        ensure_verification_revision_unchanged, head_revision_with_cancellation,
-        map_remote_integrity_error, validate_local_remote_file, verification_commit_id,
-        CommandErrorCode, LocalRemoteFileValidation,
-    };
     use uuid::Uuid;
 
     fn verification_spec() -> TaskSpec {
@@ -3257,26 +3145,6 @@ mod remote_verification_tests {
         let error = verification_commit_id(&revision).unwrap_err();
 
         assert_eq!(error.code, CommandErrorCode::Storage);
-    }
-
-    #[tokio::test]
-    async fn revision_lookup_observes_preexisting_cancellation() {
-        let adapter =
-            lios_core::modelscope::ModelScopeAdapter::new("http://127.0.0.1:9", "unused-token");
-        let repo = RepoConfig {
-            namespace: "novix".to_string(),
-            dataset: "cold".to_string(),
-            endpoint: "https://modelscope.cn".to_string(),
-            title: None,
-        };
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-
-        let revision = head_revision_with_cancellation(&adapter, &repo, &cancellation)
-            .await
-            .unwrap();
-
-        assert_eq!(revision, None);
     }
 
     #[test]
@@ -3431,23 +3299,19 @@ mod remote_verification_tests {
     }
 
     #[tokio::test]
-    async fn cached_file_hashing_observes_cancellation() {
+    async fn cached_file_hashing_detects_mismatched_content() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("cached.lios");
         fs::write(&path, vec![7u8; 2 * 1024 * 1024]).unwrap();
         let file = CatalogRemoteFile {
             path: "objects/files/a/chunks/b.lios".to_string(),
             expected_size: Some(2 * 1024 * 1024),
-            sha256: Some("unused-after-cancel".to_string()),
+            sha256: Some("0".repeat(64)),
         };
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
 
-        let outcome = validate_local_remote_file(&path, &file, &cancellation)
-            .await
-            .unwrap();
+        let outcome = validate_local_remote_file(&path, &file).await.unwrap();
 
-        assert_eq!(outcome, LocalRemoteFileValidation::Canceled);
+        assert_eq!(outcome, LocalRemoteFileValidation::Invalid);
     }
 
     #[test]
