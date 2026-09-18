@@ -1899,10 +1899,7 @@ fn file_preview_type(name: &str) -> (&'static str, bool) {
     }
 }
 
-fn find_tree_node<'a>(
-    node: &'a CatalogTreeNode,
-    target_id: &str,
-) -> Option<&'a CatalogTreeNode> {
+fn find_tree_node<'a>(node: &'a CatalogTreeNode, target_id: &str) -> Option<&'a CatalogTreeNode> {
     if node.id == target_id {
         return Some(node);
     }
@@ -1951,39 +1948,70 @@ async fn preview_file_node(
         ));
     }
 
-    let temp_preview_dir = state.paths.staging.join(".preview-tmp");
-    fs::create_dir_all(&temp_preview_dir).map_err(to_err)?;
-    let temp_output_path = temp_preview_dir.join(&node.name);
+    let catalog_staging = snapshot
+        .local_path
+        .parent()
+        .ok_or_else(|| CommandError::invalid_input("catalog staging directory is unavailable"))?
+        .to_path_buf();
+    let temp_preview_dir = tempfile::Builder::new()
+        .prefix("lios-preview-")
+        .tempdir()
+        .map_err(to_err)?;
+    let temp_preview_path = temp_preview_dir.path().to_path_buf();
+    let temp_output_path = temp_preview_path.join(&node.name);
 
-    let prepared = prepare_download_task(vec![node_id.clone()], temp_preview_dir.display().to_string())?;
+    let prepared = prepare_download_task(
+        vec![node_id.clone()],
+        temp_preview_path.display().to_string(),
+    )?;
     let CatalogSelection::Nodes(node_ids) = prepared.selection else {
         return Err(CommandError::invalid_input("invalid selection"));
     };
 
     let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(&state.paths)?);
-    let catalog = Catalog::from_staging(state.paths.staging.clone());
-    let remote_files = catalog.remote_files_for_selection(&CatalogSelection::Nodes(node_ids), &key).map_err(to_err)?;
+    let catalog = Catalog::from_staging(catalog_staging.clone());
+    let remote_files = catalog
+        .remote_files_for_selection(&CatalogSelection::Nodes(node_ids), &key)
+        .map_err(to_err)?;
 
     for file in &remote_files {
-        let local_path = remote_to_staging_path(&state.paths.staging, &file.path)?;
+        let local_path = remote_to_staging_path(&catalog_staging, &file.path)?;
         if !local_path.exists() {
-            adapter.download_object(&repo.namespace, &repo.dataset, &file.path, &local_path).await.map_err(to_err)?;
+            adapter
+                .download_object(&repo.namespace, &repo.dataset, &file.path, &local_path)
+                .await
+                .map_err(to_err)?;
         }
     }
 
     let restore_options = lios_core::restore::RestoreOptions {
-        output_dir: temp_preview_dir.clone(),
+        output_dir: temp_preview_path,
         conflict_policy: lios_core::restore::RestoreConflictPolicy::Rename,
     };
-    catalog.restore(CatalogSelection::Nodes(vec![node_id]), &key, restore_options).map_err(to_err)?;
+    catalog
+        .restore(
+            CatalogSelection::Nodes(vec![node_id]),
+            &key,
+            restore_options,
+        )
+        .map_err(to_err)?;
 
     let read_bytes = fs::read(&temp_output_path).map_err(to_err)?;
     let _ = fs::remove_file(&temp_output_path);
 
     let (text, data_url) = if is_text {
-        (Some(String::from_utf8_lossy(&read_bytes).into_owned()), None)
+        (
+            Some(String::from_utf8_lossy(&read_bytes).into_owned()),
+            None,
+        )
     } else {
-        (None, Some(format!("data:{mime_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(&read_bytes))))
+        (
+            None,
+            Some(format!(
+                "data:{mime_type};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&read_bytes)
+            )),
+        )
     };
 
     Ok(FilePreviewResult {

@@ -387,6 +387,7 @@ function App() {
   const catalogMutationCompletions = useRef<Set<string>>(new Set());
   const catalogMutationCompletionBaselineReady = useRef(false);
   const rebuildPreviewRequest = useRef(0);
+  const previewRequest = useRef(0);
 
   // New states for enhanced interaction
   const [sortField, setSortField] = useState<SortField>("name");
@@ -924,6 +925,8 @@ function App() {
 
   async function openFilePreview(item: DriveItem) {
     if (!activeSpace) return;
+    const requestId = ++previewRequest.current;
+    const spaceName = activeSpace.space_name;
     setPreviewItem(item);
     setPreviewOpen(true);
     setPreviewLoading(true);
@@ -938,17 +941,20 @@ function App() {
         text?: string;
         data_url?: string;
       }>("preview_file_node", {
-        spaceName: activeSpace.space_name,
+        spaceName,
         nodeId: item.id
       });
+      if (requestId !== previewRequest.current) return;
       setPreviewContent({
         isText: res.is_text,
         text: res.text,
         dataUrl: res.data_url
       });
     } catch (err) {
+      if (requestId !== previewRequest.current) return;
       setPreviewError(errorText(err));
     } finally {
+      if (requestId !== previewRequest.current) return;
       setPreviewLoading(false);
     }
   }
@@ -1982,6 +1988,7 @@ function App() {
           onPrev={handlePrevPreview}
           onNext={handleNextPreview}
           onClose={() => {
+            previewRequest.current += 1;
             setPreviewOpen(false);
             setPreviewItem(null);
           }}
