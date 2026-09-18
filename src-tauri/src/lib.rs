@@ -73,7 +73,6 @@ use task_support::{persist_submission, snapshot_upload_sources, TaskScope};
 #[cfg(test)]
 use task_support::{retry_backoff, TransferMetrics};
 use tauri::Manager;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -84,12 +83,6 @@ struct AppContext {
     app_log: AppLogger,
     catalog_mutation_gate: CatalogMutationGate,
     config_mutation_gate: ConfigMutationGate,
-    task_lifecycle_gate: Mutex<TaskLifecycleState>,
-}
-
-#[derive(Default)]
-struct TaskLifecycleState {
-    active_workers: HashSet<Uuid>,
 }
 
 impl AppContext {
@@ -109,7 +102,6 @@ impl AppContext {
             app_log,
             catalog_mutation_gate: CatalogMutationGate::default(),
             config_mutation_gate: ConfigMutationGate::default(),
-            task_lifecycle_gate: Mutex::new(TaskLifecycleState::default()),
         }
     }
 }
@@ -259,16 +251,6 @@ fn task_interrupt_core(paths: &LiosPaths, id: Uuid) -> lios_core::Result<Option<
 }
 
 #[cfg(test)]
-fn insert_task(paths: &LiosPaths, task: &TaskRecord) -> CommandResult<()> {
-    task_store(paths)?.insert(task).map_err(to_err)
-}
-
-#[cfg(test)]
-fn update_task_phase(paths: &LiosPaths, id: Uuid, phase: Option<String>) -> CommandResult<()> {
-    task_store(paths)?.update_phase(id, phase).map_err(to_err)
-}
-
-#[cfg(test)]
 fn transaction_phase_label(phase: CatalogTransactionPhase) -> &'static str {
     match phase {
         CatalogTransactionPhase::ValidateBlobs => "validating",
@@ -363,52 +345,6 @@ fn persist_transaction_progress(
         emit_task(app, paths, task.id);
     }
     Ok(())
-}
-
-#[cfg(test)]
-fn update_task_state(
-    paths: &LiosPaths,
-    id: Uuid,
-    state: TaskState,
-    error: Option<String>,
-) -> CommandResult<()> {
-    task_store(paths)?
-        .update_state(id, state, error)
-        .map_err(to_err)
-}
-
-#[cfg(test)]
-fn update_terminal_task_items(
-    paths: &LiosPaths,
-    task_id: Uuid,
-    state: &TaskState,
-    error: Option<String>,
-) -> CommandResult<()> {
-    let store = task_store(paths)?;
-    match state {
-        TaskState::Completed => store
-            .update_items_state(task_id, TaskItemState::Completed, None, None, true)
-            .map_err(to_err),
-        TaskState::Failed => store
-            .update_items_state(
-                task_id,
-                TaskItemState::Failed,
-                None,
-                Some(error.unwrap_or_else(|| "task failed".to_string())),
-                false,
-            )
-            .map_err(to_err),
-        TaskState::Canceled => store
-            .update_items_state(
-                task_id,
-                TaskItemState::Canceled,
-                None,
-                Some("task canceled".to_string()),
-                false,
-            )
-            .map_err(to_err),
-        _ => Ok(()),
-    }
 }
 
 fn read_token(paths: &LiosPaths) -> CommandResult<String> {
@@ -582,66 +518,7 @@ fn cleanup_current_staging_cache(
     Ok(report)
 }
 
-#[cfg(test)]
-async fn activate_new_task(
-    paths: &LiosPaths,
-    gate: &Mutex<TaskLifecycleState>,
-    mut task: TaskRecord,
-) -> CommandResult<TaskRecord> {
-    let mut lifecycle = gate.lock().await;
-    insert_task(paths, &task)?;
-    update_task_state(paths, task.id, TaskState::Running, None)?;
-    lifecycle.active_workers.insert(task.id);
-    task.state = TaskState::Running;
-    Ok(task)
-}
-
-#[cfg(test)]
-async fn activate_existing_task(
-    paths: &LiosPaths,
-    gate: &Mutex<TaskLifecycleState>,
-    task_id: Uuid,
-    state: TaskState,
-) -> CommandResult<()> {
-    set_task_state(paths, gate, task_id, state, None).await
-}
-
-#[cfg(test)]
-async fn set_task_state(
-    paths: &LiosPaths,
-    gate: &Mutex<TaskLifecycleState>,
-    task_id: Uuid,
-    state: TaskState,
-    error: Option<String>,
-) -> CommandResult<()> {
-    let _lifecycle = gate.lock().await;
-    update_task_state(paths, task_id, state, error)
-}
-
-#[cfg(test)]
-async fn interrupt_task_state(
-    paths: &LiosPaths,
-    gate: &Mutex<TaskLifecycleState>,
-    task_id: Uuid,
-    state: TaskState,
-) -> CommandResult<()> {
-    let _lifecycle = gate.lock().await;
-    if task_store(paths)?
-        .interrupt_task(task_id, state)
-        .map_err(to_err)?
-    {
-        Ok(())
-    } else {
-        Err(CommandError::invalid_input(
-            "task cannot be interrupted after catalog publication has started",
-        ))
-    }
-}
-
-fn cleanup_is_safe(paths: &LiosPaths, lifecycle: &TaskLifecycleState) -> CommandResult<bool> {
-    if !lifecycle.active_workers.is_empty() {
-        return Ok(false);
-    }
+fn cleanup_is_safe(paths: &LiosPaths) -> CommandResult<bool> {
     Ok(!task_store(paths)?
         .list_summaries()
         .map_err(to_err)?
@@ -651,130 +528,19 @@ fn cleanup_is_safe(paths: &LiosPaths, lifecycle: &TaskLifecycleState) -> Command
 
 async fn cleanup_if_idle<T>(
     paths: &LiosPaths,
-    gate: &Mutex<TaskLifecycleState>,
     cleanup: impl FnOnce() -> CommandResult<T>,
 ) -> CommandResult<Option<T>> {
-    let lifecycle = gate.lock().await;
-    if !cleanup_is_safe(paths, &lifecycle)? {
+    if !cleanup_is_safe(paths)? {
         return Ok(None);
     }
     cleanup().map(Some)
 }
-
-#[cfg(test)]
-async fn finish_active_worker(
-    paths: &LiosPaths,
-    gate: &Mutex<TaskLifecycleState>,
-    catalog_mutation_gate: &CatalogMutationGate,
-    task_id: Uuid,
-    intended_state: TaskState,
-    error: Option<String>,
-) -> CommandResult<TaskState> {
-    finish_worker(
-        paths,
-        gate,
-        catalog_mutation_gate,
-        task_id,
-        intended_state,
-        error,
-        true,
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn finish_worker(
-    paths: &LiosPaths,
-    gate: &Mutex<TaskLifecycleState>,
-    catalog_mutation_gate: &CatalogMutationGate,
-    task_id: Uuid,
-    intended_state: TaskState,
-    error: Option<String>,
-    preserve_control_state: bool,
-) -> CommandResult<TaskState> {
-    let _shared_staging_guard = catalog_mutation_gate.lock_shared_staging().await;
-    let mut lifecycle = gate.lock().await;
-    let result = (|| {
-        let current_state = task_store(paths)?
-            .get_summary(task_id)
-            .map_err(to_err)?
-            .map(|task| task.state);
-        let final_state = match (preserve_control_state, current_state) {
-            (true, Some(TaskState::Canceled)) => TaskState::Canceled,
-            (true, Some(TaskState::Paused)) => TaskState::Paused,
-            _ => intended_state,
-        };
-        let final_error = match final_state {
-            TaskState::Failed | TaskState::Completed => error,
-            _ => None,
-        };
-        if !preserve_control_state && final_state == TaskState::Completed {
-            task_store(paths)?
-                .mark_checkpoints_committed(task_id)
-                .map_err(to_err)?;
-        }
-        update_task_phase(paths, task_id, None)?;
-        update_task_state(paths, task_id, final_state.clone(), final_error.clone())?;
-        update_terminal_task_items(paths, task_id, &final_state, final_error)?;
-        Ok(final_state)
-    })();
-    lifecycle.active_workers.remove(&task_id);
-    if cleanup_is_safe(paths, &lifecycle).unwrap_or(false) {
-        let _ = cleanup_current_staging_cache(paths, true, false);
-    }
-    result
-}
-
-#[cfg(test)]
-async fn finish_committed_worker(
-    paths: &LiosPaths,
-    gate: &Mutex<TaskLifecycleState>,
-    catalog_mutation_gate: &CatalogMutationGate,
-    task_id: Uuid,
-) -> CommandResult<TaskState> {
-    let _shared_staging_guard = catalog_mutation_gate.lock_shared_staging().await;
-    let mut lifecycle = gate.lock().await;
-    let result = (|| {
-        let mut store = TaskStore::open(&paths.database).map_err(to_err)?;
-        if store.complete_reconciled_commit(task_id).map_err(to_err)?
-            || store
-                .get_summary(task_id)
-                .map_err(to_err)?
-                .is_some_and(|task| task.state == TaskState::Completed)
-        {
-            Ok(TaskState::Completed)
-        } else {
-            Err(CommandError::new(
-                CommandErrorCode::CorruptedData,
-                "committed task changed state before atomic finalization",
-                false,
-                None,
-            ))
-        }
-    })();
-    lifecycle.active_workers.remove(&task_id);
-    if cleanup_is_safe(paths, &lifecycle).unwrap_or(false) {
-        let _ = cleanup_current_staging_cache(paths, true, false);
-    }
-    result
-}
-
-async fn clear_task_record(
-    paths: &LiosPaths,
-    gate: &Mutex<TaskLifecycleState>,
-    task_id: Uuid,
-) -> CommandResult<()> {
-    let lifecycle = gate.lock().await;
-    if lifecycle.active_workers.contains(&task_id) {
-        return Err(CommandError::invalid_input(
-            "active worker task cannot be cleared",
-        ));
-    }
+async fn clear_task_record(paths: &LiosPaths, task_id: Uuid) -> CommandResult<()> {
     let store = task_store(paths)?;
     let task = store.get_summary(task_id).map_err(to_err)?;
     if task
         .as_ref()
-        .is_some_and(|task| task_state_blocks_clear(&task.state))
+        .is_some_and(|task| task_state_is_active(&task.state))
     {
         return Err(CommandError::invalid_input("active task cannot be cleared"));
     }
@@ -793,21 +559,7 @@ async fn clear_task_record(
             }
         }
     }
-    let result = store.delete(task_id).map_err(to_err);
-    drop(lifecycle);
-    result
-}
-
-fn task_state_blocks_clear(state: &TaskState) -> bool {
-    matches!(
-        state,
-        TaskState::Queued
-            | TaskState::Preparing
-            | TaskState::Running
-            | TaskState::Paused
-            | TaskState::Retrying
-            | TaskState::Committing
-    )
+    store.delete(task_id).map_err(to_err)
 }
 
 fn task_state_is_active(state: &TaskState) -> bool {
@@ -2364,7 +2116,7 @@ async fn cleanup_local_cache(
     state: tauri::State<'_, AppContext>,
 ) -> CommandResult<CacheCleanupReport> {
     let _shared_staging_guard = state.catalog_mutation_gate.lock_shared_staging().await;
-    match cleanup_if_idle(&state.paths, &state.task_lifecycle_gate, || {
+    match cleanup_if_idle(&state.paths, || {
         cleanup_current_staging_cache(&state.paths, true, false)
     })
     .await?
@@ -2446,7 +2198,7 @@ async fn clear_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    clear_task_record(&state.paths, &state.task_lifecycle_gate, task_id).await?;
+    clear_task_record(&state.paths, task_id).await?;
     emit_removed_tasks(&app, vec![task_id]);
     Ok(())
 }
@@ -2500,16 +2252,14 @@ mod task_center_backend_tests {
     use lios_core::LiosError;
     use serde_json::json;
     use tempfile::tempdir;
-    use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     use super::{
-        activate_new_task, cleanup_is_safe, clear_task_record, finish_active_worker,
-        interrupt_task_state, list_task_items_for_paths, observed_task_interrupt, paths_dto,
-        persist_submission, recover_startup_tasks, recovery_key_status, submission_summary,
-        task_summaries_for_paths, AppContext, CatalogMutationGate, CommandError, CommandErrorCode,
-        SetupSnapshot, TaskLifecycleState, TaskUpdateEvent,
+        cleanup_is_safe, clear_task_record, list_task_items_for_paths, observed_task_interrupt,
+        paths_dto, persist_submission, recover_startup_tasks, recovery_key_status,
+        submission_summary, task_summaries_for_paths, AppContext, CommandError, CommandErrorCode,
+        SetupSnapshot, TaskUpdateEvent,
     };
 
     fn corrupt_task_item_state(paths: &LiosPaths, item_id: Uuid) {
@@ -2623,25 +2373,16 @@ mod task_center_backend_tests {
 
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
-        let lifecycle = Mutex::new(TaskLifecycleState::default());
-        let catalog_mutation_gate = CatalogMutationGate::default();
-        let task = activate_new_task(&paths, &lifecycle, TaskRecord::queued("upload", 1))
-            .await
-            .unwrap();
+        let task = TaskRecord::queued("upload", 1);
+        let store = TaskStore::open(&paths.database).unwrap();
+        store.insert(&task).unwrap();
         let error = CommandError::from(LiosError::Unsupported(format!(
             "source paths no longer exist: {WINDOWS_SENTINEL}; {UNIX_SENTINEL}"
         )));
-
-        let final_state = finish_active_worker(
-            &paths,
-            &lifecycle,
-            &catalog_mutation_gate,
-            task.id,
-            TaskState::Failed,
-            Some(error.message),
-        )
-        .await
-        .unwrap();
+        store
+            .update_state(task.id, TaskState::Failed, Some(error.message))
+            .unwrap();
+        drop(store);
         let summary = TaskStore::open(&paths.database)
             .unwrap()
             .get_summary(task.id)
@@ -2652,7 +2393,6 @@ mod task_center_backend_tests {
         })
         .unwrap();
 
-        assert_eq!(final_state, TaskState::Failed);
         assert_eq!(
             summary.error.as_deref(),
             Some("selected sources no longer exist")
@@ -2864,7 +2604,7 @@ mod task_center_backend_tests {
             observed_task_interrupt(&paths, active.id, &CancellationToken::new()).unwrap(),
             None
         );
-        assert!(!cleanup_is_safe(&paths, &TaskLifecycleState::default()).unwrap());
+        assert!(!cleanup_is_safe(&paths).unwrap());
     }
 
     #[tokio::test]
@@ -2872,10 +2612,9 @@ mod task_center_backend_tests {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         let task = insert_malformed_task(&paths, TaskState::Running);
-        let lifecycle = Mutex::new(TaskLifecycleState::default());
-
-        interrupt_task_state(&paths, &lifecycle, task.id, TaskState::Canceled)
-            .await
+        TaskStore::open(&paths.database)
+            .unwrap()
+            .interrupt_task(task.id, TaskState::Canceled)
             .unwrap();
 
         assert_eq!(
@@ -2898,25 +2637,10 @@ mod task_center_backend_tests {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         let paused = insert_malformed_task(&paths, TaskState::Paused);
-        let lifecycle = Mutex::new(TaskLifecycleState::default());
-
-        let final_state = finish_active_worker(
-            &paths,
-            &lifecycle,
-            &CatalogMutationGate::default(),
-            paused.id,
-            TaskState::Completed,
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(final_state, TaskState::Paused);
+        assert!(clear_task_record(&paths, paused.id).await.is_err());
 
         let completed = insert_malformed_task(&paths, TaskState::Completed);
-        clear_task_record(&paths, &lifecycle, completed.id)
-            .await
-            .unwrap();
+        clear_task_record(&paths, completed.id).await.unwrap();
         assert!(TaskStore::open(&paths.database)
             .unwrap()
             .get_summary(completed.id)
@@ -3272,22 +2996,15 @@ mod task_checkpoint_tests {
 
 #[cfg(test)]
 mod task_cleanup_tests {
-    use std::{fs, sync::Arc, time::Duration};
-
     use lios_core::config::{LiosPaths, RepoConfig};
-    use lios_core::tasks::{
-        CheckpointState, TaskObjectCheckpoint, TaskRecord, TaskSpec, TaskState, TaskStore,
-    };
+    use lios_core::tasks::{TaskRecord, TaskSpec, TaskState, TaskStore};
     use tempfile::tempdir;
-    use tokio::sync::{oneshot, Mutex};
 
     use super::{
-        activate_existing_task, activate_new_task, cleanup_current_staging_cache, cleanup_if_idle,
-        clear_task_record, finish_active_worker, finish_committed_worker, group_startup_tasks,
-        reconciliation_error_should_wait, recover_startup_tasks, retry_storage_operation,
-        set_task_state, startup_reconciliation_terminal_error, task_state_blocks_clear,
-        task_state_is_active, CatalogMutationGate, CommandError, CommandErrorCode,
-        StartupReconciliationOutcome, StartupTaskRecovery, TaskLifecycleState,
+        clear_task_record, group_startup_tasks, reconciliation_error_should_wait,
+        recover_startup_tasks, retry_storage_operation, startup_reconciliation_terminal_error,
+        task_state_is_active, CommandError, CommandErrorCode, StartupReconciliationOutcome,
+        StartupTaskRecovery,
     };
 
     #[test]
@@ -3441,18 +3158,13 @@ mod task_cleanup_tests {
             TaskState::Retrying,
             TaskState::Committing,
         ] {
-            assert!(task_state_blocks_clear(&state));
             let temp = tempdir().unwrap();
             let paths = LiosPaths::from_home(temp.path());
             let task = TaskRecord::queued("persisted active", 0);
             let store = TaskStore::open(&paths.database).unwrap();
             store.insert(&task).unwrap();
             store.update_state(task.id, state.clone(), None).unwrap();
-            let lifecycle = Mutex::new(TaskLifecycleState::default());
-
-            let error = clear_task_record(&paths, &lifecycle, task.id)
-                .await
-                .unwrap_err();
+            let error = clear_task_record(&paths, task.id).await.unwrap_err();
 
             assert_eq!(error.code, CommandErrorCode::InvalidInput, "{state:?}");
             assert!(TaskStore::open(&paths.database)
@@ -3462,412 +3174,6 @@ mod task_cleanup_tests {
                 .iter()
                 .any(|record| record.id == task.id));
         }
-    }
-
-    #[tokio::test]
-    async fn active_task_staging_survives_another_task_finishing() {
-        let temp = tempdir().unwrap();
-        let paths = LiosPaths::from_home(temp.path());
-        paths.ensure_dirs().unwrap();
-        let staged = paths.staging.join("other-task.download");
-        fs::write(&staged, b"still active").unwrap();
-        let store = TaskStore::open(&paths.database).unwrap();
-        let active = TaskRecord::queued("active", 1);
-        store.insert(&active).unwrap();
-        store
-            .update_state(active.id, TaskState::Running, None)
-            .unwrap();
-        let completed = TaskRecord::queued("completed", 1);
-        store.insert(&completed).unwrap();
-        store
-            .update_state(completed.id, TaskState::Completed, None)
-            .unwrap();
-
-        let gate = Mutex::new(TaskLifecycleState::default());
-        let skipped = cleanup_if_idle(&paths, &gate, || {
-            cleanup_current_staging_cache(&paths, true, false)
-        })
-        .await
-        .unwrap();
-
-        assert!(skipped.is_none());
-        assert!(staged.exists());
-    }
-
-    #[tokio::test]
-    async fn task_end_cleanup_runs_after_all_tasks_are_inactive() {
-        let temp = tempdir().unwrap();
-        let paths = LiosPaths::from_home(temp.path());
-        paths.ensure_dirs().unwrap();
-        let staged = paths.staging.join("finished.download");
-        fs::write(&staged, b"finished").unwrap();
-        let store = TaskStore::open(&paths.database).unwrap();
-        let completed = TaskRecord::queued("completed", 1);
-        store.insert(&completed).unwrap();
-        store
-            .update_state(completed.id, TaskState::Completed, None)
-            .unwrap();
-
-        let gate = Mutex::new(TaskLifecycleState::default());
-        let cleaned = cleanup_if_idle(&paths, &gate, || {
-            cleanup_current_staging_cache(&paths, true, false)
-        })
-        .await
-        .unwrap();
-
-        assert!(cleaned.is_some());
-        assert!(!staged.exists());
-    }
-
-    #[tokio::test]
-    async fn completed_worker_preserves_warning_text() {
-        let temp = tempdir().unwrap();
-        let paths = LiosPaths::from_home(temp.path());
-        let lifecycle = Mutex::new(TaskLifecycleState::default());
-        let catalog_mutation_gate = CatalogMutationGate::default();
-        let task = activate_new_task(&paths, &lifecycle, TaskRecord::queued("verify_quick", 1))
-            .await
-            .unwrap();
-        let warning = "1 个旧版分片缺少长度元数据";
-
-        let final_state = finish_active_worker(
-            &paths,
-            &lifecycle,
-            &catalog_mutation_gate,
-            task.id,
-            TaskState::Completed,
-            Some(warning.to_string()),
-        )
-        .await
-        .unwrap();
-
-        let completed = TaskStore::open(&paths.database)
-            .unwrap()
-            .get(task.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(final_state, TaskState::Completed);
-        assert_eq!(completed.state, TaskState::Completed);
-        assert_eq!(completed.error.as_deref(), Some(warning));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn activation_cannot_enter_between_cleanup_check_and_deletion() {
-        let temp = tempdir().unwrap();
-        let paths = LiosPaths::from_home(temp.path());
-        paths.ensure_dirs().unwrap();
-        let stale_staged = paths.staging.join("stale.download");
-        let active_staged = paths.staging.join("active.download");
-        fs::write(&stale_staged, b"stale").unwrap();
-
-        let gate = Arc::new(Mutex::new(TaskLifecycleState::default()));
-        let cleanup_paths = paths.clone();
-        let deletion_paths = cleanup_paths.clone();
-        let cleanup_gate = Arc::clone(&gate);
-        let (checked_tx, checked_rx) = oneshot::channel();
-        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
-        let cleanup = tokio::spawn(async move {
-            cleanup_if_idle(&cleanup_paths, cleanup_gate.as_ref(), move || {
-                checked_tx.send(()).unwrap();
-                continue_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                cleanup_current_staging_cache(&deletion_paths, true, false)
-            })
-            .await
-        });
-        checked_rx.await.unwrap();
-
-        let activation_paths = paths.clone();
-        let activation_gate = Arc::clone(&gate);
-        let activation_staged = active_staged.clone();
-        let (attempted_tx, attempted_rx) = oneshot::channel();
-        let activation = tokio::spawn(async move {
-            attempted_tx.send(()).unwrap();
-            let task = activate_new_task(
-                &activation_paths,
-                activation_gate.as_ref(),
-                TaskRecord::queued("active", 1),
-            )
-            .await
-            .unwrap();
-            fs::write(&activation_staged, b"active").unwrap();
-            task
-        });
-        attempted_rx.await.unwrap();
-        tokio::task::yield_now().await;
-
-        assert!(!activation.is_finished());
-        assert!(TaskStore::open(&paths.database)
-            .unwrap()
-            .list()
-            .unwrap()
-            .is_empty());
-
-        continue_tx.send(()).unwrap();
-        assert!(cleanup.await.unwrap().unwrap().is_some());
-        let activated = activation.await.unwrap();
-        assert_eq!(activated.state, TaskState::Running);
-        assert!(!stale_staged.exists());
-        assert!(active_staged.exists());
-
-        let skipped = cleanup_if_idle(&paths, gate.as_ref(), || {
-            cleanup_current_staging_cache(&paths, true, false)
-        })
-        .await
-        .unwrap();
-        assert!(skipped.is_none());
-        assert!(active_staged.exists());
-    }
-
-    #[tokio::test]
-    async fn existing_task_reactivation_waits_for_lifecycle_gate() {
-        let temp = tempdir().unwrap();
-        let paths = LiosPaths::from_home(temp.path());
-        let store = TaskStore::open(&paths.database).unwrap();
-        let paused = TaskRecord::queued("paused", 1);
-        store.insert(&paused).unwrap();
-        store
-            .update_state(paused.id, TaskState::Paused, None)
-            .unwrap();
-
-        let gate = Arc::new(Mutex::new(TaskLifecycleState::default()));
-        let guard = gate.lock().await;
-        let activation_paths = paths.clone();
-        let activation_gate = Arc::clone(&gate);
-        let task_id = paused.id;
-        let activation = tokio::spawn(async move {
-            activate_existing_task(
-                &activation_paths,
-                activation_gate.as_ref(),
-                task_id,
-                TaskState::Queued,
-            )
-            .await
-        });
-        tokio::task::yield_now().await;
-
-        let state_while_locked = store
-            .list()
-            .unwrap()
-            .into_iter()
-            .find(|task| task.id == paused.id)
-            .unwrap()
-            .state;
-        assert_eq!(state_while_locked, TaskState::Paused);
-
-        drop(guard);
-        activation.await.unwrap().unwrap();
-        let state_after_release = store
-            .list()
-            .unwrap()
-            .into_iter()
-            .find(|task| task.id == paused.id)
-            .unwrap()
-            .state;
-        assert_eq!(state_after_release, TaskState::Queued);
-    }
-
-    #[tokio::test]
-    async fn canceled_worker_blocks_cleanup_until_exit_is_acknowledged() {
-        let temp = tempdir().unwrap();
-        let paths = LiosPaths::from_home(temp.path());
-        paths.ensure_dirs().unwrap();
-        let staged = paths.staging.join("blocked-transfer.download");
-        fs::write(&staged, b"worker still owns this").unwrap();
-        let lifecycle = Mutex::new(TaskLifecycleState::default());
-        let catalog_mutation_gate = CatalogMutationGate::default();
-
-        let task = activate_new_task(&paths, &lifecycle, TaskRecord::queued("blocked delete", 1))
-            .await
-            .unwrap();
-        set_task_state(&paths, &lifecycle, task.id, TaskState::Canceled, None)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            TaskStore::open(&paths.database)
-                .unwrap()
-                .list()
-                .unwrap()
-                .into_iter()
-                .find(|record| record.id == task.id)
-                .unwrap()
-                .state,
-            TaskState::Canceled
-        );
-        assert!(lifecycle.lock().await.active_workers.contains(&task.id));
-
-        let skipped = cleanup_if_idle(&paths, &lifecycle, || {
-            cleanup_current_staging_cache(&paths, true, false)
-        })
-        .await
-        .unwrap();
-        assert!(skipped.is_none());
-        assert!(staged.exists());
-
-        let final_state = finish_active_worker(
-            &paths,
-            &lifecycle,
-            &catalog_mutation_gate,
-            task.id,
-            TaskState::Completed,
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(final_state, TaskState::Canceled);
-        assert!(!lifecycle.lock().await.active_workers.contains(&task.id));
-        assert!(!staged.exists());
-        assert_eq!(
-            TaskStore::open(&paths.database)
-                .unwrap()
-                .list()
-                .unwrap()
-                .into_iter()
-                .find(|record| record.id == task.id)
-                .unwrap()
-                .state,
-            TaskState::Canceled
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_rejects_registered_canceled_and_paused_workers_until_exit() {
-        for controlled_state in [TaskState::Canceled, TaskState::Paused] {
-            let temp = tempdir().unwrap();
-            let paths = LiosPaths::from_home(temp.path());
-            let lifecycle = Mutex::new(TaskLifecycleState::default());
-            let catalog_mutation_gate = CatalogMutationGate::default();
-            let task = activate_new_task(
-                &paths,
-                &lifecycle,
-                TaskRecord::queued("controlled worker", 1),
-            )
-            .await
-            .unwrap();
-            set_task_state(&paths, &lifecycle, task.id, controlled_state.clone(), None)
-                .await
-                .unwrap();
-
-            let error = clear_task_record(&paths, &lifecycle, task.id)
-                .await
-                .unwrap_err();
-            assert_eq!(error.code, CommandErrorCode::InvalidInput);
-            assert!(TaskStore::open(&paths.database)
-                .unwrap()
-                .list()
-                .unwrap()
-                .iter()
-                .any(|record| record.id == task.id));
-
-            let final_state = finish_active_worker(
-                &paths,
-                &lifecycle,
-                &catalog_mutation_gate,
-                task.id,
-                TaskState::Completed,
-                None,
-            )
-            .await
-            .unwrap();
-            assert_eq!(final_state, controlled_state);
-
-            if controlled_state == TaskState::Paused {
-                let error = clear_task_record(&paths, &lifecycle, task.id)
-                    .await
-                    .unwrap_err();
-                assert_eq!(error.code, CommandErrorCode::InvalidInput);
-                set_task_state(&paths, &lifecycle, task.id, TaskState::Canceled, None)
-                    .await
-                    .unwrap();
-            }
-            clear_task_record(&paths, &lifecycle, task.id)
-                .await
-                .unwrap();
-            assert!(TaskStore::open(&paths.database)
-                .unwrap()
-                .list()
-                .unwrap()
-                .iter()
-                .all(|record| record.id != task.id));
-        }
-    }
-
-    #[tokio::test]
-    async fn committed_worker_ignores_a_late_cancel_state() {
-        let temp = tempdir().unwrap();
-        let paths = LiosPaths::from_home(temp.path());
-        let lifecycle = Mutex::new(TaskLifecycleState::default());
-        let catalog_mutation_gate = CatalogMutationGate::default();
-        let task = activate_new_task(
-            &paths,
-            &lifecycle,
-            TaskRecord::queued("committed upload", 1),
-        )
-        .await
-        .unwrap();
-        TaskStore::open(&paths.database)
-            .unwrap()
-            .upsert_checkpoint(&TaskObjectCheckpoint {
-                task_id: task.id,
-                remote_path: "catalog.enc".to_string(),
-                oid: "a".repeat(64),
-                size: 10,
-                state: CheckpointState::Pending,
-            })
-            .unwrap();
-        set_task_state(&paths, &lifecycle, task.id, TaskState::Canceled, None)
-            .await
-            .unwrap();
-
-        let final_state =
-            finish_committed_worker(&paths, &lifecycle, &catalog_mutation_gate, task.id)
-                .await
-                .unwrap();
-
-        assert_eq!(final_state, TaskState::Completed);
-        assert_eq!(
-            TaskStore::open(&paths.database)
-                .unwrap()
-                .list()
-                .unwrap()
-                .into_iter()
-                .find(|record| record.id == task.id)
-                .unwrap()
-                .state,
-            TaskState::Completed
-        );
-        assert_eq!(
-            TaskStore::open(&paths.database)
-                .unwrap()
-                .list_checkpoints(task.id)
-                .unwrap()[0]
-                .state,
-            CheckpointState::Committed
-        );
-    }
-
-    #[tokio::test]
-    async fn finalization_failure_still_deregisters_the_active_worker() {
-        let temp = tempdir().unwrap();
-        let paths = LiosPaths::from_home(temp.path());
-        let lifecycle = Mutex::new(TaskLifecycleState::default());
-        let catalog_mutation_gate = CatalogMutationGate::default();
-        let task = activate_new_task(
-            &paths,
-            &lifecycle,
-            TaskRecord::queued("committed upload", 1),
-        )
-        .await
-        .unwrap();
-        fs::remove_file(&paths.database).unwrap();
-        fs::create_dir(&paths.database).unwrap();
-
-        let result =
-            finish_committed_worker(&paths, &lifecycle, &catalog_mutation_gate, task.id).await;
-
-        assert!(result.is_err());
-        assert!(!lifecycle.lock().await.active_workers.contains(&task.id));
     }
 }
 
@@ -3883,7 +3189,6 @@ mod remote_verification_tests {
     use lios_core::tasks::{TaskRecord, TaskSpec, TaskState, TaskStore};
     use lios_core::LiosError;
     use tempfile::tempdir;
-    use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
     #[cfg(windows)]
@@ -3893,7 +3198,7 @@ mod remote_verification_tests {
         cleanup_terminal_task_staging_after_restart_async, clear_task_record,
         ensure_verification_revision_unchanged, head_revision_with_cancellation,
         map_remote_integrity_error, validate_local_remote_file, verification_commit_id,
-        CommandErrorCode, LocalRemoteFileValidation, TaskLifecycleState,
+        CommandErrorCode, LocalRemoteFileValidation,
     };
     use uuid::Uuid;
 
@@ -4187,9 +3492,7 @@ mod remote_verification_tests {
         task_paths.ensure_dirs().unwrap();
         fs::write(task_paths.staging.join("cached.lios"), b"cached").unwrap();
 
-        clear_task_record(&paths, &Mutex::new(TaskLifecycleState::default()), task.id)
-            .await
-            .unwrap();
+        clear_task_record(&paths, task.id).await.unwrap();
 
         assert!(!task_paths.staging.exists());
         assert!(TaskStore::open(&paths.database)
@@ -4227,9 +3530,7 @@ mod remote_verification_tests {
         task_paths.ensure_dirs().unwrap();
         fs::write(task_paths.staging.join("chunk.lios"), b"downloaded").unwrap();
 
-        clear_task_record(&paths, &Mutex::new(TaskLifecycleState::default()), task.id)
-            .await
-            .unwrap();
+        clear_task_record(&paths, task.id).await.unwrap();
 
         assert!(!task_paths.staging.exists());
         assert!(TaskStore::open(&paths.database)
@@ -4304,9 +3605,7 @@ mod remote_verification_tests {
         task_paths.ensure_dirs().unwrap();
         fs::write(task_paths.staging.join("catalog.enc"), b"rebuilt").unwrap();
 
-        clear_task_record(&paths, &Mutex::new(TaskLifecycleState::default()), task.id)
-            .await
-            .unwrap();
+        clear_task_record(&paths, task.id).await.unwrap();
 
         assert!(!task_paths.staging.exists());
         assert!(TaskStore::open(&paths.database)
