@@ -2081,7 +2081,7 @@ async fn enqueue_rebuild_catalog(
         account_id: scope.account_id,
         space_id: scope.space_id,
         repo,
-        expected_revision: Some(expected_revision.to_string()),
+        expected_revision: expected_revision.to_string(),
     };
     submit_and_spawn(&app, state.inner(), spec)
 }
@@ -3227,7 +3227,7 @@ mod remote_verification_tests {
                 endpoint: "https://modelscope.cn".to_string(),
                 title: None,
             },
-            expected_revision: Some("preview-revision".to_string()),
+            expected_revision: "preview-revision".to_string(),
         }
     }
 

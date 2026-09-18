@@ -1082,7 +1082,7 @@ impl Application {
         paths: &LiosPaths,
         task: &TaskRecord,
         repo: RepoConfig,
-        expected_revision: Option<String>,
+        expected_revision: String,
     ) -> CommandResult<Vec<String>> {
         let config = LiosConfig::load(&paths.config).map_err(to_err)?;
         let key = key_from_config(&config)?;
@@ -1091,19 +1091,17 @@ impl Application {
             .head_revision(&repo.namespace, &repo.dataset)
             .await
             .map_err(to_err)?;
-        if let Some(expected) = expected_revision.as_deref() {
-            let current_commit = started_revision.commit_id.as_deref().unwrap_or("");
-            if expected != current_commit {
-                return Err(CommandError::new(
-                    CommandErrorCode::RemoteConflict,
-                    "remote space changed after the rebuild preview",
-                    false,
-                    Some(serde_json::json!({
-                        "preview_revision": expected,
-                        "current_revision": current_commit,
-                    })),
-                ));
-            }
+        let current_commit = started_revision.commit_id.as_deref().unwrap_or("");
+        if expected_revision != current_commit {
+            return Err(CommandError::new(
+                CommandErrorCode::RemoteConflict,
+                "remote space changed after the rebuild preview",
+                false,
+                Some(serde_json::json!({
+                    "preview_revision": expected_revision,
+                    "current_revision": current_commit,
+                })),
+            ));
         }
         let remote_objects = adapter
             .list_objects(&repo.namespace, &repo.dataset, "")

@@ -172,8 +172,7 @@ pub enum TaskSpec {
         account_id: String,
         space_id: String,
         repo: RepoConfig,
-        #[serde(default)]
-        expected_revision: Option<String>,
+        expected_revision: String,
     },
 }
 

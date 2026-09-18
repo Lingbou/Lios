@@ -2199,7 +2199,7 @@ fn rebuild_task_spec_roundtrips_the_confirmed_revision() {
             endpoint: "https://modelscope.cn".to_string(),
             title: None,
         },
-        expected_revision: Some("commit-123".to_string()),
+        expected_revision: "commit-123".to_string(),
     };
 
     let encoded = serde_json::to_string(&spec).unwrap();
@@ -2211,30 +2211,7 @@ fn rebuild_task_spec_roundtrips_the_confirmed_revision() {
         panic!("expected rebuild catalog task");
     };
 
-    assert_eq!(expected_revision.as_deref(), Some("commit-123"));
-}
-
-#[test]
-fn legacy_rebuild_task_spec_without_revision_loads_as_unconfirmed() {
-    let decoded: TaskSpec = serde_json::from_value(serde_json::json!({
-        "kind": "rebuild_catalog",
-        "account_id": "account",
-        "space_id": "space",
-        "repo": {
-            "namespace": "novix",
-            "dataset": "archive",
-            "endpoint": "https://modelscope.cn"
-        }
-    }))
-    .unwrap();
-    let TaskSpec::RebuildCatalog {
-        expected_revision, ..
-    } = decoded
-    else {
-        panic!("expected rebuild catalog task");
-    };
-
-    assert_eq!(expected_revision, None);
+    assert_eq!(expected_revision, "commit-123");
 }
 
 #[test]
