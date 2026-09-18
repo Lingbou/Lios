@@ -73,6 +73,14 @@ pub struct RepoConfig {
     pub title: Option<String>,
 }
 
+impl RepoConfig {
+    pub fn same_repository(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint
+            && self.namespace == other.namespace
+            && self.dataset == other.dataset
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigLockError {
     #[error("Lios configuration is busy in another process")]

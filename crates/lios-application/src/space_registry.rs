@@ -120,7 +120,11 @@ fn validate_unique_addresses(spaces: &BTreeMap<String, RepoConfig>) -> CommandRe
     for (index, (name, repo)) in spaces.iter().enumerate() {
         validate_space_name(name)?;
         validate_repo(repo.clone())?;
-        if spaces.values().skip(index + 1).any(|other| other == repo) {
+        if spaces
+            .values()
+            .skip(index + 1)
+            .any(|other| other.same_repository(repo))
+        {
             return Err(CommandError::invalid_input(
                 "a Repository Address cannot have multiple SpaceNames",
             ));
@@ -139,7 +143,10 @@ fn validate_available_registration(
             "space `{name}` is already registered"
         )));
     }
-    if spaces.values().any(|existing| existing == repo) {
+    if spaces
+        .values()
+        .any(|existing| existing.same_repository(repo))
+    {
         return Err(CommandError::invalid_input(
             "this Repository Address is already registered",
         ));

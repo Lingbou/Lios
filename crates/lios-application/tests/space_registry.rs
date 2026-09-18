@@ -35,6 +35,10 @@ fn registry_validates_aliases_and_forbids_duplicate_repository_addresses() {
         .add("archive", repo("allen", "photos"))
         .unwrap_err();
     assert_eq!(duplicate.code, CommandErrorCode::InvalidInput);
+    let mut titled_duplicate = repo("allen", "photos");
+    titled_duplicate.title = Some("照片".to_string());
+    let duplicate = registry.add("titled", titled_duplicate).unwrap_err();
+    assert_eq!(duplicate.code, CommandErrorCode::InvalidInput);
     let duplicate_address = registry
         .ensure_can_add("archive", &repo("allen", "photos"))
         .unwrap_err();
