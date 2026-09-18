@@ -355,14 +355,6 @@ impl CommitPlan {
             cleanup: chunk_actions(delete_paths.into_iter().map(RemoteAction::delete).collect()),
         })
     }
-
-    pub fn all_batches(&self) -> impl Iterator<Item = &[RemoteAction]> {
-        self.prepublish
-            .iter()
-            .map(Vec::as_slice)
-            .chain(std::iter::once(self.publish.as_slice()).filter(|batch| !batch.is_empty()))
-            .chain(self.cleanup.iter().map(Vec::as_slice))
-    }
 }
 
 pub fn current_catalog_sha256(objects: &[StorageObject]) -> Option<&str> {

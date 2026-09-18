@@ -153,8 +153,11 @@ fn more_than_256_uploads_use_bounded_phases_with_catalog_publish_before_cleanup(
     assert_eq!(plan.cleanup[0].len(), 1);
     assert_eq!(plan.cleanup[0][0].path(), "objects/stale.enc");
     assert!(plan
-        .all_batches()
+        .prepublish
+        .iter()
+        .chain(plan.cleanup.iter())
         .all(|batch| batch.len() <= MODELSCOPE_COMMIT_ACTION_LIMIT));
+    assert!(plan.publish.len() <= MODELSCOPE_COMMIT_ACTION_LIMIT);
 }
 
 #[test]
