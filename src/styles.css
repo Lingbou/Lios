@@ -310,7 +310,7 @@ select:focus {
   padding: 16px 18px 14px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
   overflow: hidden;
 }
 
@@ -962,7 +962,7 @@ select:focus {
   min-height: 0;
   height: var(--task-panel-height, 220px);
   display: grid;
-  grid-template-rows: 46px minmax(0, 1fr);
+  grid-template-rows: 40px minmax(0, 1fr);
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.94);
@@ -1020,20 +1020,21 @@ select:focus {
 }
 
 .taskHeader {
-  min-height: 46px;
+  min-height: 40px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   background: linear-gradient(90deg, #fff7fb, #f6fcff);
   border-bottom: 1px solid #f5e5ef;
-  padding: 0 14px;
+  padding: 0 12px;
 }
 
 .taskHeaderTitle {
   min-width: 0;
-  display: grid;
-  gap: 2px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
 }
 
 .taskHeaderActions {

@@ -278,7 +278,7 @@ test("collapses to the header and restores the persisted expanded height", async
   await userEvent.click(collapseButton);
 
   expect(panel).toHaveClass("collapsed");
-  expect(panel.style.getPropertyValue("--task-panel-height")).toBe("46px");
+  expect(panel.style.getPropertyValue("--task-panel-height")).toBe("40px");
   expect(screen.queryByRole("article")).not.toBeInTheDocument();
   expect(window.localStorage.getItem(TASK_PANEL_STORAGE_KEY)).toBe("340");
 
