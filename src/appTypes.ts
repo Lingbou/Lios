@@ -2,7 +2,6 @@ import type {
   RecoveryKeyStatus,
   RecoveryKeyVerification
 } from "./recoveryKeyPresentation.ts";
-import type { SetupWarning } from "./setupWarning.ts";
 
 export type RepoConfig = {
   namespace: string;
@@ -120,7 +119,6 @@ export type Snapshot = {
   recovery_key: RecoveryKeyStatus;
   has_token: boolean;
   spaces: SpaceSummary[];
-  warning: SetupWarning | null;
 };
 
 export type UploadConflict = {

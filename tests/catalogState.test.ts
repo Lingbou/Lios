@@ -7,7 +7,6 @@ import {
   loadCatalogState
 } from "../src/catalogState.ts";
 import { commandError as parseCommandError } from "../src/commandError.ts";
-import { setupWarningMessage } from "../src/setupWarning.ts";
 
 const commandError = (code: string, message = code) => ({
   code,
@@ -158,15 +157,4 @@ test("CommandError parser accepts the declared structured shape", () => {
       details: { status: null }
     }
   );
-});
-
-test("setup reconnect warning supplies non-modal notice text", () => {
-  assert.equal(
-    setupWarningMessage({
-      code: "ReconnectRequired",
-      message: "Reconnect the ModelScope space."
-    }),
-    "Reconnect the ModelScope space."
-  );
-  assert.equal(setupWarningMessage(null), null);
 });

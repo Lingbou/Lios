@@ -67,7 +67,6 @@ import {
   type RecoveryKeyStatus,
   type RecoveryKeyVerification
 } from "./recoveryKeyPresentation.ts";
-import { setupWarningMessage } from "./setupWarning.ts";
 
 import { ConflictModal } from "./features/drive/ConflictModal.tsx";
 import { ContextMenu } from "./features/drive/ContextMenu.tsx";
@@ -274,7 +273,6 @@ function previewSnapshot(): Snapshot {
         task_space_id: "task-space-3"
       }
     ],
-    warning: null
   };
 }
 
@@ -552,8 +550,6 @@ function App() {
   async function refreshSetup(loadSpaces = true) {
     const next = await appInvoke<Snapshot>("current_setup");
     setSnapshot(next);
-    const warning = setupWarningMessage(next.warning);
-    if (warning) setMessage(warning);
     setSpaces(next.spaces);
     setSpacesLoaded(true);
     const preferredName =
