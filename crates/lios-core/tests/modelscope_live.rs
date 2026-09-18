@@ -16,6 +16,9 @@ use lios_core::{
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
+mod support;
+use support::CatalogPackTestExt;
+
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set for the live test"))
 }

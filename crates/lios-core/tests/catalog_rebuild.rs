@@ -16,6 +16,9 @@ use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{tempdir, TempDir};
 
+mod support;
+use support::CatalogPackTestExt;
+
 const FILE_BYTES: &[u8] = b"catalog rebuild payload";
 
 struct RecoveryFixture {

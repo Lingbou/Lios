@@ -18,6 +18,9 @@ use serde::{de::DeserializeOwned, Serialize};
 use sha2::Digest;
 use tempfile::tempdir;
 
+mod support;
+use support::{CatalogFolderTestExt, CatalogPackTestExt};
+
 fn assert_public_serde_type<T: Serialize + DeserializeOwned>() {}
 
 fn write_file(path: &Path, contents: &[u8]) {

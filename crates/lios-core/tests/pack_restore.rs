@@ -16,6 +16,9 @@ use lios_core::{
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
+mod support;
+use support::{CatalogFolderTestExt, CatalogPackTestExt};
+
 fn read_catalog_v1(catalog: &Catalog, key: &KeyFile) -> CatalogV1 {
     let encrypted = fs::read(catalog.encrypted_catalog_path()).unwrap();
     let plaintext = decrypt_envelope_v1(key, EnvelopeKindV1::Catalog, &encrypted).unwrap();

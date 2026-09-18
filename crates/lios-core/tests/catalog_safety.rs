@@ -12,6 +12,9 @@ use lios_core::{
 };
 use tempfile::tempdir;
 
+mod support;
+use support::{CatalogFolderTestExt, CatalogPackTestExt};
+
 fn child_names(catalog: &Catalog, key: &KeyFile) -> Vec<String> {
     let tree = catalog.decrypt_tree(key).unwrap();
     match tree.kind {

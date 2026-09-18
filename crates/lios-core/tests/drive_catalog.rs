@@ -11,6 +11,9 @@ use lios_core::{
 };
 use tempfile::tempdir;
 
+mod support;
+use support::CatalogFolderTestExt;
+
 fn write_file(path: &Path, contents: &[u8]) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();

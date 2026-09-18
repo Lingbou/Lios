@@ -587,27 +587,6 @@ impl Catalog {
         ))
     }
 
-    pub fn pack(source: PackSource, key: &KeyFile, options: PackOptions) -> Result<Self> {
-        Self::pack_with_report(source, key, options)?.into_catalog()
-    }
-
-    pub fn pack_with_report(
-        source: PackSource,
-        key: &KeyFile,
-        options: PackOptions,
-    ) -> Result<PackOutcome> {
-        Self::pack_with_optional_progress(source, key, options, None)
-    }
-
-    pub fn pack_with_progress(
-        source: PackSource,
-        key: &KeyFile,
-        options: PackOptions,
-        mut on_progress: impl FnMut(PackProgress),
-    ) -> Result<Self> {
-        Self::pack_with_progress_and_report(source, key, options, &mut on_progress)?.into_catalog()
-    }
-
     pub fn pack_with_progress_and_report(
         source: PackSource,
         key: &KeyFile,
@@ -918,38 +897,6 @@ impl Catalog {
         Ok(conflicts)
     }
 
-    pub fn add_paths_to_folder(
-        &self,
-        parent_id: &str,
-        paths: &[PathBuf],
-        resolutions: &[ConflictResolution],
-        key: &KeyFile,
-        options: PackOptions,
-    ) -> Result<()> {
-        let report =
-            self.add_paths_to_folder_with_report(parent_id, paths, resolutions, key, options)?;
-        report.ensure_no_skipped_paths()
-    }
-
-    pub fn add_paths_to_folder_with_report(
-        &self,
-        parent_id: &str,
-        paths: &[PathBuf],
-        resolutions: &[ConflictResolution],
-        key: &KeyFile,
-        options: PackOptions,
-    ) -> Result<PackReport> {
-        self.add_paths_to_folder_with_optional_progress(
-            parent_id,
-            paths,
-            resolutions,
-            key,
-            options,
-            &[],
-            None,
-        )
-    }
-
     pub fn add_paths_to_folder_with_remote_inventory(
         &self,
         parent_id: &str,
@@ -969,46 +916,6 @@ impl Catalog {
             None,
         )?;
         report.ensure_no_skipped_paths()
-    }
-
-    pub fn add_paths_to_folder_with_progress(
-        &self,
-        parent_id: &str,
-        paths: &[PathBuf],
-        resolutions: &[ConflictResolution],
-        key: &KeyFile,
-        options: PackOptions,
-        mut on_progress: impl FnMut(PackProgress),
-    ) -> Result<()> {
-        let report = self.add_paths_to_folder_with_progress_and_report(
-            parent_id,
-            paths,
-            resolutions,
-            key,
-            options,
-            &mut on_progress,
-        )?;
-        report.ensure_no_skipped_paths()
-    }
-
-    pub fn add_paths_to_folder_with_progress_and_report(
-        &self,
-        parent_id: &str,
-        paths: &[PathBuf],
-        resolutions: &[ConflictResolution],
-        key: &KeyFile,
-        options: PackOptions,
-        mut on_progress: impl FnMut(PackProgress),
-    ) -> Result<PackReport> {
-        self.add_paths_to_folder_with_optional_progress(
-            parent_id,
-            paths,
-            resolutions,
-            key,
-            options,
-            &[],
-            Some(&mut on_progress),
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
