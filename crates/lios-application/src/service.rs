@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lios_core::cache::reset_shared_staging;
-use lios_core::catalog::{
-    Catalog, CatalogTreeNode, ConflictResolution, DriveItem, UploadConflict, CATALOG_FILE,
-};
+use lios_core::catalog::{Catalog, CatalogTreeNode, DriveItem, UploadConflict, CATALOG_FILE};
 use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
 use lios_core::credentials::{protect_to_file, unprotect_from_file};
 use lios_core::crypto::KeyFile;
@@ -343,22 +341,6 @@ impl Application {
         .await
     }
 
-    pub fn normalize_conflict_resolutions(
-        &self,
-        paths: &mut Vec<PathBuf>,
-        resolutions: &mut Vec<ConflictResolution>,
-    ) {
-        use lios_core::catalog::ConflictAction;
-
-        let skipped = resolutions
-            .iter()
-            .filter(|resolution| resolution.action == ConflictAction::Skip)
-            .map(|resolution| resolution.source_path.clone())
-            .collect::<HashSet<_>>();
-        paths.retain(|path| !skipped.contains(path.to_string_lossy().as_ref()));
-        resolutions.retain(|resolution| resolution.action != ConflictAction::Skip);
-    }
-
     pub(crate) fn read_token(&self) -> CommandResult<String> {
         unprotect_from_file(&self.paths.credentials).map_err(|_| {
             CommandError::invalid_input("ModelScope token is not configured or cannot be read")
@@ -411,31 +393,6 @@ fn snapshot_from_catalog(
         tree,
         warnings,
     })
-}
-
-pub fn existing_absolute_paths(
-    values: impl IntoIterator<Item = PathBuf>,
-) -> CommandResult<Vec<PathBuf>> {
-    let values = values.into_iter().collect::<Vec<_>>();
-    if values.is_empty()
-        || values
-            .iter()
-            .any(|path| !path.is_absolute() || !path.exists())
-    {
-        return Err(CommandError::invalid_input(
-            "upload paths must be existing absolute paths",
-        ));
-    }
-    Ok(values)
-}
-
-pub fn existing_absolute_directory(path: &Path) -> CommandResult<PathBuf> {
-    if !path.is_absolute() || !path.is_dir() {
-        return Err(CommandError::invalid_input(
-            "download output must be an existing absolute directory",
-        ));
-    }
-    path.canonicalize().map_err(to_err)
 }
 
 #[cfg(test)]

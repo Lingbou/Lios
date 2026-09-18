@@ -25,12 +25,10 @@ use uuid::Uuid;
 use crate::catalog_sync::{
     download_catalog_baseline, execute_sync_work, persist_sync_checkpoints, plan_catalog_sync,
 };
-use crate::service::{
-    existing_absolute_directory, existing_absolute_paths, key_from_config, Application,
-};
+use crate::service::{key_from_config, Application};
 use crate::task_support::{
     apply_pack_progress, persist_submission, persist_transfer_submission, reconcile_catalog_hash,
-    snapshot_upload_sources, validate_task_sources, CatalogReconcileDecision, TaskScope,
+    validate_task_sources, CatalogReconcileDecision, TaskScope,
 };
 use crate::transfer_request::fingerprint_path;
 use crate::{remote_to_staging_path, to_err, CommandError, CommandErrorCode, CommandResult};
@@ -50,38 +48,6 @@ impl Application {
             .map_err(to_err)
     }
 
-    pub fn queue_upload_for(
-        &self,
-        repo: RepoConfig,
-        parent_node_id: String,
-        source_paths: Vec<PathBuf>,
-        mut conflict_resolutions: Vec<ConflictResolution>,
-    ) -> CommandResult<TaskSummary> {
-        let mut source_paths = existing_absolute_paths(source_paths)?;
-        self.normalize_conflict_resolutions(&mut source_paths, &mut conflict_resolutions);
-        if source_paths.is_empty() {
-            return Err(CommandError::invalid_input(
-                "all selected upload paths were skipped",
-            ));
-        }
-        let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
-        key_from_config(&config)?;
-        let scope = TaskScope::from_repo(&repo);
-        let source_snapshot = snapshot_upload_sources(&source_paths).map_err(to_err)?;
-        let spec = TaskSpec::Upload {
-            account_id: scope.account_id,
-            space_id: scope.space_id,
-            repo,
-            parent_node_id,
-            source_paths,
-            source_snapshot: source_snapshot.clone(),
-            chunk_size: config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
-            conflict_resolutions,
-        };
-        let task = persist_submission(&self.paths, &spec).map_err(to_err)?;
-        summary_for(&self.paths, task.id)
-    }
-
     pub fn queue_delete_for(
         &self,
         repo: RepoConfig,
@@ -94,26 +60,6 @@ impl Application {
             space_id: scope.space_id,
             repo,
             node_ids,
-        };
-        let task = persist_submission(&self.paths, &spec).map_err(to_err)?;
-        summary_for(&self.paths, task.id)
-    }
-
-    pub fn queue_download_for(
-        &self,
-        repo: RepoConfig,
-        node_ids: Vec<String>,
-        output_dir: PathBuf,
-    ) -> CommandResult<TaskSummary> {
-        let node_ids = clean_ids(node_ids, "download selection cannot be empty")?;
-        let output_dir = existing_absolute_directory(&output_dir)?;
-        let scope = TaskScope::from_repo(&repo);
-        let spec = TaskSpec::Download {
-            account_id: scope.account_id,
-            space_id: scope.space_id,
-            repo,
-            node_ids,
-            output_dir,
         };
         let task = persist_submission(&self.paths, &spec).map_err(to_err)?;
         summary_for(&self.paths, task.id)
