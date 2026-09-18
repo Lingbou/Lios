@@ -83,6 +83,7 @@ out
 # Nuxt.js build / generate output
 .nuxt
 dist
+src-tauri/gen/schemas/linux-schema.json
 
 # Gatsby files
 .cache/
