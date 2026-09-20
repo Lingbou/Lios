@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -8,6 +9,9 @@ use crate::storage::{
     CommitPlan, RemoteAction, RemoteDeleteCapability, RepoRevision, StorageAdapter, StorageObject,
 };
 use crate::{LiosError, RemoteError, RemoteErrorKind, Result};
+
+const BLOB_UPLOAD_MAX_ATTEMPTS: usize = 4;
+const BLOB_UPLOAD_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct CatalogTransactionSpec {
@@ -94,15 +98,12 @@ where
     let mut actions = Vec::with_capacity(spec.uploads.len());
     for upload in &spec.uploads {
         validate_catalog_sync_upload(upload)?;
-        let blob = BlobSpec::from_path(upload.local_path.clone()).await?;
-        if blob.oid != upload.expected_sha256
-            || upload.expected_size.is_some_and(|size| size != blob.size)
-        {
-            return Err(LiosError::DataCorruption(format!(
-                "planned catalog upload changed before blob validation: {}",
-                upload.path
-            )));
-        }
+        let blob = BlobSpec::from_expected(
+            upload.local_path.clone(),
+            upload.expected_sha256.clone(),
+            upload.expected_size,
+        )
+        .await?;
         actions.push(RemoteAction::lfs_upsert(
             upload.path.clone(),
             BlobCheckpoint::new(blob.oid.clone(), blob.size),
@@ -150,19 +151,45 @@ where
         if should_cancel()? {
             return Ok(CatalogTransactionOutcome::Canceled);
         }
-        let checkpoint = match validation {
-            BlobValidation::Reusable(checkpoint) => checkpoint,
-            BlobValidation::UploadRequired(validated) => {
-                let completed_before_blob = progress.bytes_done;
-                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-                let upload = adapter.upload_blob_with_progress(blob, validated, Some(progress_tx));
-                tokio::pin!(upload);
-                let mut progress_open = true;
-                let checkpoint = loop {
-                    tokio::select! {
-                        result = &mut upload => {
-                            let checkpoint = result?;
-                            while let Ok(streamed) = progress_rx.try_recv() {
+        let completed_before_blob = progress.bytes_done;
+        let mut validation = validation;
+        let mut upload_attempts = 0;
+        let checkpoint = loop {
+            match validation {
+                BlobValidation::Reusable(checkpoint) => break checkpoint,
+                BlobValidation::UploadRequired(validated) => {
+                    upload_attempts += 1;
+                    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let upload =
+                        adapter.upload_blob_with_progress(blob, validated, Some(progress_tx));
+                    tokio::pin!(upload);
+                    let mut progress_open = true;
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut upload => {
+                                while let Ok(streamed) = progress_rx.try_recv() {
+                                    if streamed > blob.size {
+                                        return Err(LiosError::DataCorruption(
+                                            "blob upload reported more bytes than expected"
+                                                .to_string(),
+                                        ));
+                                    }
+                                    let bytes_done = completed_before_blob.saturating_add(streamed);
+                                    if bytes_done > progress.bytes_done {
+                                        progress.bytes_done = bytes_done;
+                                        on_progress(progress.clone())?;
+                                    }
+                                    if should_cancel()? {
+                                        return Ok(CatalogTransactionOutcome::Canceled);
+                                    }
+                                }
+                                break result;
+                            },
+                            streamed = progress_rx.recv(), if progress_open => {
+                                let Some(streamed) = streamed else {
+                                    progress_open = false;
+                                    continue;
+                                };
                                 if streamed > blob.size {
                                     return Err(LiosError::DataCorruption(
                                         "blob upload reported more bytes than expected".to_string(),
@@ -177,33 +204,27 @@ where
                                     return Ok(CatalogTransactionOutcome::Canceled);
                                 }
                             }
-                            break checkpoint;
-                        },
-                        streamed = progress_rx.recv(), if progress_open => {
-                            let Some(streamed) = streamed else {
-                                progress_open = false;
-                                continue;
-                            };
-                            if streamed > blob.size {
-                                return Err(LiosError::DataCorruption(
-                                    "blob upload reported more bytes than expected".to_string(),
-                                ));
-                            }
-                            let bytes_done = completed_before_blob.saturating_add(streamed);
-                            if bytes_done > progress.bytes_done {
-                                progress.bytes_done = bytes_done;
-                                on_progress(progress.clone())?;
-                            }
-                            if should_cancel()? {
-                                return Ok(CatalogTransactionOutcome::Canceled);
-                            }
                         }
+                    };
+                    match result {
+                        Ok(checkpoint) => break checkpoint,
+                        Err(error)
+                            if upload_attempts < BLOB_UPLOAD_MAX_ATTEMPTS
+                                && is_retryable_upload_error(&error) =>
+                        {
+                            let retry_shift = u32::try_from(upload_attempts - 1)
+                                .expect("blob upload attempt index must fit in u32");
+                            tokio::time::sleep(BLOB_UPLOAD_RETRY_BASE_DELAY * (1 << retry_shift))
+                                .await;
+                            validation =
+                                refresh_blob_validation(adapter, namespace, dataset, blob).await?;
+                        }
+                        Err(error) => return Err(error),
                     }
-                };
-                progress.bytes_done = completed_before_blob.saturating_add(blob.size);
-                checkpoint
+                }
             }
         };
+        progress.bytes_done = completed_before_blob.saturating_add(blob.size);
         if checkpoint.oid != blob.oid || checkpoint.size != blob.size {
             return Err(LiosError::DataCorruption(
                 "storage adapter returned a mismatched blob checkpoint".to_string(),
@@ -358,6 +379,50 @@ where
     Ok(CatalogTransactionOutcome::Completed { warnings })
 }
 
+fn is_retryable_upload_error(error: &LiosError) -> bool {
+    matches!(
+        error,
+        LiosError::Remote(remote)
+            if matches!(
+                remote.kind,
+                RemoteErrorKind::Network
+                    | RemoteErrorKind::RateLimited
+                    | RemoteErrorKind::Server
+            )
+    )
+}
+
+async fn refresh_blob_validation<A>(
+    adapter: &A,
+    namespace: &str,
+    dataset: &str,
+    blob: &BlobSpec,
+) -> Result<BlobValidation>
+where
+    A: StorageAdapter + ?Sized,
+{
+    let mut validations = adapter
+        .validate_blobs(namespace, dataset, std::slice::from_ref(blob))
+        .await?;
+    if validations.len() != 1 {
+        return Err(RemoteError::new(RemoteErrorKind::InvalidResponse, None).into());
+    }
+    let validation = validations
+        .pop()
+        .expect("validated blob count was checked above");
+    match validation {
+        BlobValidation::Reusable(checkpoint)
+            if checkpoint.oid == blob.oid && checkpoint.size == blob.size =>
+        {
+            Ok(BlobValidation::Reusable(checkpoint))
+        }
+        BlobValidation::Reusable(_) => Err(LiosError::DataCorruption(
+            "refreshed blob validation does not match the local blob specification".to_string(),
+        )),
+        validation @ BlobValidation::UploadRequired(_) => Ok(validation),
+    }
+}
+
 fn validate_initial_catalog(spec: &CatalogTransactionSpec) -> Result<()> {
     let remote_catalog = spec
         .initial_remote_inventory
@@ -470,6 +535,7 @@ mod tests {
         head_revision: RepoRevision,
         upload_required: bool,
         remote_delete_capability: RemoteDeleteCapability,
+        upload_failures_remaining: usize,
         cleanup_failures_remaining: usize,
         publish_failures_remaining: usize,
     }
@@ -491,6 +557,7 @@ mod tests {
                     },
                     upload_required,
                     remote_delete_capability: RemoteDeleteCapability::Supported,
+                    upload_failures_remaining: 0,
                     cleanup_failures_remaining: 0,
                     publish_failures_remaining: 0,
                 })),
@@ -507,6 +574,10 @@ mod tests {
 
         fn fail_cleanup_times(&self, failures: usize) {
             self.state.lock().unwrap().cleanup_failures_remaining = failures;
+        }
+
+        fn fail_upload_times(&self, failures: usize) {
+            self.state.lock().unwrap().upload_failures_remaining = failures;
         }
 
         fn disable_remote_delete(&self, reason: &'static str) {
@@ -586,7 +657,14 @@ mod tests {
             let (checkpoint, _url) = validated.into_parts();
             assert_eq!(checkpoint.oid, blob.oid);
             assert_eq!(checkpoint.size, blob.size);
-            self.record(format!("upload:{}", blob.oid));
+            {
+                let mut state = self.state.lock().unwrap();
+                state.events.push(format!("upload:{}", blob.oid));
+                if state.upload_failures_remaining > 0 {
+                    state.upload_failures_remaining -= 1;
+                    return Err(RemoteError::new(RemoteErrorKind::Network, None).into());
+                }
+            }
             Ok(checkpoint)
         }
 
@@ -779,6 +857,39 @@ mod tests {
             .rposition(|event| event.starts_with("upload:"))
             .unwrap();
         assert!(last_upload < first_commit, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn transient_blob_upload_failures_refresh_validation_and_resume() {
+        let tmp = tempdir().unwrap();
+        let base = b"old encrypted catalog";
+        let adapter = ScriptedAdapter::new(ProbeResult::Bytes(base.to_vec()), true);
+        adapter.fail_upload_times(2);
+
+        let outcome = run(&adapter, spec(tmp.path(), Some(base), true, 0), || {
+            Ok(false)
+        })
+        .await
+        .unwrap();
+
+        assert!(assert_completed(outcome).is_empty());
+        let events = adapter.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.as_str() == "validate")
+                .count(),
+            3,
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("upload:"))
+                .count(),
+            4,
+            "{events:?}"
+        );
     }
 
     #[tokio::test]
