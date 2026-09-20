@@ -93,6 +93,42 @@ pub fn encode_chunk_stream_with_compression_v1<R: Read, W: Write>(
     mut output: W,
     enable_compression: bool,
 ) -> Result<ChunkStreamStatsV1> {
+    encode_chunk_stream_with_hashers_v1(
+        key_file,
+        chunk_id,
+        input,
+        &mut output,
+        enable_compression,
+        None,
+    )
+}
+
+pub(crate) fn encode_chunk_stream_with_compression_and_whole_hasher_v1<R: Read, W: Write>(
+    key_file: &KeyFile,
+    chunk_id: ChunkIdV1,
+    input: R,
+    output: W,
+    enable_compression: bool,
+    whole_file_hasher: &mut Sha256,
+) -> Result<ChunkStreamStatsV1> {
+    encode_chunk_stream_with_hashers_v1(
+        key_file,
+        chunk_id,
+        input,
+        output,
+        enable_compression,
+        Some(whole_file_hasher),
+    )
+}
+
+fn encode_chunk_stream_with_hashers_v1<R: Read, W: Write>(
+    key_file: &KeyFile,
+    chunk_id: ChunkIdV1,
+    input: R,
+    mut output: W,
+    enable_compression: bool,
+    whole_file_hasher: Option<&mut Sha256>,
+) -> Result<ChunkStreamStatsV1> {
     let (_compression_id, stream_header) = if enable_compression {
         (ZSTD_ID, chunk_stream_header(chunk_id))
     } else {
@@ -106,7 +142,7 @@ pub fn encode_chunk_stream_with_compression_v1<R: Read, W: Write>(
 
     let key = key_file.derive_key_v1(KeyDomainV1::Chunk)?;
     let frame_writer = FrameEncryptWriter::new(encoded_writer, key, stream_header);
-    let mut hashing_reader = HashingReader::new(input);
+    let mut hashing_reader = HashingReader::new(input, whole_file_hasher);
 
     let (encoded_writer, frame_stats) = if enable_compression {
         let mut encoder = zstd::stream::write::Encoder::new(frame_writer, ZSTD_LEVEL)?;
@@ -141,7 +177,7 @@ pub fn decode_chunk_stream_v1<R: Read, W: Write>(
     limits: &ChunkDecodeLimitsV1,
 ) -> Result<ChunkStreamStatsV1> {
     ensure_encoded_budget(0, CHUNK_STREAM_HEADER_LEN_V1, limits.max_encoded_bytes)?;
-    let mut encoded_reader = HashingReader::new(input);
+    let mut encoded_reader = HashingReader::new(input, None);
     let mut stream_header = [0u8; CHUNK_STREAM_HEADER_LEN_V1];
     read_exact_v1(
         &mut encoded_reader,
@@ -645,17 +681,19 @@ impl<W: Write> Write for FrameEncryptWriter<W> {
     }
 }
 
-struct HashingReader<R> {
+struct HashingReader<'a, R> {
     inner: R,
     hasher: Sha256,
+    whole_file_hasher: Option<&'a mut Sha256>,
     bytes: u64,
 }
 
-impl<R> HashingReader<R> {
-    fn new(inner: R) -> Self {
+impl<'a, R> HashingReader<'a, R> {
+    fn new(inner: R, whole_file_hasher: Option<&'a mut Sha256>) -> Self {
         Self {
             inner,
             hasher: Sha256::new(),
+            whole_file_hasher,
             bytes: 0,
         }
     }
@@ -669,10 +707,13 @@ impl<R> HashingReader<R> {
     }
 }
 
-impl<R: Read> Read for HashingReader<R> {
+impl<R: Read> Read for HashingReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let read = self.inner.read(buffer)?;
         self.hasher.update(&buffer[..read]);
+        if let Some(hasher) = self.whole_file_hasher.as_mut() {
+            hasher.update(&buffer[..read]);
+        }
         self.bytes += read as u64;
         Ok(read)
     }

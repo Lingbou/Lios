@@ -14,7 +14,8 @@ use crate::format_v1::{
     decrypt_envelope_v1, encrypt_envelope_v1, envelope_encoded_len_v1, EnvelopeKindV1,
 };
 use crate::framed_v1::{
-    decode_chunk_stream_v1, encode_chunk_stream_with_compression_v1, ChunkDecodeLimitsV1, ChunkIdV1,
+    decode_chunk_stream_v1, encode_chunk_stream_with_compression_and_whole_hasher_v1,
+    ChunkDecodeLimitsV1, ChunkIdV1,
 };
 use crate::pack::{PackOptions, PackProgress};
 use crate::restore::RestoreOptions;
@@ -2222,22 +2223,23 @@ fn pack_content_object_v1(
             let mut temp = SiblingTempFile::create(&chunk_path, ".lios-tmp")?;
             let should_compress = !is_precompressed_path(path);
             let stats = if at_eof {
-                encode_chunk_stream_with_compression_v1(
+                encode_chunk_stream_with_compression_and_whole_hasher_v1(
                     key,
                     chunk_id,
                     std::io::empty(),
                     temp.file_mut(),
                     should_compress,
+                    &mut file_hasher,
                 )?
             } else {
                 let limited = source.by_ref().take(options.chunk_size as u64);
-                let hashing = WholeFileHashingReader::new(limited, &mut file_hasher);
-                encode_chunk_stream_with_compression_v1(
+                encode_chunk_stream_with_compression_and_whole_hasher_v1(
                     key,
                     chunk_id,
-                    hashing,
+                    limited,
                     temp.file_mut(),
                     should_compress,
+                    &mut file_hasher,
                 )?
             };
             temp.persist_new(&chunk_path)?;
@@ -2468,25 +2470,6 @@ fn replace_content_object_references(
             *object_id = replacement_object_id.to_string();
             node.descriptor_encrypted_sha256 = None;
         }
-    }
-}
-
-struct WholeFileHashingReader<'a, R> {
-    inner: R,
-    hasher: &'a mut Sha256,
-}
-
-impl<'a, R> WholeFileHashingReader<'a, R> {
-    fn new(inner: R, hasher: &'a mut Sha256) -> Self {
-        Self { inner, hasher }
-    }
-}
-
-impl<R: Read> Read for WholeFileHashingReader<'_, R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let read = self.inner.read(buffer)?;
-        self.hasher.update(&buffer[..read]);
-        Ok(read)
     }
 }
 

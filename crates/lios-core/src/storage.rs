@@ -54,6 +54,35 @@ pub struct BlobSpec {
 }
 
 impl BlobSpec {
+    pub async fn from_expected(
+        local_path: impl Into<PathBuf>,
+        oid: impl Into<String>,
+        expected_size: Option<u64>,
+    ) -> Result<Self> {
+        let local_path = local_path.into();
+        let oid = oid.into();
+        validate_blob_oid(&oid)?;
+        let metadata = tokio::fs::metadata(&local_path).await?;
+        if !metadata.is_file() {
+            return Err(LiosError::Storage(format!(
+                "blob source is not a regular file: {}",
+                local_path.display()
+            )));
+        }
+        let size = metadata.len();
+        if expected_size.is_some_and(|expected| expected != size) {
+            return Err(LiosError::DataCorruption(format!(
+                "planned blob size changed before validation: {}",
+                local_path.display()
+            )));
+        }
+        Ok(Self {
+            local_path,
+            oid,
+            size,
+        })
+    }
+
     pub async fn from_path(local_path: impl Into<PathBuf>) -> Result<Self> {
         let local_path = local_path.into();
         let mut file = tokio::fs::File::open(&local_path).await?;

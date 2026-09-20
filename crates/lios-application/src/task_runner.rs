@@ -1267,12 +1267,15 @@ fn apply_push_create_or_update(
                 .join(Uuid::new_v4().simple().to_string());
             std::fs::create_dir_all(&input_dir).map_err(to_err)?;
             let staged_source = input_dir.join(name);
-            if std::fs::hard_link(source, &staged_source).is_err() {
+            let linked = std::fs::hard_link(source, &staged_source).is_ok();
+            if !linked {
                 std::fs::copy(source, &staged_source).map_err(to_err)?;
             }
-            if action.source_sha256.as_deref().is_some_and(|expected| {
-                crate::sha256_hex_file(&staged_source).ok().as_deref() != Some(expected)
-            }) {
+            if !linked
+                && action.source_sha256.as_deref().is_some_and(|expected| {
+                    crate::sha256_hex_file(&staged_source).ok().as_deref() != Some(expected)
+                })
+            {
                 return Err(CommandError::new(
                     CommandErrorCode::RemoteConflict,
                     format!("local source content changed: {}", action.relative_path),
