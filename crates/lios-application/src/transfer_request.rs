@@ -387,7 +387,42 @@ pub fn prepare_upload(
             continue;
         };
         match resolution.action {
-            ConflictAction::Replace => {}
+            ConflictAction::Replace => {
+                // Replacing an existing directory means replacing the whole
+                // subtree. Mark the directory action as ReplaceType so the
+                // worker removes the old node (and descendants) before the
+                // uploaded children are applied again.
+                let remote_directory = remote_entries.iter().any(|entry| {
+                    entry.path.eq_ignore_ascii_case(&target) && entry.kind == EntryKind::Directory
+                });
+                if remote_directory {
+                    let marked = prepared
+                        .plan
+                        .actions
+                        .iter_mut()
+                        .find(|action| action.path == target)
+                        .is_some_and(|action| {
+                            if action.entry_kind == EntryKind::Directory {
+                                action.kind = PlanActionKind::ReplaceType;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    if marked && !target.is_empty() {
+                        // The replaced subtree is removed from the Catalog, so
+                        // every skipped descendant has to be created again.
+                        for action in &mut prepared.plan.actions {
+                            if is_path_or_descendant(&action.path, &target)
+                                && action.path != target
+                                && action.kind == PlanActionKind::Skip
+                            {
+                                action.kind = PlanActionKind::Create;
+                            }
+                        }
+                    }
+                }
+            }
             ConflictAction::Skip => {
                 prepared
                     .plan

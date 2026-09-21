@@ -229,6 +229,64 @@ fn upload_replace_accepts_a_type_change_after_conflict_confirmation() {
 }
 
 #[test]
+fn upload_replace_directory_drops_remote_only_children() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("docs");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("keep.txt"), b"new").unwrap();
+    std::fs::create_dir(source.join("sub")).unwrap();
+    std::fs::write(source.join("sub").join("same.txt"), b"same").unwrap();
+    let same_sha256 =
+        lios_application::sha256_hex_file(&source.join("sub").join("same.txt")).unwrap();
+
+    let prepared = prepare_upload(
+        vec![LocalLocation {
+            path: source.clone(),
+            trailing_slash: false,
+        }],
+        "",
+        &[
+            TreeEntry::directory("docs"),
+            TreeEntry::file("docs/keep.txt", "old", 3),
+            TreeEntry::directory("docs/sub"),
+            TreeEntry::file("docs/sub/same.txt", &same_sha256, 4),
+            TreeEntry::file("docs/stale.txt", "stale", 5),
+        ],
+        &[ConflictResolution {
+            source_path: source.to_string_lossy().into_owned(),
+            action: ConflictAction::Replace,
+        }],
+    )
+    .unwrap();
+
+    let directory = prepared.plan.action("docs").unwrap();
+    assert_eq!(directory.kind, PlanActionKind::ReplaceType);
+    // Descendants are recreated after the subtree deletion, including ones
+    // that would otherwise have been skipped as unchanged.
+    assert_eq!(
+        prepared.plan.action("docs/sub").unwrap().kind,
+        PlanActionKind::Create
+    );
+    assert_eq!(
+        prepared.plan.action("docs/sub/same.txt").unwrap().kind,
+        PlanActionKind::Create
+    );
+    assert_eq!(
+        prepared.plan.action("docs/keep.txt").unwrap().kind,
+        PlanActionKind::Update
+    );
+    assert!(
+        prepared
+            .plan
+            .actions
+            .iter()
+            .all(|action| action.kind != PlanActionKind::Delete),
+        "directory replacement is executed through ReplaceType: {:?}",
+        prepared.plan.actions
+    );
+}
+
+#[test]
 fn sync_contents_to_space_root_deletes_destination_only_root_entries() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("dir");
