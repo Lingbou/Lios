@@ -33,9 +33,8 @@ use download_service::prepare_download_task;
 use lios_application::location::LocalLocation;
 use lios_application::service::Application;
 use lios_application::space_registry::SpaceRegistry;
-use lios_application::transfer_planner::PlanOptions;
 use lios_application::transfer_request::{
-    catalog_node_path, catalog_tree_entries, prepare_pull, prepare_upload, RemoteSource,
+    catalog_node_path, catalog_tree_entries, prepare_download, prepare_upload, RemoteSource,
 };
 use lios_core::cache::{prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
@@ -1796,7 +1795,7 @@ async fn enqueue_download(
         path: prepared.output_dir,
         trailing_slash: true,
     };
-    let prepared_pull = prepare_pull(&sources, &local_destination, &PlanOptions::default())?;
+    let prepared_pull = prepare_download(&sources, &local_destination)?;
     let persisted = prepared_pull.into_persisted(
         node_ids.join("\0"),
         local_destination.path.to_string_lossy().into_owned(),

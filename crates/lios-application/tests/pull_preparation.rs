@@ -1,6 +1,6 @@
 use lios_application::location::LocalLocation;
 use lios_application::transfer_planner::{PlanActionKind, PlanOptions};
-use lios_application::transfer_request::{prepare_pull, RemoteSource};
+use lios_application::transfer_request::{prepare_download, prepare_pull, RemoteSource};
 use lios_core::catalog::{CatalogTreeNode, CatalogTreeNodeKind};
 use tempfile::tempdir;
 
@@ -23,6 +23,108 @@ fn remote_dir() -> CatalogTreeNode {
             }],
         },
     }
+}
+
+fn remote_file(name: &str, sha256: &str, size: u64) -> CatalogTreeNode {
+    CatalogTreeNode {
+        id: format!("{name}-id"),
+        name: name.to_string(),
+        updated_at: "now".to_string(),
+        kind: CatalogTreeNodeKind::File {
+            original_size: size,
+            sha256: sha256.to_string(),
+            object_id: format!("{name}-object"),
+            chunk_count: 1,
+        },
+    }
+}
+
+#[test]
+fn download_preserves_existing_conflicting_file() {
+    let temp = tempdir().unwrap();
+    let destination = temp.path().join("restore");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("report.txt"), b"local").unwrap();
+
+    let prepared = prepare_download(
+        &[RemoteSource {
+            node: remote_file("report.txt", &"a".repeat(64), 6),
+            trailing_slash: false,
+        }],
+        &LocalLocation {
+            path: destination.clone(),
+            trailing_slash: true,
+        },
+    )
+    .unwrap();
+
+    let action = prepared.plan.action("report.txt").unwrap();
+    assert_eq!(action.kind, PlanActionKind::Create);
+    assert_eq!(
+        prepared.destination_paths.get("report.txt"),
+        Some(&destination.join("report (restored 1).txt"))
+    );
+    assert!(!prepared.destination_fingerprints.contains_key("report.txt"));
+    assert_eq!(
+        std::fs::read(destination.join("report.txt")).unwrap(),
+        b"local"
+    );
+}
+
+#[test]
+fn download_uses_next_restored_name_when_first_is_taken() {
+    let temp = tempdir().unwrap();
+    let destination = temp.path().join("restore");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("report.txt"), b"local").unwrap();
+    std::fs::write(destination.join("report (restored 1).txt"), b"older").unwrap();
+
+    let prepared = prepare_download(
+        &[RemoteSource {
+            node: remote_file("report.txt", &"a".repeat(64), 6),
+            trailing_slash: false,
+        }],
+        &LocalLocation {
+            path: destination.clone(),
+            trailing_slash: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.destination_paths.get("report.txt"),
+        Some(&destination.join("report (restored 2).txt"))
+    );
+}
+
+#[test]
+fn download_skips_identical_existing_file_without_rename() {
+    let temp = tempdir().unwrap();
+    let destination = temp.path().join("restore");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("report.txt"), b"remote").unwrap();
+    let local_sha256 = lios_application::sha256_hex_file(&destination.join("report.txt")).unwrap();
+
+    let prepared = prepare_download(
+        &[RemoteSource {
+            node: remote_file("report.txt", &local_sha256, 6),
+            trailing_slash: false,
+        }],
+        &LocalLocation {
+            path: destination.clone(),
+            trailing_slash: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.plan.action("report.txt").unwrap().kind,
+        PlanActionKind::Skip
+    );
+    assert_eq!(
+        prepared.destination_paths.get("report.txt"),
+        Some(&destination.join("report.txt"))
+    );
 }
 
 #[test]

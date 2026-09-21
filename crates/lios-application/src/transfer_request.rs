@@ -628,6 +628,80 @@ pub fn prepare_pull(
     })
 }
 
+/// Desktop download planning.
+///
+/// Unlike the rsync-style [`prepare_pull`], an existing local file whose
+/// content differs from the remote source is preserved under a
+/// `name (restored N).ext` sibling instead of being overwritten.
+pub fn prepare_download(
+    sources: &[RemoteSource],
+    local_destination: &LocalLocation,
+) -> CommandResult<PreparedPull> {
+    let mut prepared = prepare_pull(sources, local_destination, &PlanOptions::default())?;
+    rename_existing_file_conflicts(&mut prepared)?;
+    Ok(prepared)
+}
+
+fn rename_existing_file_conflicts(prepared: &mut PreparedPull) -> CommandResult<()> {
+    let mut taken = BTreeSet::new();
+    if prepared.destination_root.exists() {
+        for entry in fs::read_dir(&prepared.destination_root)? {
+            let entry = entry.map_err(to_err)?;
+            taken.insert(entry.file_name().to_string_lossy().to_ascii_lowercase());
+        }
+    }
+
+    for index in 0..prepared.plan.actions.len() {
+        let (kind, entry_kind, path) = {
+            let action = &prepared.plan.actions[index];
+            (action.kind, action.entry_kind, action.path.clone())
+        };
+        if kind != PlanActionKind::Update || entry_kind != EntryKind::File {
+            continue;
+        }
+        let Some(current) = prepared.destination_paths.get(&path).cloned() else {
+            continue;
+        };
+        if !current.exists() {
+            continue;
+        }
+        let Some(parent) = current.parent() else {
+            continue;
+        };
+        let name = current
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("restored");
+        let renamed = restored_available_name(&taken, name);
+        taken.insert(renamed.to_ascii_lowercase());
+        prepared
+            .destination_paths
+            .insert(path.clone(), parent.join(&renamed));
+        prepared.destination_fingerprints.remove(&path);
+        prepared.plan.actions[index].kind = PlanActionKind::Create;
+    }
+    Ok(())
+}
+
+fn restored_available_name(existing: &BTreeSet<String>, name: &str) -> String {
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name);
+    let extension = path.extension().and_then(|value| value.to_str());
+    for index in 1u64.. {
+        let candidate = match extension {
+            Some(extension) => format!("{stem} (restored {index}).{extension}"),
+            None => format!("{stem} (restored {index})"),
+        };
+        if !existing.contains(&candidate.to_ascii_lowercase()) {
+            return candidate;
+        }
+    }
+    unreachable!("restored file name search is unbounded")
+}
+
 fn flatten_remote_source(
     node: &CatalogTreeNode,
     target: &str,
