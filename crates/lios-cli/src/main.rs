@@ -850,6 +850,10 @@ async fn request_worker_interruption(
     ) {
         return Err(CliError::invalid_input("task is already terminal"));
     }
+    // A worker may have idle-exited or crashed while the task was still
+    // marked active. Start one so the request is actually consumed instead
+    // of polling a control file forever.
+    start_worker(application.paths())?;
     application.paths().ensure_worker_control_dir()?;
     let request = if cancel {
         application.paths().worker_cancel_path(task_id)
