@@ -62,6 +62,9 @@ describe("DriveToolbar", () => {
     );
 
     expect(screen.getByText("已选 2 / 10 项")).toBeInTheDocument();
+    const toolbar = screen.getByText("已选 2 / 10 项").closest(".driveToolbar")!;
+    expect(toolbar.querySelector(":scope > .viewModeSegment")).not.toBeNull();
+    expect(toolbar.querySelector(".toolbarActions .selectionBadge")).not.toBeNull();
     fireEvent.click(screen.getByText("取消"));
     expect(onClearSelection).toHaveBeenCalledOnce();
 

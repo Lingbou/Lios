@@ -446,10 +446,11 @@ select:focus {
 
 .driveToolbar {
   min-width: 0;
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  gap: 8px 10px;
+  align-items: center;
 }
 
 .toolbar {
@@ -457,6 +458,18 @@ select:focus {
   gap: 8px;
   flex-wrap: wrap;
   align-items: center;
+}
+
+.toolbarPrimary {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.toolbarActions {
+  grid-column: 1;
+  grid-row: 2;
+  min-width: 0;
+  flex-wrap: nowrap;
 }
 
 .primary {
@@ -1897,6 +1910,7 @@ select:focus {
 
   .driveToolbar {
     display: grid;
+    grid-template-columns: 1fr;
   }
 
   .toolbar {
@@ -1906,6 +1920,12 @@ select:focus {
 
   .toolbar button {
     width: 100%;
+  }
+
+  .viewModeSegment {
+    grid-column: 1;
+    grid-row: auto;
+    justify-self: start;
   }
 
   .fileTable th:nth-child(3),
@@ -2035,6 +2055,8 @@ select:focus {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  margin-left: auto;
+  white-space: nowrap;
   font-size: 12px;
   color: var(--muted);
   background: var(--pink-weak);
@@ -2056,6 +2078,9 @@ select:focus {
 
 .viewModeSegment {
   display: inline-flex;
+  grid-column: 2;
+  grid-row: 2;
+  align-self: center;
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;

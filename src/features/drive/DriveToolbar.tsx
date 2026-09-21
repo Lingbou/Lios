@@ -46,7 +46,7 @@ export function DriveToolbar({
 }: DriveToolbarProps) {
   return (
     <section className="driveToolbar">
-      <div className="toolbar">
+      <div className="toolbar toolbarPrimary">
         <button
           className="primary"
           onClick={onUploadFiles}
@@ -74,7 +74,7 @@ export function DriveToolbar({
         </button>
       </div>
 
-      <div className="toolbar">
+      <div className="toolbar toolbarActions">
         <button
           onClick={onDownload}
           disabled={selectedCount === 0 || busy}
@@ -125,28 +125,29 @@ export function DriveToolbar({
           </div>
         )}
 
-        <div className="viewModeSegment" role="radiogroup" aria-label="视图模式">
-          <button
-            type="button"
-            className={`viewModeBtn ${viewMode === "table" ? "active" : ""}`}
-            onClick={() => onViewModeChange("table")}
-            title="列表视图"
-            aria-checked={viewMode === "table"}
-            role="radio"
-          >
-            <List aria-hidden />
-          </button>
-          <button
-            type="button"
-            className={`viewModeBtn ${viewMode === "grid" ? "active" : ""}`}
-            onClick={() => onViewModeChange("grid")}
-            title="网格平铺视图"
-            aria-checked={viewMode === "grid"}
-            role="radio"
-          >
-            <LayoutGrid aria-hidden />
-          </button>
-        </div>
+      </div>
+
+      <div className="viewModeSegment" role="radiogroup" aria-label="视图模式">
+        <button
+          type="button"
+          className={`viewModeBtn ${viewMode === "table" ? "active" : ""}`}
+          onClick={() => onViewModeChange("table")}
+          title="列表视图"
+          aria-checked={viewMode === "table"}
+          role="radio"
+        >
+          <List aria-hidden />
+        </button>
+        <button
+          type="button"
+          className={`viewModeBtn ${viewMode === "grid" ? "active" : ""}`}
+          onClick={() => onViewModeChange("grid")}
+          title="网格平铺视图"
+          aria-checked={viewMode === "grid"}
+          role="radio"
+        >
+          <LayoutGrid aria-hidden />
+        </button>
       </div>
     </section>
   );
