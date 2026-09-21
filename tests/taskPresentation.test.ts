@@ -62,6 +62,47 @@ test("task progress prefers byte progress and includes speed plus ETA", () => {
   assert.equal(taskProgressText(task), "1.00 MB / 4.00 MB · 25% · 512 KB/s · 剩余 6 秒");
 });
 
+test("task status describes local packing and remote transaction phases", () => {
+  const running = {
+    state: "Running",
+    label: "upload",
+    progress_total: 1,
+    progress_done: 0
+  } as const;
+
+  assert.equal(taskStatusText({ ...running, phase: "preparing" }), "正在切片加密");
+  assert.equal(taskStatusText({ ...running, phase: "validating" }), "正在校验远端对象");
+  assert.equal(taskStatusText({ ...running, phase: "uploading" }), "正在同步到远端");
+  assert.equal(taskStatusText({ ...running, phase: "prepublishing" }), "正在提交加密对象");
+  assert.equal(
+    taskStatusText({ ...running, phase: "checking_remote" }),
+    "正在核对远端清单"
+  );
+  assert.equal(taskStatusText({ ...running, phase: "publishing" }), "正在发布目录索引");
+  assert.equal(taskStatusText({ ...running, phase: "cleaning" }), "正在清理远端对象");
+  assert.equal(taskStatusText({ ...running, phase: "downloading" }), "正在下载");
+  assert.equal(taskStatusText({ ...running, phase: "restoring" }), "正在恢复到本地");
+  assert.equal(taskStatusText({ ...running, phase: "deleting" }), "正在删除");
+});
+
+test("task item status describes packing and apply phases", () => {
+  const item = {
+    state: "Running",
+    phase: null,
+    bytes_done: 1,
+    bytes_total: 2,
+    size: 2,
+    error: null
+  } as const;
+
+  assert.equal(taskItemStatusText({ ...item, phase: "preparing" }), "正在切片加密");
+  assert.equal(taskItemStatusText({ ...item, phase: "downloading" }), "正在下载");
+  assert.equal(taskItemStatusText({ ...item, phase: "restoring" }), "正在恢复");
+  assert.equal(taskItemStatusText({ ...item, phase: "applying_plan" }), "正在应用变更");
+  assert.equal(taskItemStatusText({ ...item, phase: "deleting" }), "正在删除");
+  assert.equal(taskItemStatusText({ ...item, phase: "uploading" }), "正在上传");
+});
+
 test("task item presentation reports concrete file state and progress", () => {
   const item = {
     state: "Running",

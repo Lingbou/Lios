@@ -377,7 +377,7 @@ impl Application {
                 self.run_delete(task_paths, task, repo, node_ids).await
             }
             TaskSpec::VerifySpace { repo, full, .. } => {
-                self.run_verify(task_paths, repo, full).await
+                self.run_verify(task_paths, task, repo, full).await
             }
             TaskSpec::RebuildCatalog {
                 repo,
@@ -431,10 +431,19 @@ impl Application {
                 )
             })
         })?;
-        TaskStore::open(&paths.database)
-            .map_err(to_err)?
+        let store = TaskStore::open(&paths.database).map_err(to_err)?;
+        store
             .update_transfer(task.id, 0, total, 0, bytes_total, 0)
             .map_err(to_err)?;
+        if plan
+            .actions
+            .iter()
+            .any(|action| push_item_phase(action) == "preparing")
+        {
+            store
+                .update_phase(task.id, Some("preparing".to_string()))
+                .map_err(to_err)?;
+        }
 
         let mut journal = transfer_journal(paths, task.id)?;
         let mut bytes_done = 0u64;
@@ -449,7 +458,7 @@ impl Application {
                 } else {
                     TaskItemState::Running
                 },
-                Some("applying_plan"),
+                Some(push_item_phase(action)),
                 skipped,
                 None,
             )?;
@@ -594,10 +603,40 @@ impl Application {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let has_downloads = !node_ids.is_empty();
         let selection = CatalogSelection::Nodes(node_ids);
         let remote_files = catalog
             .remote_files_for_selection(&selection, &key)
             .map_err(to_err)?;
+        if has_downloads {
+            TaskStore::open(&paths.database)
+                .map_err(to_err)?
+                .update_phase(task.id, Some("downloading".to_string()))
+                .map_err(to_err)?;
+            let download_actions = plan
+                .actions
+                .iter()
+                .filter(|action| {
+                    !transfer_action_finished(&journal, action)
+                        && action.entry_kind == TransferEntryKind::File
+                        && !matches!(
+                            action.kind,
+                            TransferActionKind::Skip | TransferActionKind::Delete
+                        )
+                })
+                .collect::<Vec<_>>();
+            for action in download_actions {
+                mark_transfer_item(
+                    paths,
+                    &mut journal,
+                    action,
+                    TaskItemState::Running,
+                    Some("downloading"),
+                    false,
+                    None,
+                )?;
+            }
+        }
         for file in &remote_files {
             let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
             adapter
@@ -665,11 +704,7 @@ impl Application {
                 } else {
                     TaskItemState::Running
                 },
-                Some(if action.kind == TransferActionKind::Delete {
-                    "deleting"
-                } else {
-                    "applying_plan"
-                }),
+                Some(pull_item_phase(action)),
                 skipped,
                 None,
             )?;
@@ -719,8 +754,11 @@ impl Application {
             })?;
             completed += 1;
             let done = u64::try_from(completed).unwrap_or(total);
-            TaskStore::open(&paths.database)
-                .map_err(to_err)?
+            let store = TaskStore::open(&paths.database).map_err(to_err)?;
+            store
+                .update_phase(task.id, Some(pull_item_phase(action).to_string()))
+                .map_err(to_err)?;
+            store
                 .update_transfer(task.id, done, total, bytes_done, bytes_total, 0)
                 .map_err(to_err)?;
         }
@@ -738,6 +776,10 @@ impl Application {
         let key = key_from_config(&config)?;
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
         let (catalog, baseline) = download_catalog_baseline(paths, &key, &adapter, &repo).await?;
+        TaskStore::open(&paths.database)
+            .map_err(to_err)?
+            .update_phase(task.id, Some("deleting".to_string()))
+            .map_err(to_err)?;
         catalog.delete_nodes(&node_ids, &key).map_err(to_err)?;
         let work = plan_catalog_sync(paths, &catalog, &key, baseline)?;
         persist_sync_checkpoints(paths, task.id, &work)?;
@@ -823,6 +865,10 @@ impl Application {
             .cloned()
             .collect::<Vec<_>>();
 
+        TaskStore::open(&paths.database)
+            .map_err(to_err)?
+            .update_phase(task.id, Some("downloading_recovery_metadata".to_string()))
+            .map_err(to_err)?;
         for obj in &metadata_objects {
             let local_path = remote_to_staging_path(&paths.staging, &obj.path)?;
             adapter
@@ -834,6 +880,11 @@ impl Application {
         let staging_dir = paths.staging.clone();
         let key_clone = key.clone();
         let remote_clone = remote_objects.clone();
+        let store = TaskStore::open(&paths.database).map_err(to_err)?;
+        store
+            .update_phase(task.id, Some("rebuilding_catalog".to_string()))
+            .map_err(to_err)?;
+        drop(store);
         let (catalog, report) = tokio::task::spawn_blocking(move || {
             Catalog::rebuild_from_recovery(&key_clone, staging_dir, &remote_clone)
         })
@@ -876,6 +927,7 @@ impl Application {
     async fn run_verify(
         &self,
         paths: &LiosPaths,
+        task: &TaskRecord,
         repo: RepoConfig,
         full: bool,
     ) -> CommandResult<Vec<String>> {
@@ -892,6 +944,10 @@ impl Application {
             .list_objects(&repo.namespace, &repo.dataset, "")
             .await
             .map_err(to_err)?;
+        TaskStore::open(&paths.database)
+            .map_err(to_err)?
+            .update_phase(task.id, Some("checking_remote".to_string()))
+            .map_err(to_err)?;
         let remote = catalog
             .verify_remote_inventory(&key, &remote_objects)
             .map_err(to_err)?;
@@ -901,6 +957,10 @@ impl Application {
         let files = catalog
             .remote_files_for_selection(&CatalogSelection::All, &key)
             .map_err(to_err)?;
+        TaskStore::open(&paths.database)
+            .map_err(to_err)?
+            .update_phase(task.id, Some("downloading_verification_data".to_string()))
+            .map_err(to_err)?;
         for file in &files {
             let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
             adapter
@@ -908,6 +968,10 @@ impl Application {
                 .await
                 .map_err(to_err)?;
         }
+        TaskStore::open(&paths.database)
+            .map_err(to_err)?
+            .update_phase(task.id, Some("verifying_content".to_string()))
+            .map_err(to_err)?;
         let local = catalog.verify_staged_integrity(&key).map_err(to_err)?;
         Ok(vec![
             format_remote_report(&remote),
@@ -973,6 +1037,29 @@ fn mark_transfer_item(
         .map_err(to_err)?
         .upsert_item(item)
         .map_err(to_err)
+}
+
+fn push_item_phase(action: &PersistedTransferAction) -> &'static str {
+    if action.entry_kind == TransferEntryKind::File
+        && matches!(
+            action.kind,
+            TransferActionKind::Create
+                | TransferActionKind::Update
+                | TransferActionKind::ReplaceType
+        )
+    {
+        "preparing"
+    } else {
+        "applying_plan"
+    }
+}
+
+fn pull_item_phase(action: &PersistedTransferAction) -> &'static str {
+    if action.kind == TransferActionKind::Delete {
+        "deleting"
+    } else {
+        "restoring"
+    }
 }
 
 fn apply_push_create_or_update(
@@ -1475,8 +1562,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        delete_local_destination, fingerprint_path, persist_transaction_progress,
-        validate_local_destination_fingerprint, with_scratch_dir,
+        delete_local_destination, fingerprint_path, persist_transaction_progress, pull_item_phase,
+        push_item_phase, validate_local_destination_fingerprint, with_scratch_dir,
     };
     use crate::{to_err, CommandError, CommandResult};
 
@@ -1502,6 +1589,54 @@ mod tests {
         });
         assert!(failed.is_err());
         assert!(!seen.exists());
+    }
+
+    #[test]
+    fn transfer_item_phases_describe_packing_and_applying() {
+        let action =
+            |kind: TransferActionKind, entry_kind: TransferEntryKind| PersistedTransferAction {
+                relative_path: "docs/file.txt".to_string(),
+                source_path: None,
+                remote_node_id: None,
+                local_destination_path: None,
+                kind,
+                entry_kind,
+                source_sha256: None,
+                source_fingerprint: None,
+                size: 0,
+                destination_fingerprint: None,
+                state: TransferActionState::Pending,
+            };
+
+        for kind in [
+            TransferActionKind::Create,
+            TransferActionKind::Update,
+            TransferActionKind::ReplaceType,
+        ] {
+            assert_eq!(
+                push_item_phase(&action(kind, TransferEntryKind::File)),
+                "preparing"
+            );
+            assert_eq!(
+                pull_item_phase(&action(kind, TransferEntryKind::File)),
+                "restoring"
+            );
+        }
+        assert_eq!(
+            push_item_phase(&action(
+                TransferActionKind::Create,
+                TransferEntryKind::Directory
+            )),
+            "applying_plan"
+        );
+        assert_eq!(
+            push_item_phase(&action(TransferActionKind::Delete, TransferEntryKind::File)),
+            "applying_plan"
+        );
+        assert_eq!(
+            pull_item_phase(&action(TransferActionKind::Delete, TransferEntryKind::File)),
+            "deleting"
+        );
     }
 
     #[test]

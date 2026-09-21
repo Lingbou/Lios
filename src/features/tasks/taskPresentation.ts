@@ -192,6 +192,11 @@ export function taskStatusText(task: TaskPresentationRecord) {
   if (task.phase === "preparing" && task.label === "rebuild") return "正在准备目录重建";
   if (task.phase === "preparing") return "正在切片加密";
   if (task.state === "Running" && task.phase === "uploading") return "正在同步到远端";
+  if (task.state === "Running" && task.phase === "validating") return "正在校验远端对象";
+  if (task.state === "Running" && task.phase === "prepublishing") return "正在提交加密对象";
+  if (task.state === "Running" && task.phase === "publishing") return "正在发布目录索引";
+  if (task.state === "Running" && task.phase === "cleaning") return "正在清理远端对象";
+  if (task.state === "Running" && task.phase === "deleting") return "正在删除";
   if (task.state === "Running" && task.phase === "downloading") return "正在下载";
   if (task.state === "Running" && task.phase === "checking_remote") return "正在核对远端清单";
   if (task.state === "Running" && task.phase === "downloading_verification_data") {
@@ -226,11 +231,13 @@ export function taskItemStatusText(item: TaskItemPresentationRecord) {
   if (item.state === "Completed") return "已完成";
   if (item.phase === "preparing") return "正在切片加密";
   if (item.phase === "prepared") return "已加密，等待上传";
+  if (item.phase === "applying_plan") return "正在应用变更";
   if (item.phase === "uploading") return "正在上传";
   if (item.phase === "committing") return "正在提交";
   if (item.phase === "retrying") return "等待重试";
   if (item.phase === "downloading") return "正在下载";
   if (item.phase === "restoring") return "正在恢复";
+  if (item.phase === "deleting") return "正在删除";
   return "正在处理";
 }
 
