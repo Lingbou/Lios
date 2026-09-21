@@ -1694,9 +1694,9 @@ async fn enqueue_upload_to_folder(
     key_from_config(&config)?;
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
-    let snapshot = Application::new(state.paths.clone())?
-        .open_space(repo.clone())
-        .await?;
+    let planning_app = Application::new(state.paths.clone())?;
+    let snapshot = planning_app.open_space(repo.clone()).await?;
+    let baseline = lios_application::sha256_hex_file(&snapshot.local_path)?;
     let parent_path = catalog_node_path(&snapshot.tree, &parent_node_id)
         .ok_or_else(|| CommandError::invalid_input("upload destination folder was not found"))?;
     let remote_entries = catalog_tree_entries(&snapshot.tree);
@@ -1713,7 +1713,6 @@ async fn enqueue_upload_to_folder(
         &remote_entries,
         &conflict_resolutions,
     )?;
-    let baseline = lios_application::sha256_hex_file(&snapshot.local_path)?;
     let source_operand = prepared
         .source_paths
         .values()
@@ -1779,9 +1778,9 @@ async fn enqueue_download(
     key_from_config(&config)?;
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
-    let snapshot = Application::new(state.paths.clone())?
-        .open_space(repo.clone())
-        .await?;
+    let planning_app = Application::new(state.paths.clone())?;
+    let snapshot = planning_app.open_space(repo.clone()).await?;
+    let baseline = lios_application::sha256_hex_file(&snapshot.local_path)?;
     let sources = node_ids
         .iter()
         .map(|node_id| {
@@ -1798,7 +1797,6 @@ async fn enqueue_download(
         trailing_slash: true,
     };
     let prepared_pull = prepare_pull(&sources, &local_destination, &PlanOptions::default())?;
-    let baseline = lios_application::sha256_hex_file(&snapshot.local_path)?;
     let persisted = prepared_pull.into_persisted(
         node_ids.join("\0"),
         local_destination.path.to_string_lossy().into_owned(),
