@@ -205,6 +205,7 @@ impl Application {
                 None,
             ));
         }
+        clear_worker_controls(&self.paths, task_id);
         summary_for(&self.paths, task_id)
     }
 
@@ -215,6 +216,7 @@ impl Application {
                 "only failed tasks with a saved specification can retry",
             ));
         }
+        clear_worker_controls(&self.paths, task_id);
         summary_for(&self.paths, task_id)
     }
 
@@ -266,7 +268,9 @@ impl Application {
         if !space_id.is_empty() {
             let _ = lios_core::cache::cleanup_task_staging(&self.paths.staging, &space_id, task_id);
         }
-        store.delete(task_id).map_err(to_err)
+        store.delete(task_id).map_err(to_err)?;
+        clear_worker_controls(&self.paths, task_id);
+        Ok(())
     }
 
     async fn prepare_task_for_run(&self, task_id: Uuid, spec: &TaskSpec) -> CommandResult<bool> {
@@ -274,17 +278,10 @@ impl Application {
         let mut store = TaskStore::open(&self.paths.database).map_err(to_err)?;
         match summary.state {
             TaskState::Queued => Ok(false),
-            TaskState::Paused => {
-                if !store
-                    .transition_state(task_id, TaskState::Paused, TaskState::Queued)
-                    .map_err(to_err)?
-                {
-                    return Err(CommandError::invalid_input(
-                        "paused task could not be resumed",
-                    ));
-                }
-                Ok(false)
-            }
+            // Resuming is an explicit user action (`requeue_paused_task`). If a
+            // pause lands between worker selection and execution, leave the
+            // task paused instead of silently overriding the request.
+            TaskState::Paused => Ok(true),
             TaskState::Failed => {
                 if !store.requeue_failed(task_id).map_err(to_err)? {
                     return Err(CommandError::invalid_input("failed task cannot be retried"));
@@ -1348,6 +1345,11 @@ fn summary_for(paths: &LiosPaths, task_id: Uuid) -> CommandResult<TaskSummary> {
         .get_summary(task_id)
         .map_err(to_err)?
         .ok_or_else(|| CommandError::invalid_input("task was not found"))
+}
+
+fn clear_worker_controls(paths: &LiosPaths, task_id: Uuid) {
+    let _ = std::fs::remove_file(paths.worker_pause_path(task_id));
+    let _ = std::fs::remove_file(paths.worker_cancel_path(task_id));
 }
 
 fn task_repo(spec: &TaskSpec) -> &RepoConfig {

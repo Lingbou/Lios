@@ -76,6 +76,86 @@ fn foreground_task_is_durable_before_network_execution() {
     assert!(!persisted.can_retry);
 }
 
+#[test]
+fn resuming_a_paused_task_clears_stale_worker_controls() {
+    let (_temp, application, paths, repo) = configured_application();
+    let task = application.queue_verify_for(repo, false).unwrap();
+    TaskStore::open(&paths.database)
+        .unwrap()
+        .update_state(task.id, TaskState::Paused, None)
+        .unwrap();
+    paths.ensure_worker_control_dir().unwrap();
+    fs::write(paths.worker_pause_path(task.id), b"pause\n").unwrap();
+    fs::write(paths.worker_cancel_path(task.id), b"cancel\n").unwrap();
+
+    let resumed = application.requeue_paused_task(task.id).unwrap();
+
+    assert_eq!(resumed.state, TaskState::Queued);
+    assert!(!paths.worker_pause_path(task.id).exists());
+    assert!(!paths.worker_cancel_path(task.id).exists());
+}
+
+#[test]
+fn retrying_a_failed_task_clears_stale_worker_controls() {
+    let (_temp, application, paths, repo) = configured_application();
+    let task = application.queue_verify_for(repo, false).unwrap();
+    TaskStore::open(&paths.database)
+        .unwrap()
+        .update_state(task.id, TaskState::Failed, Some("failed".to_string()))
+        .unwrap();
+    paths.ensure_worker_control_dir().unwrap();
+    fs::write(paths.worker_pause_path(task.id), b"pause\n").unwrap();
+    fs::write(paths.worker_cancel_path(task.id), b"cancel\n").unwrap();
+
+    let retried = application.requeue_failed_task(task.id).unwrap();
+
+    assert_eq!(retried.state, TaskState::Queued);
+    assert!(!paths.worker_pause_path(task.id).exists());
+    assert!(!paths.worker_cancel_path(task.id).exists());
+}
+
+#[test]
+fn clearing_a_terminal_task_removes_worker_controls() {
+    let (_temp, application, paths, repo) = configured_application();
+    let task = application.queue_verify_for(repo, false).unwrap();
+    TaskStore::open(&paths.database)
+        .unwrap()
+        .update_state(task.id, TaskState::Completed, None)
+        .unwrap();
+    paths.ensure_worker_control_dir().unwrap();
+    fs::write(paths.worker_pause_path(task.id), b"pause\n").unwrap();
+    fs::write(paths.worker_cancel_path(task.id), b"cancel\n").unwrap();
+
+    application.clear_task(task.id).unwrap();
+
+    assert!(!paths.worker_pause_path(task.id).exists());
+    assert!(!paths.worker_cancel_path(task.id).exists());
+    assert!(TaskStore::open(&paths.database)
+        .unwrap()
+        .get_summary(task.id)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn paused_task_is_not_executed_by_a_worker_claim_race() {
+    let (_temp, application, paths, repo) = configured_application();
+    let task = application.queue_verify_for(repo, false).unwrap();
+    TaskStore::open(&paths.database)
+        .unwrap()
+        .update_state(task.id, TaskState::Paused, None)
+        .unwrap();
+
+    application.run_task(task.id).await.unwrap();
+
+    let persisted = TaskStore::open(&paths.database)
+        .unwrap()
+        .get_summary(task.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.state, TaskState::Paused);
+}
+
 #[tokio::test]
 async fn second_frontend_gets_a_typed_busy_error_for_the_same_space() {
     let (_temp, application, paths, repo) = configured_application();

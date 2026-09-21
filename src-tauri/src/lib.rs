@@ -1982,8 +1982,10 @@ async fn pause_task(
         Application::new(state.paths.clone())?
             .pause_task(task_id)
             .await?;
-        state.paths.ensure_worker_control_dir()?;
-        fs::write(state.paths.worker_pause_path(task_id), b"pause\n").map_err(to_err)?;
+        if summary.state == TaskState::Running {
+            state.paths.ensure_worker_control_dir()?;
+            fs::write(state.paths.worker_pause_path(task_id), b"pause\n").map_err(to_err)?;
+        }
     }
     emit_task(&app, &state.paths, task_id);
     Ok(())
@@ -2021,20 +2023,30 @@ async fn cancel_task(
 ) -> CommandResult<()> {
     let summary = task_summary_for_paths(&state.paths, task_id)?
         .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
-    if matches!(
-        summary.state,
-        TaskState::Queued | TaskState::Running | TaskState::Paused
-    ) {
-        Application::new(state.paths.clone())?
-            .cancel_task(task_id)
-            .await?;
-        if summary.state != TaskState::Queued {
+    match summary.state {
+        // Queued and paused tasks are not being executed, so the durable task
+        // state alone is enough; a control file would never be consumed.
+        TaskState::Queued | TaskState::Paused => {
+            Application::new(state.paths.clone())?
+                .cancel_task(task_id)
+                .await?;
+        }
+        // Cancel the durable state immediately, then ask the worker to drop
+        // the in-flight execution at its next interruptible boundary.
+        TaskState::Running => {
+            Application::new(state.paths.clone())?
+                .cancel_task(task_id)
+                .await?;
             state.paths.ensure_worker_control_dir()?;
             fs::write(state.paths.worker_cancel_path(task_id), b"cancel\n").map_err(to_err)?;
         }
-    } else {
-        state.paths.ensure_worker_control_dir()?;
-        fs::write(state.paths.worker_cancel_path(task_id), b"cancel\n").map_err(to_err)?;
+        // Committing cannot be interrupted; let the worker finish and remove
+        // the request when the task reaches a terminal state.
+        TaskState::Committing => {
+            state.paths.ensure_worker_control_dir()?;
+            fs::write(state.paths.worker_cancel_path(task_id), b"cancel\n").map_err(to_err)?;
+        }
+        _ => {}
     }
     emit_task(&app, &state.paths, task_id);
     Ok(())
