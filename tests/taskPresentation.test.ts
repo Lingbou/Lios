@@ -100,6 +100,41 @@ test("terminal task progress does not show stale speed or ETA", () => {
   );
 });
 
+test("completed task average speed uses the execution start, not queue time", () => {
+  const bytes = 60 * 1024 * 1024;
+  assert.equal(
+    taskProgressText({
+      state: "Completed",
+      label: "upload",
+      progress_done: 1,
+      progress_total: 1,
+      bytes_done: bytes,
+      bytes_total: bytes,
+      created_at: "2026-07-12T00:00:00Z",
+      started_at: "2026-07-12T00:09:00Z",
+      updated_at: "2026-07-12T00:10:00Z"
+    }),
+    "60 MB / 60 MB · 100% · 1.00 MB/s"
+  );
+});
+
+test("completed task average speed falls back to creation time", () => {
+  const bytes = 60 * 1024 * 1024;
+  assert.equal(
+    taskProgressText({
+      state: "Completed",
+      label: "upload",
+      progress_done: 1,
+      progress_total: 1,
+      bytes_done: bytes,
+      bytes_total: bytes,
+      created_at: "2026-07-12T00:00:00Z",
+      updated_at: "2026-07-12T00:00:10Z"
+    }),
+    "60 MB / 60 MB · 100% · 6.00 MB/s"
+  );
+});
+
 test("completed task status preserves integrity warnings", () => {
   assert.equal(
     taskStatusText({

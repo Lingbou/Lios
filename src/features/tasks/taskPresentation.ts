@@ -28,7 +28,7 @@ type TaskPresentationRecord = Pick<
   Partial<
     Pick<
       TaskSummary,
-      "phase" | "bytes_total" | "bytes_done" | "speed_bps" | "eta_seconds" | "attempt" | "error" | "created_at" | "updated_at"
+      "phase" | "bytes_total" | "bytes_done" | "speed_bps" | "eta_seconds" | "attempt" | "error" | "created_at" | "updated_at" | "started_at"
     >
   >;
 
@@ -166,8 +166,8 @@ export function taskProgressText(task: TaskPresentationRecord) {
     if (speed > 0) parts.push(`${formatTaskBytes(speed)}/s`);
     const eta = finiteNonNegative(task.eta_seconds);
     if (eta > 0) parts.push(`剩余 ${formatEta(eta)}`);
-  } else if (task.state === "Completed" && bytesTotal > 0 && task.created_at && task.updated_at) {
-    const start = Date.parse(task.created_at);
+  } else if (task.state === "Completed" && bytesTotal > 0 && task.updated_at) {
+    const start = Date.parse(task.started_at || task.created_at || "");
     const end = Date.parse(task.updated_at);
     if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
       const durationSeconds = (end - start) / 1000;

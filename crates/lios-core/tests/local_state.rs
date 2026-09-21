@@ -1996,6 +1996,12 @@ fn task_store_lists_valid_queued_specs_and_claims_each_task_once() {
 
     let claimed_spec = store.claim_queued(queued.id).unwrap().unwrap();
     assert_eq!(claimed_spec.space_id(), "novix/cold");
+    assert!(store
+        .get_summary(queued.id)
+        .unwrap()
+        .unwrap()
+        .started_at
+        .is_some());
     let mut second_connection = TaskStore::open(&db_path).unwrap();
     assert!(second_connection.claim_queued(queued.id).unwrap().is_none());
     assert!(second_connection.claim_queued(legacy.id).unwrap().is_none());
@@ -2010,6 +2016,10 @@ fn task_store_lists_valid_queued_specs_and_claims_each_task_once() {
     let claimed = second_connection.get(queued.id).unwrap().unwrap();
     assert_eq!(claimed.state, TaskState::Running);
     assert_eq!(claimed.phase, None);
+    let started_at = claimed
+        .started_at
+        .expect("claimed task records a start time");
+    assert!(chrono::DateTime::parse_from_rfc3339(&started_at).is_ok());
 }
 
 #[test]

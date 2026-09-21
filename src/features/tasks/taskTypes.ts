@@ -32,6 +32,7 @@ export type TaskSummary = {
   attempt: number;
   created_at: string;
   updated_at: string;
+  started_at?: string | null;
   error?: string | null;
   item_count: number;
   can_retry: boolean;

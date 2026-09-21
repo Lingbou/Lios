@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::config::RepoConfig;
 use crate::{LiosError, Result};
 
-const TASK_SCHEMA_VERSION: i64 = 6;
+const TASK_SCHEMA_VERSION: i64 = 7;
 const INVALID_TASK_SPEC_MESSAGE: &str = "persisted task specification is invalid";
 const TERMINAL_TASK_RETENTION_DAYS: i64 = 30;
 const MAX_TERMINAL_TASKS: usize = 500;
@@ -293,6 +293,7 @@ pub struct TaskRecord {
     pub attempt: u32,
     pub created_at: String,
     pub updated_at: String,
+    pub started_at: Option<String>,
     pub error: Option<String>,
     pub items: Vec<TaskItem>,
 }
@@ -313,6 +314,7 @@ pub struct TaskSummary {
     pub attempt: u32,
     pub created_at: String,
     pub updated_at: String,
+    pub started_at: Option<String>,
     pub error: Option<String>,
     pub item_count: u64,
     pub can_retry: bool,
@@ -333,6 +335,7 @@ type RawTaskSummary = (
     i64,
     String,
     String,
+    Option<String>,
     Option<String>,
     i64,
     Option<String>,
@@ -356,6 +359,7 @@ impl TaskRecord {
             attempt: 0,
             created_at: now.clone(),
             updated_at: now,
+            started_at: None,
             error: None,
             items: Vec::new(),
         }
@@ -892,7 +896,7 @@ impl TaskStore {
             r#"
             SELECT tasks.id, space_id, state, label, phase, progress_total,
                    progress_done, bytes_total, bytes_done, speed_bps, eta_seconds,
-                   attempt, created_at, updated_at, error,
+                   attempt, created_at, updated_at, started_at, error,
                    (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id), spec_json
             FROM tasks
             WHERE spec_json IS NOT NULL
@@ -903,7 +907,7 @@ impl TaskStore {
         let secondary_state = secondary_state.as_ref().map(TaskState::as_str);
         let rows = statement.query_map(
             rusqlite::params![primary_state.as_str(), secondary_state],
-            |row| Ok((raw_task_summary(row)?, row.get::<_, String>(16)?)),
+            |row| Ok((raw_task_summary(row)?, row.get::<_, String>(17)?)),
         )?;
         let mut tasks = Vec::new();
         for row in rows {
@@ -954,7 +958,8 @@ impl TaskStore {
         let changed = transaction.execute(
             r#"
             UPDATE tasks
-            SET state = ?2, phase = NULL, error = NULL, updated_at = ?3
+            SET state = ?2, phase = NULL, error = NULL,
+                started_at = ?3, updated_at = ?3
             WHERE id = ?1 AND state = ?4 AND spec_json IS NOT NULL
             "#,
             rusqlite::params![
@@ -1401,6 +1406,7 @@ impl TaskStore {
                 attempt: summary.attempt,
                 created_at: summary.created_at,
                 updated_at: summary.updated_at,
+                started_at: summary.started_at,
                 error: summary.error,
                 items: self.list_items(summary.id)?,
             });
@@ -1413,7 +1419,7 @@ impl TaskStore {
             r#"
             SELECT tasks.id, space_id, state, label, phase, progress_total,
                    progress_done, bytes_total, bytes_done, speed_bps, eta_seconds,
-                   attempt, created_at, updated_at, error,
+                   attempt, created_at, updated_at, started_at, error,
                    (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id),
                    CASE WHEN tasks.state = 'Failed' THEN spec_json ELSE NULL END
             FROM tasks
@@ -1440,7 +1446,7 @@ impl TaskStore {
                 r#"
                 SELECT tasks.id, space_id, state, label, phase, progress_total,
                        progress_done, bytes_total, bytes_done, speed_bps, eta_seconds,
-                       attempt, created_at, updated_at, error,
+                       attempt, created_at, updated_at, started_at, error,
                        (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id),
                        CASE WHEN tasks.state = 'Failed' THEN spec_json ELSE NULL END
                 FROM tasks
@@ -1473,6 +1479,7 @@ impl TaskStore {
             attempt: summary.attempt,
             created_at: summary.created_at,
             updated_at: summary.updated_at,
+            started_at: summary.started_at,
             error: summary.error,
             items: self.list_items(id)?,
         }))
@@ -1496,8 +1503,9 @@ fn raw_task_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTaskSummary>
         row.get::<_, String>(12)?,
         row.get::<_, String>(13)?,
         row.get::<_, Option<String>>(14)?,
-        row.get::<_, i64>(15)?,
-        row.get::<_, Option<String>>(16)?,
+        row.get::<_, Option<String>>(15)?,
+        row.get::<_, i64>(16)?,
+        row.get::<_, Option<String>>(17)?,
     ))
 }
 
@@ -1517,6 +1525,7 @@ fn decode_task_summary(raw: RawTaskSummary) -> Result<TaskSummary> {
         attempt,
         created_at,
         updated_at,
+        started_at,
         error,
         item_count,
         spec_json,
@@ -1542,6 +1551,7 @@ fn decode_task_summary(raw: RawTaskSummary) -> Result<TaskSummary> {
         })?,
         created_at,
         updated_at,
+        started_at,
         error,
         item_count: persisted_u64(item_count, "task item count")?,
         can_retry,
@@ -1629,9 +1639,9 @@ fn upsert_task_on(
         INSERT INTO tasks
             (id, space_id, state, label, phase, progress_total, progress_done,
              bytes_total, bytes_done, speed_bps, eta_seconds, attempt, spec_json,
-             created_at, updated_at, error)
+             created_at, updated_at, started_at, error)
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         ON CONFLICT(id) DO UPDATE SET
             space_id = excluded.space_id,
             state = excluded.state,
@@ -1646,6 +1656,7 @@ fn upsert_task_on(
             attempt = excluded.attempt,
             spec_json = COALESCE(excluded.spec_json, tasks.spec_json),
             updated_at = excluded.updated_at,
+            started_at = COALESCE(excluded.started_at, tasks.started_at),
             error = excluded.error
         "#,
         rusqlite::params![
@@ -1666,6 +1677,7 @@ fn upsert_task_on(
             spec_json,
             &task.created_at,
             &task.updated_at,
+            &task.started_at,
             &task.error,
         ],
     )?;
@@ -1810,6 +1822,7 @@ fn ensure_task_store_schema(connection: &mut rusqlite::Connection) -> Result<()>
             spec_json TEXT,
             created_at TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT '',
+            started_at TEXT,
             error TEXT
         );
         CREATE TABLE IF NOT EXISTS task_items (
