@@ -551,14 +551,25 @@ pub fn prepare_pull(
         sources,
         local_destination,
         options,
+        PullConflictMode::Fail,
         |root, _source_entries| snapshot_local_destination(root),
     )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PullConflictMode {
+    /// rsync semantics: conflicting destination types make the plan fail.
+    Fail,
+    /// Desktop download semantics: keep the local entry and restore the
+    /// incoming entry under a `name (restored N)` sibling.
+    Rename,
 }
 
 fn prepare_pull_with_snapshot(
     sources: &[RemoteSource],
     local_destination: &LocalLocation,
     options: &PlanOptions,
+    conflict_mode: PullConflictMode,
     snapshot_destination: impl FnOnce(
         &Path,
         &[TreeEntry],
@@ -649,9 +660,18 @@ fn prepare_pull_with_snapshot(
         }
     }
 
-    let source_entries = source_entries.into_values().collect::<Vec<_>>();
+    let mut source_entries = source_entries.into_values().collect::<Vec<_>>();
     let (destination_entries, destination_fingerprints) =
         snapshot_destination(&destination_root, &source_entries)?;
+    if conflict_mode == PullConflictMode::Rename {
+        source_entries = rename_download_type_conflicts(
+            source_entries,
+            &mut remote_node_ids,
+            &mut exclude_root,
+            &destination_entries,
+            &destination_root,
+        )?;
+    }
     let scoped_destination = transfer_scope_entries(
         &source_entries,
         &destination_entries,
@@ -693,6 +713,7 @@ pub fn prepare_download(
         sources,
         local_destination,
         &PlanOptions::default(),
+        PullConflictMode::Rename,
         snapshot_download_destination,
     )?;
     rename_existing_file_conflicts(&mut prepared)?;
@@ -712,8 +733,14 @@ fn snapshot_download_destination(
         let path = root.join(Path::new(&source.path));
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(to_err(error)),
+            Err(error) => {
+                // A parent directory may have been replaced by a file, in
+                // which case the planned path simply does not exist yet.
+                if error.kind() == std::io::ErrorKind::NotFound || path_is_absent(&path) {
+                    continue;
+                }
+                return Err(to_err(error));
+            }
         };
         if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
             return Err(CommandError::invalid_input(
@@ -736,6 +763,120 @@ fn snapshot_download_destination(
         }
     }
     Ok((entries, fingerprints))
+}
+
+/// Whether a failed metadata lookup means the path cannot exist because one
+/// of its parents is not a directory.
+fn path_is_absent(path: &Path) -> bool {
+    let mut current = path.parent();
+    while let Some(ancestor) = current {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => return !metadata.is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = ancestor.parent();
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn rename_download_type_conflicts(
+    source_entries: Vec<TreeEntry>,
+    remote_node_ids: &mut BTreeMap<String, String>,
+    exclude_root: &mut Option<String>,
+    destination_entries: &[TreeEntry],
+    destination_root: &Path,
+) -> CommandResult<Vec<TreeEntry>> {
+    let destination_kinds = destination_entries
+        .iter()
+        .map(|entry| (entry.path.to_ascii_lowercase(), entry.kind))
+        .collect::<BTreeMap<_, _>>();
+    let mut renames = Vec::<(String, String)>::new();
+    for entry in &source_entries {
+        if renames
+            .iter()
+            .any(|(old, _new)| is_path_or_descendant(&entry.path, old))
+        {
+            continue;
+        }
+        let Some(kind) = destination_kinds.get(&entry.path.to_ascii_lowercase()) else {
+            continue;
+        };
+        if *kind == entry.kind {
+            continue;
+        }
+        let renamed = restored_sibling_path(destination_root, &entry.path, &renames)?;
+        renames.push((entry.path.clone(), renamed));
+    }
+    if renames.is_empty() {
+        return Ok(source_entries);
+    }
+
+    let mut rewritten = Vec::with_capacity(source_entries.len());
+    for mut entry in source_entries {
+        if let Some((old, new)) = renames
+            .iter()
+            .find(|(old, _new)| is_path_or_descendant(&entry.path, old))
+        {
+            let new_path = format!("{new}{}", &entry.path[old.len()..]);
+            if let Some(node_id) = remote_node_ids.remove(&entry.path) {
+                remote_node_ids.insert(new_path.clone(), node_id);
+            }
+            entry.path = new_path;
+        }
+        rewritten.push(entry);
+    }
+    if let Some(root) = exclude_root.as_mut() {
+        if let Some((old, new)) = renames
+            .iter()
+            .find(|(old, _new)| is_path_or_descendant(root, old))
+        {
+            *root = format!("{new}{}", &root[old.len()..]);
+        }
+    }
+    Ok(rewritten)
+}
+
+fn restored_sibling_path(
+    destination_root: &Path,
+    path: &str,
+    assigned: &[(String, String)],
+) -> CommandResult<String> {
+    let (parent, name) = path
+        .rsplit_once('/')
+        .map_or(("", path), |(parent, name)| (parent, name));
+    let parent_dir = if parent.is_empty() {
+        destination_root.to_path_buf()
+    } else {
+        destination_root.join(parent)
+    };
+    let mut taken = BTreeSet::new();
+    if parent_dir.is_dir() {
+        for entry in fs::read_dir(&parent_dir).map_err(to_err)? {
+            taken.insert(
+                entry
+                    .map_err(to_err)?
+                    .file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase(),
+            );
+        }
+    }
+    for (_old, new) in assigned {
+        let (new_parent, new_name) = new
+            .rsplit_once('/')
+            .map_or(("", new.as_str()), |(parent, name)| (parent, name));
+        if new_parent == parent {
+            taken.insert(new_name.to_ascii_lowercase());
+        }
+    }
+    let renamed = restored_available_name(&taken, name);
+    Ok(if parent.is_empty() {
+        renamed
+    } else {
+        format!("{parent}/{renamed}")
+    })
 }
 
 fn rename_existing_file_conflicts(prepared: &mut PreparedPull) -> CommandResult<()> {

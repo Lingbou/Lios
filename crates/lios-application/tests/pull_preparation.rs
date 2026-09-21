@@ -102,6 +102,114 @@ fn download_ignores_unrelated_destination_entries() {
 }
 
 #[test]
+fn download_renames_a_file_that_conflicts_with_an_existing_directory() {
+    let temp = tempdir().unwrap();
+    let destination = temp.path().join("restore");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::create_dir(destination.join("report.txt")).unwrap();
+
+    let prepared = prepare_download(
+        &[RemoteSource {
+            node: remote_file("report.txt", &"a".repeat(64), 6),
+            trailing_slash: false,
+        }],
+        &LocalLocation {
+            path: destination.clone(),
+            trailing_slash: true,
+        },
+    )
+    .unwrap();
+
+    assert!(prepared.plan.action("report.txt").is_none());
+    assert_eq!(
+        prepared
+            .plan
+            .action("report (restored 1).txt")
+            .unwrap()
+            .kind,
+        PlanActionKind::Create
+    );
+    assert_eq!(
+        prepared.destination_paths.get("report (restored 1).txt"),
+        Some(&destination.join("report (restored 1).txt"))
+    );
+    assert!(destination.join("report.txt").is_dir());
+
+    let persisted = prepared.into_persisted(
+        "source".to_string(),
+        "destination".to_string(),
+        false,
+        Vec::new(),
+        None,
+        None,
+    );
+    let action = persisted
+        .actions
+        .iter()
+        .find(|action| action.relative_path == "report (restored 1).txt")
+        .unwrap();
+    assert_eq!(action.remote_node_id.as_deref(), Some("report.txt-id"));
+}
+
+#[test]
+fn download_renames_a_directory_that_conflicts_with_an_existing_file() {
+    let temp = tempdir().unwrap();
+    let destination = temp.path().join("restore");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("photos"), b"local file").unwrap();
+
+    let prepared = prepare_download(
+        &[RemoteSource {
+            node: remote_dir(),
+            trailing_slash: false,
+        }],
+        &LocalLocation {
+            path: destination.clone(),
+            trailing_slash: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.plan.action("photos (restored 1)").unwrap().kind,
+        PlanActionKind::Create
+    );
+    assert_eq!(
+        prepared
+            .plan
+            .action("photos (restored 1)/image.jpg")
+            .unwrap()
+            .kind,
+        PlanActionKind::Create
+    );
+    assert_eq!(
+        prepared
+            .destination_paths
+            .get("photos (restored 1)/image.jpg"),
+        Some(&destination.join("photos (restored 1)").join("image.jpg"))
+    );
+    assert_eq!(
+        std::fs::read(destination.join("photos")).unwrap(),
+        b"local file"
+    );
+
+    let persisted = prepared.into_persisted(
+        "source".to_string(),
+        "destination".to_string(),
+        false,
+        Vec::new(),
+        None,
+        None,
+    );
+    let action = persisted
+        .actions
+        .iter()
+        .find(|action| action.relative_path == "photos (restored 1)/image.jpg")
+        .unwrap();
+    assert_eq!(action.remote_node_id.as_deref(), Some("file-id"));
+}
+
+#[test]
 fn download_uses_next_restored_name_when_first_is_taken() {
     let temp = tempdir().unwrap();
     let destination = temp.path().join("restore");
