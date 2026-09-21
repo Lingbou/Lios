@@ -1229,12 +1229,16 @@ fn set_chunk_size(
 
 #[tauri::command]
 fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandResult<()> {
-    state.paths.ensure_dirs().map_err(to_err)?;
-    let registry = SpaceRegistry::new(state.paths.clone());
-    let resolved = registry.resolve(&name).ok();
+    remove_space_for_paths(&state.paths, &name)
+}
+
+fn remove_space_for_paths(paths: &LiosPaths, name: &str) -> CommandResult<()> {
+    paths.ensure_dirs().map_err(to_err)?;
+    let registry = SpaceRegistry::new(paths.clone());
+    let resolved = registry.resolve(name).ok();
     if let Some(repo) = &resolved {
         let scope = TaskScope::from_repo(repo);
-        let store = TaskStore::open(&state.paths.database).map_err(to_err)?;
+        let store = TaskStore::open(&paths.database).map_err(to_err)?;
         if store
             .list_summaries()
             .map_err(to_err)?
@@ -1246,10 +1250,37 @@ fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandRes
             ));
         }
     }
-    registry.remove(&name)?;
+    // Serialize with the worker and foreground operations for this space so
+    // the staging directory cannot be deleted while it is in use.
+    let _space_guard = match &resolved {
+        Some(repo) => {
+            let scope = TaskScope::from_repo(repo);
+            Some(
+                paths
+                    .try_lock_space(&scope.space_id)
+                    .map_err(CommandError::from)?,
+            )
+        }
+        None => None,
+    };
+    if let Some(repo) = &resolved {
+        let scope = TaskScope::from_repo(repo);
+        let store = TaskStore::open(&paths.database).map_err(to_err)?;
+        if store
+            .list_summaries()
+            .map_err(to_err)?
+            .iter()
+            .any(|task| task.space_id == scope.space_id && task_state_is_active(&task.state))
+        {
+            return Err(CommandError::invalid_input(
+                "cannot remove a space while one of its tasks is active",
+            ));
+        }
+    }
+    registry.remove(name)?;
     if let Some(repo) = resolved {
         let scope = TaskScope::from_repo(&repo);
-        let space_staging = state.paths.staging.join(&scope.space_id);
+        let space_staging = paths.staging.join(&scope.space_id);
         if space_staging.exists() {
             let _ = fs::remove_dir_all(&space_staging);
         }
@@ -2104,6 +2135,8 @@ pub fn run() {
 mod task_center_backend_tests {
     use std::path::PathBuf;
 
+    use lios_application::space_registry::SpaceRegistry;
+    use lios_application::task_support::TaskScope;
     use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
     use lios_core::tasks::{
         TaskItem, TaskItemState, TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary,
@@ -2116,9 +2149,41 @@ mod task_center_backend_tests {
     use super::{
         cleanup_is_safe, clear_task_record, list_task_items_for_paths, paths_dto,
         persist_transfer_submission, recover_startup_tasks, recovery_key_status,
-        submission_summary, task_summaries_for_paths, AppContext, CommandError, CommandErrorCode,
-        SetupSnapshot, TaskUpdateEvent,
+        remove_space_for_paths, submission_summary, task_summaries_for_paths, AppContext,
+        CommandError, CommandErrorCode, SetupSnapshot, TaskUpdateEvent,
     };
+
+    fn configured_space(paths: &LiosPaths) -> RepoConfig {
+        paths.ensure_dirs().unwrap();
+        let repo = RepoConfig {
+            namespace: "novix".to_string(),
+            dataset: "cold".to_string(),
+            endpoint: "https://modelscope.cn".to_string(),
+            title: None,
+        };
+        let mut config = LiosConfig::load(&paths.config).unwrap_or_default();
+        config.spaces.insert("cold".to_string(), repo.clone());
+        config.save(&paths.config).unwrap();
+        repo
+    }
+
+    #[test]
+    fn remove_space_refuses_while_the_space_lock_is_held() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        let repo = configured_space(&paths);
+        let scope = TaskScope::from_repo(&repo);
+        let guard = paths.try_lock_space(&scope.space_id).unwrap();
+
+        let error = remove_space_for_paths(&paths, "cold").unwrap_err();
+
+        assert_eq!(error.code, CommandErrorCode::Busy);
+        assert!(SpaceRegistry::new(paths.clone()).resolve("cold").is_ok());
+
+        drop(guard);
+        remove_space_for_paths(&paths, "cold").unwrap();
+        assert!(SpaceRegistry::new(paths).resolve("cold").is_err());
+    }
 
     fn corrupt_task_item_state(paths: &LiosPaths, item_id: Uuid) {
         let connection = rusqlite::Connection::open(&paths.database).unwrap();
