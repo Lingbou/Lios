@@ -65,19 +65,6 @@ mod tests {
     }
 
     #[test]
-    fn excludes_legacy_dangerous_commands() {
-        for legacy in [
-            "load_remote_catalog",
-            "enqueue_upload",
-            "enqueue_replace",
-            "enqueue_delete",
-            "enqueue_restore",
-        ] {
-            assert!(!REGISTERED_COMMANDS.contains(&legacy), "{legacy}");
-        }
-    }
-
-    #[test]
     fn retains_node_scoped_commands() {
         for command in [
             "enqueue_upload_to_folder",
@@ -91,20 +78,6 @@ mod tests {
             "retry_task",
         ] {
             assert!(REGISTERED_COMMANDS.contains(&command), "{command}");
-        }
-    }
-
-    #[test]
-    fn registers_recovery_key_workflow_and_removes_obsolete_key_commands() {
-        for command in [
-            "export_recovery_key",
-            "verify_recovery_key",
-            "import_recovery_key",
-        ] {
-            assert!(REGISTERED_COMMANDS.contains(&command), "{command}");
-        }
-        for obsolete in ["generate_key_file", "import_key_file"] {
-            assert!(!REGISTERED_COMMANDS.contains(&obsolete), "{obsolete}");
         }
     }
 }

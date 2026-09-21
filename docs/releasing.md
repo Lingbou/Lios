@@ -51,11 +51,6 @@ Desktop and CLI executable names are intentionally separate: Windows and Linux D
 install `lios-desktop` (`lios-desktop.exe` on Windows), while only the separately packaged CLI may
 own `/usr/bin/lios`. Desktop installers do not add their installation directory to `PATH`.
 
-The pre-1.0 executable rename does not support an in-place upgrade from the old `lios` Desktop
-binary. Uninstall the old 0.1.x Desktop package before installing the renamed build. Uninstalling
-the application must leave the user's `~/.lios` configuration, tasks, credentials, staging state,
-logs, and recovery key intact.
-
 ## Current unsigned release policy
 
 The first release series intentionally does not apply Lios-controlled package signatures:

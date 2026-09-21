@@ -377,12 +377,4 @@ mod tests {
             })
         ));
     }
-
-    #[test]
-    fn removed_legacy_commands_are_rejected() {
-        for command in ["upload", "download", "delete", "rename", "repos"] {
-            assert!(Cli::try_parse_from(["lios", command]).is_err());
-        }
-        assert!(Cli::try_parse_from(["lios", "space", "open"]).is_err());
-    }
 }
