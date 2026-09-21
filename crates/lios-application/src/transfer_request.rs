@@ -856,6 +856,12 @@ fn snapshot_directory(
         let target = join_catalog(target_base, &relative);
         if metadata.is_dir() {
             insert_directory_with_ancestors(entries, &target);
+            source_paths
+                .entry(target.clone())
+                .or_insert_with(|| entry.path().to_path_buf());
+            fingerprints
+                .entry(target)
+                .or_insert(local_fingerprint(&metadata)?);
         } else if metadata.is_file() {
             insert_file(
                 entries,

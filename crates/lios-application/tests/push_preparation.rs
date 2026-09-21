@@ -1,6 +1,7 @@
 use lios_core::catalog::{
     CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution,
 };
+use lios_core::tasks::TransferActionKind;
 
 use lios_application::location::LocalLocation;
 use lios_application::transfer_planner::{PlanActionKind, PlanOptions, TreeEntry};
@@ -8,6 +9,42 @@ use lios_application::transfer_request::{
     catalog_node_path, catalog_tree_entries, prepare_push, prepare_upload,
 };
 use tempfile::tempdir;
+
+#[test]
+fn persisted_push_plan_tracks_nested_directories_for_change_detection() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("docs");
+    std::fs::create_dir_all(source.join("sub")).unwrap();
+    std::fs::write(source.join("sub").join("file.txt"), b"data").unwrap();
+
+    let prepared = prepare_push(
+        &[LocalLocation {
+            path: source,
+            trailing_slash: false,
+        }],
+        "/",
+        &[],
+        &PlanOptions::default(),
+    )
+    .unwrap();
+    let persisted = prepared.into_persisted(
+        "source".to_string(),
+        "/".to_string(),
+        false,
+        Vec::new(),
+        None,
+        None,
+    );
+
+    let nested = persisted
+        .actions
+        .iter()
+        .find(|action| action.relative_path == "docs/sub")
+        .unwrap();
+    assert_eq!(nested.kind, TransferActionKind::Create);
+    assert!(nested.source_path.is_some());
+    assert!(nested.source_fingerprint.is_some());
+}
 
 #[test]
 fn directory_trailing_slash_changes_only_the_destination_mapping() {
