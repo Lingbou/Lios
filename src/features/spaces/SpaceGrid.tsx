@@ -1,4 +1,4 @@
-import { AlertTriangle, ChevronRight, Cloud, HardDrive, Plus, RefreshCw, Settings, Trash2 } from "lucide-react";
+import { AlertTriangle, Cloud, HardDrive, Plus, RefreshCw, Settings, Trash2 } from "lucide-react";
 import { memo } from "react";
 import type { SpaceSummary } from "../../appTypes.ts";
 
@@ -135,10 +135,8 @@ function SpaceGridComponent({
                         <Trash2 aria-hidden />
                       </button>
                     )}
-                    {hasNonAscii ? (
+                    {hasNonAscii && (
                       <AlertTriangle className="unsupportedIcon" aria-hidden />
-                    ) : (
-                      <ChevronRight aria-hidden />
                     )}
                   </div>
                 </div>
