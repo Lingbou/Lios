@@ -1,8 +1,12 @@
-use lios_core::catalog::{ConflictAction, ConflictResolution};
+use lios_core::catalog::{
+    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution,
+};
 
 use lios_application::location::LocalLocation;
 use lios_application::transfer_planner::{PlanActionKind, PlanOptions, TreeEntry};
-use lios_application::transfer_request::{prepare_push, prepare_upload};
+use lios_application::transfer_request::{
+    catalog_node_path, catalog_tree_entries, prepare_push, prepare_upload,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -36,6 +40,46 @@ fn directory_trailing_slash_changes_only_the_destination_mapping() {
     assert!(with_directory.plan.action("backup/dir/file.txt").is_some());
     assert!(contents_only.plan.action("backup/file.txt").is_some());
     assert!(contents_only.plan.action("backup/dir/file.txt").is_none());
+}
+
+#[test]
+fn catalog_helpers_flatten_without_the_root_and_resolve_node_paths() {
+    let tree = CatalogTreeNode {
+        id: "root".to_string(),
+        name: "Space".to_string(),
+        updated_at: String::new(),
+        kind: CatalogTreeNodeKind::Directory {
+            children: vec![CatalogTreeNode {
+                id: "folder".to_string(),
+                name: "docs".to_string(),
+                updated_at: String::new(),
+                kind: CatalogTreeNodeKind::Directory {
+                    children: vec![CatalogTreeNode {
+                        id: "file".to_string(),
+                        name: "a.txt".to_string(),
+                        updated_at: String::new(),
+                        kind: CatalogTreeNodeKind::File {
+                            original_size: 1,
+                            sha256: "a".repeat(64),
+                            object_id: "b".repeat(32),
+                            chunk_count: 1,
+                        },
+                    }],
+                },
+            }],
+        },
+    };
+
+    assert_eq!(catalog_node_path(&tree, "root").as_deref(), Some(""));
+    assert_eq!(catalog_node_path(&tree, "folder").as_deref(), Some("docs"));
+    assert_eq!(
+        catalog_node_path(&tree, "file").as_deref(),
+        Some("docs/a.txt")
+    );
+    let entries = catalog_tree_entries(&tree);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].path, "docs");
+    assert_eq!(entries[1].path, "docs/a.txt");
 }
 
 #[test]
