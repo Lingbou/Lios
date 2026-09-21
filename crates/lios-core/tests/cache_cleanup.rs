@@ -69,11 +69,9 @@ fn reset_shared_staging_preserves_task_scopes_and_removes_shared_cache() {
     let tmp = tempdir().unwrap();
     let paths = LiosPaths::from_home(tmp.path());
     paths.ensure_dirs().unwrap();
-    let account_id = "a".repeat(64);
     let space_id = "b".repeat(64);
     let task_file = paths
         .staging
-        .join(&account_id)
         .join(&space_id)
         .join(Uuid::new_v4().to_string())
         .join("chunk.lios");
@@ -96,21 +94,19 @@ use uuid::Uuid;
 fn cleanup_task_staging_removes_task_folder_and_empty_parents() {
     let tmp = tempdir().unwrap();
     let staging = tmp.path().join("staging");
-    let account_id = "a".repeat(64);
     let space_id = "b".repeat(64);
     let task_id = Uuid::new_v4();
 
     let task_file = staging
-        .join(&account_id)
         .join(&space_id)
         .join(task_id.to_string())
         .join("chunks/data.lios");
     write_file(&task_file, b"staged data");
 
-    let report = cleanup_task_staging(&staging, &account_id, &space_id, task_id).unwrap();
+    let report = cleanup_task_staging(&staging, &space_id, task_id).unwrap();
 
     assert!(!task_file.exists());
-    assert!(!staging.join(&account_id).exists());
+    assert!(!staging.join(&space_id).exists());
     assert_eq!(report.files_removed, 1);
     assert_eq!(report.bytes_removed, b"staged data".len() as u64);
 }
@@ -119,18 +115,15 @@ fn cleanup_task_staging_removes_task_folder_and_empty_parents() {
 fn cleanup_all_inactive_staging_prunes_only_terminal_and_orphaned_tasks() {
     let tmp = tempdir().unwrap();
     let staging = tmp.path().join("staging");
-    let account_id = "a".repeat(64);
     let space_id = "b".repeat(64);
     let active_task_id = Uuid::new_v4();
     let completed_task_id = Uuid::new_v4();
 
     let active_file = staging
-        .join(&account_id)
         .join(&space_id)
         .join(active_task_id.to_string())
         .join("chunks/active.lios");
     let completed_file = staging
-        .join(&account_id)
         .join(&space_id)
         .join(completed_task_id.to_string())
         .join("chunks/completed.lios");
@@ -152,17 +145,14 @@ fn cleanup_all_inactive_staging_prunes_only_terminal_and_orphaned_tasks() {
 fn inactive_sweep_preserves_shared_entries_and_active_downloads() {
     let tmp = tempdir().unwrap();
     let staging = tmp.path().join("staging");
-    let account = "a".repeat(64);
     let space = "b".repeat(64);
     let active_id = Uuid::new_v4();
     let inactive_id = Uuid::new_v4();
     let active_download = staging
-        .join(&account)
         .join(&space)
         .join(active_id.to_string())
         .join("chunk.download");
     let inactive_file = staging
-        .join(&account)
         .join(&space)
         .join(inactive_id.to_string())
         .join("chunk.lios");

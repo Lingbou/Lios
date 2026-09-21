@@ -7,11 +7,10 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::catalog::{ConflictResolution, SourceSnapshotReport};
 use crate::config::RepoConfig;
 use crate::{LiosError, Result};
 
-const TASK_SCHEMA_VERSION: i64 = 5;
+const TASK_SCHEMA_VERSION: i64 = 6;
 const INVALID_TASK_SPEC_MESSAGE: &str = "persisted task specification is invalid";
 const TERMINAL_TASK_RETENTION_DAYS: i64 = 30;
 const MAX_TERMINAL_TASKS: usize = 500;
@@ -81,10 +80,8 @@ pub struct PersistedTransferPlan {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskState {
     Queued,
-    Preparing,
     Running,
     Paused,
-    Retrying,
     Committing,
     Failed,
     Completed,
@@ -95,10 +92,8 @@ impl TaskState {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Queued => "Queued",
-            Self::Preparing => "Preparing",
             Self::Running => "Running",
             Self::Paused => "Paused",
-            Self::Retrying => "Retrying",
             Self::Committing => "Committing",
             Self::Failed => "Failed",
             Self::Completed => "Completed",
@@ -109,10 +104,8 @@ impl TaskState {
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "Queued" => Ok(Self::Queued),
-            "Preparing" => Ok(Self::Preparing),
             "Running" => Ok(Self::Running),
             "Paused" => Ok(Self::Paused),
-            "Retrying" => Ok(Self::Retrying),
             "Committing" => Ok(Self::Committing),
             "Failed" => Ok(Self::Failed),
             "Completed" => Ok(Self::Completed),
@@ -127,49 +120,22 @@ impl TaskState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskSpec {
-    Copy {
-        account_id: String,
+    Transfer {
         space_id: String,
         repo: RepoConfig,
         plan: PersistedTransferPlan,
-    },
-    Sync {
-        account_id: String,
-        space_id: String,
-        repo: RepoConfig,
-        plan: PersistedTransferPlan,
-    },
-    Upload {
-        account_id: String,
-        space_id: String,
-        repo: RepoConfig,
-        parent_node_id: String,
-        source_paths: Vec<PathBuf>,
-        source_snapshot: SourceSnapshotReport,
-        chunk_size: usize,
-        conflict_resolutions: Vec<ConflictResolution>,
     },
     Delete {
-        account_id: String,
         space_id: String,
         repo: RepoConfig,
         node_ids: Vec<String>,
-    },
-    Download {
-        account_id: String,
-        space_id: String,
-        repo: RepoConfig,
-        node_ids: Vec<String>,
-        output_dir: PathBuf,
     },
     VerifySpace {
-        account_id: String,
         space_id: String,
         repo: RepoConfig,
         full: bool,
     },
     RebuildCatalog {
-        account_id: String,
         space_id: String,
         repo: RepoConfig,
         expected_revision: String,
@@ -177,25 +143,10 @@ pub enum TaskSpec {
 }
 
 impl TaskSpec {
-    pub fn account_id(&self) -> &str {
-        match self {
-            Self::Copy { account_id, .. }
-            | Self::Sync { account_id, .. }
-            | Self::Upload { account_id, .. }
-            | Self::Delete { account_id, .. }
-            | Self::Download { account_id, .. }
-            | Self::VerifySpace { account_id, .. }
-            | Self::RebuildCatalog { account_id, .. } => account_id,
-        }
-    }
-
     pub fn space_id(&self) -> &str {
         match self {
-            Self::Copy { space_id, .. }
-            | Self::Sync { space_id, .. }
-            | Self::Upload { space_id, .. }
+            Self::Transfer { space_id, .. }
             | Self::Delete { space_id, .. }
-            | Self::Download { space_id, .. }
             | Self::VerifySpace { space_id, .. }
             | Self::RebuildCatalog { space_id, .. } => space_id,
         }
@@ -203,11 +154,11 @@ impl TaskSpec {
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Copy { .. } => "copy",
-            Self::Sync { .. } => "sync",
-            Self::Upload { .. } => "upload",
+            Self::Transfer { plan, .. } => match plan.direction {
+                TransferDirection::Push => "upload",
+                TransferDirection::Pull => "download",
+            },
             Self::Delete { .. } => "delete",
-            Self::Download { .. } => "download",
             Self::VerifySpace { full: false, .. } => "verify_quick",
             Self::VerifySpace { full: true, .. } => "verify_full",
             Self::RebuildCatalog { .. } => "rebuild",
@@ -329,7 +280,6 @@ pub struct TaskRecoveryReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub id: Uuid,
-    pub account_id: String,
     pub space_id: String,
     pub state: TaskState,
     pub label: String,
@@ -350,7 +300,6 @@ pub struct TaskRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskSummary {
     pub id: Uuid,
-    pub account_id: String,
     pub space_id: String,
     pub state: TaskState,
     pub label: String,
@@ -370,7 +319,6 @@ pub struct TaskSummary {
 }
 
 type RawTaskSummary = (
-    String,
     String,
     String,
     String,
@@ -395,7 +343,6 @@ impl TaskRecord {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
             id: Uuid::new_v4(),
-            account_id: String::new(),
             space_id: String::new(),
             state: TaskState::Queued,
             label: label.into(),
@@ -416,7 +363,6 @@ impl TaskRecord {
 
     pub fn queued_for_spec(spec: &TaskSpec) -> Self {
         let mut task = Self::queued(spec.label(), 0);
-        task.account_id = spec.account_id().to_string();
         task.space_id = spec.space_id().to_string();
         task
     }
@@ -519,30 +465,26 @@ impl TaskStore {
                 r#"
                 UPDATE tasks
                 SET state = ?2, error = NULL, updated_at = ?3
-                WHERE id = ?1 AND state IN (?4, ?5, ?6)
+                WHERE id = ?1 AND state = ?4
                 "#,
                 rusqlite::params![
                     id.to_string(),
                     TaskState::Running.as_str(),
                     now_timestamp(),
-                    TaskState::Preparing.as_str(),
                     TaskState::Running.as_str(),
-                    TaskState::Retrying.as_str(),
                 ],
             )?,
             TaskState::Committing => self.connection.execute(
                 r#"
                 UPDATE tasks
                 SET state = ?2, error = NULL, updated_at = ?3
-                WHERE id = ?1 AND state IN (?4, ?5, ?6, ?7)
+                WHERE id = ?1 AND state IN (?4, ?5)
                 "#,
                 rusqlite::params![
                     id.to_string(),
                     TaskState::Committing.as_str(),
                     now_timestamp(),
-                    TaskState::Preparing.as_str(),
                     TaskState::Running.as_str(),
-                    TaskState::Retrying.as_str(),
                     TaskState::Committing.as_str(),
                 ],
             )?,
@@ -562,16 +504,14 @@ impl TaskStore {
                 UPDATE tasks
                 SET state = ?2, phase = NULL, speed_bps = 0, eta_seconds = NULL,
                     error = NULL, updated_at = ?3
-                WHERE id = ?1 AND state IN (?4, ?5, ?6, ?7)
+                WHERE id = ?1 AND state IN (?4, ?5)
                 "#,
                 rusqlite::params![
                     id.to_string(),
                     TaskState::Paused.as_str(),
                     now_timestamp(),
                     TaskState::Queued.as_str(),
-                    TaskState::Preparing.as_str(),
                     TaskState::Running.as_str(),
-                    TaskState::Retrying.as_str(),
                 ],
             )?,
             TaskState::Canceled => self.connection.execute(
@@ -579,17 +519,15 @@ impl TaskStore {
                 UPDATE tasks
                 SET state = ?2, phase = NULL, speed_bps = 0, eta_seconds = NULL,
                     error = NULL, updated_at = ?3
-                WHERE id = ?1 AND state IN (?4, ?5, ?6, ?7, ?8)
+                WHERE id = ?1 AND state IN (?4, ?5, ?6)
                 "#,
                 rusqlite::params![
                     id.to_string(),
                     TaskState::Canceled.as_str(),
                     now_timestamp(),
                     TaskState::Queued.as_str(),
-                    TaskState::Preparing.as_str(),
                     TaskState::Running.as_str(),
                     TaskState::Paused.as_str(),
-                    TaskState::Retrying.as_str(),
                 ],
             )?,
             _ => {
@@ -613,33 +551,6 @@ impl TaskStore {
             ],
         )?;
         Ok(())
-    }
-
-    pub fn schedule_retry(&self, id: Uuid, attempt: u32, error: &str) -> Result<bool> {
-        let changed = self.connection.execute(
-            r#"
-            UPDATE tasks
-            SET state = ?2,
-                phase = 'retrying',
-                speed_bps = 0,
-                eta_seconds = NULL,
-                attempt = ?3,
-                error = ?4,
-                updated_at = ?5
-            WHERE id = ?1 AND state IN (?6, ?7, ?8)
-            "#,
-            rusqlite::params![
-                id.to_string(),
-                TaskState::Retrying.as_str(),
-                i64::from(attempt),
-                error,
-                now_timestamp(),
-                TaskState::Preparing.as_str(),
-                TaskState::Running.as_str(),
-                TaskState::Retrying.as_str(),
-            ],
-        )?;
-        Ok(changed == 1)
     }
 
     pub fn requeue_failed(&mut self, id: Uuid) -> Result<bool> {
@@ -722,16 +633,14 @@ impl TaskStore {
                 error = NULL,
                 updated_at = ?3
             WHERE id = ?1
-              AND state IN (?4, ?5, ?6)
+              AND state = ?4
               AND spec_json IS NOT NULL
             "#,
             rusqlite::params![
                 id.to_string(),
                 TaskState::Queued.as_str(),
                 now_timestamp(),
-                TaskState::Preparing.as_str(),
                 TaskState::Running.as_str(),
-                TaskState::Retrying.as_str(),
             ],
         )?;
         if changed == 1 {
@@ -981,7 +890,7 @@ impl TaskStore {
     ) -> Result<Vec<(TaskSummary, TaskSpec)>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT tasks.id, account_id, space_id, state, label, phase, progress_total,
+            SELECT tasks.id, space_id, state, label, phase, progress_total,
                    progress_done, bytes_total, bytes_done, speed_bps, eta_seconds,
                    attempt, created_at, updated_at, error,
                    (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id), spec_json
@@ -994,7 +903,7 @@ impl TaskStore {
         let secondary_state = secondary_state.as_ref().map(TaskState::as_str);
         let rows = statement.query_map(
             rusqlite::params![primary_state.as_str(), secondary_state],
-            |row| Ok((raw_task_summary(row)?, row.get::<_, String>(17)?)),
+            |row| Ok((raw_task_summary(row)?, row.get::<_, String>(16)?)),
         )?;
         let mut tasks = Vec::new();
         for row in rows {
@@ -1013,19 +922,18 @@ impl TaskStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let row = transaction
             .query_row(
-                "SELECT account_id, space_id, state, spec_json FROM tasks WHERE id = ?1",
+                "SELECT space_id, state, spec_json FROM tasks WHERE id = ?1",
                 rusqlite::params![id.to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(2)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((account_id, space_id, state, spec_json)) = row else {
+        let Some((space_id, state, spec_json)) = row else {
             transaction.commit()?;
             return Ok(None);
         };
@@ -1038,7 +946,7 @@ impl TaskStore {
             return Ok(None);
         };
         let spec: TaskSpec = serde_json::from_str(&spec_json)?;
-        if spec.account_id() != account_id || spec.space_id() != space_id {
+        if spec.space_id() != space_id {
             return Err(LiosError::DataCorruption(
                 "persisted task ownership does not match its specification".to_string(),
             ));
@@ -1046,12 +954,12 @@ impl TaskStore {
         let changed = transaction.execute(
             r#"
             UPDATE tasks
-            SET state = ?2, phase = 'preparing', error = NULL, updated_at = ?3
+            SET state = ?2, phase = NULL, error = NULL, updated_at = ?3
             WHERE id = ?1 AND state = ?4 AND spec_json IS NOT NULL
             "#,
             rusqlite::params![
                 id.to_string(),
-                TaskState::Preparing.as_str(),
+                TaskState::Running.as_str(),
                 now_timestamp(),
                 TaskState::Queued.as_str(),
             ],
@@ -1277,17 +1185,15 @@ impl TaskStore {
                 SELECT id, spec_json
                 FROM tasks
                 WHERE spec_json IS NOT NULL
-                  AND state IN (?1, ?2, ?3, ?4, ?5, ?6)
-                  AND (?7 IS NULL OR space_id = ?7)
+                  AND state IN (?1, ?2, ?3, ?4)
+                  AND (?5 IS NULL OR space_id = ?5)
                 "#,
             )?;
             let rows = statement.query_map(
                 rusqlite::params![
                     TaskState::Queued.as_str(),
-                    TaskState::Preparing.as_str(),
                     TaskState::Running.as_str(),
                     TaskState::Paused.as_str(),
-                    TaskState::Retrying.as_str(),
                     TaskState::Committing.as_str(),
                     space_id,
                 ],
@@ -1335,16 +1241,14 @@ impl TaskStore {
               AND task_id IN (
                   SELECT id FROM tasks
                   WHERE spec_json IS NOT NULL
-                    AND state IN (?3, ?4, ?5)
-                    AND (?6 IS NULL OR space_id = ?6)
+                    AND state = ?3
+                    AND (?4 IS NULL OR space_id = ?4)
               )
             "#,
             rusqlite::params![
                 TaskItemState::Queued.as_str(),
                 TaskItemState::Running.as_str(),
-                TaskState::Preparing.as_str(),
                 TaskState::Running.as_str(),
-                TaskState::Retrying.as_str(),
                 space_id,
             ],
         )?;
@@ -1357,15 +1261,13 @@ impl TaskStore {
                 attempt = attempt + 1,
                 updated_at = ?2
             WHERE spec_json IS NOT NULL
-              AND state IN (?3, ?4, ?5)
-              AND (?6 IS NULL OR space_id = ?6)
+              AND state = ?3
+              AND (?4 IS NULL OR space_id = ?4)
             "#,
             rusqlite::params![
                 TaskState::Queued.as_str(),
                 now_timestamp(),
-                TaskState::Preparing.as_str(),
                 TaskState::Running.as_str(),
-                TaskState::Retrying.as_str(),
                 space_id,
             ],
         )?;
@@ -1376,18 +1278,16 @@ impl TaskStore {
             WHERE task_id IN (
                 SELECT id FROM tasks
                 WHERE spec_json IS NULL
-                  AND state IN (?3, ?4, ?5, ?6, ?7, ?8)
-                  AND (?11 IS NULL OR space_id = ?11)
-            ) AND state IN (?9, ?10)
+                  AND state IN (?3, ?4, ?5, ?6)
+                  AND (?9 IS NULL OR space_id = ?9)
+            ) AND state IN (?7, ?8)
             "#,
             rusqlite::params![
                 TaskItemState::Failed.as_str(),
                 unrecoverable_message,
                 TaskState::Queued.as_str(),
-                TaskState::Preparing.as_str(),
                 TaskState::Running.as_str(),
                 TaskState::Paused.as_str(),
-                TaskState::Retrying.as_str(),
                 TaskState::Committing.as_str(),
                 TaskItemState::Queued.as_str(),
                 TaskItemState::Running.as_str(),
@@ -1399,18 +1299,16 @@ impl TaskStore {
             UPDATE tasks
             SET state = ?1, phase = NULL, error = ?2, updated_at = ?3
             WHERE spec_json IS NULL
-              AND state IN (?4, ?5, ?6, ?7, ?8, ?9)
-              AND (?10 IS NULL OR space_id = ?10)
+              AND state IN (?4, ?5, ?6, ?7)
+              AND (?8 IS NULL OR space_id = ?8)
             "#,
             rusqlite::params![
                 TaskState::Failed.as_str(),
                 unrecoverable_message,
                 now_timestamp(),
                 TaskState::Queued.as_str(),
-                TaskState::Preparing.as_str(),
                 TaskState::Running.as_str(),
                 TaskState::Paused.as_str(),
-                TaskState::Retrying.as_str(),
                 TaskState::Committing.as_str(),
                 space_id,
             ],
@@ -1490,7 +1388,6 @@ impl TaskStore {
         for summary in self.list_summaries()? {
             tasks.push(TaskRecord {
                 id: summary.id,
-                account_id: summary.account_id,
                 space_id: summary.space_id,
                 state: summary.state,
                 label: summary.label,
@@ -1514,7 +1411,7 @@ impl TaskStore {
     pub fn list_summaries(&self) -> Result<Vec<TaskSummary>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT tasks.id, account_id, space_id, state, label, phase, progress_total,
+            SELECT tasks.id, space_id, state, label, phase, progress_total,
                    progress_done, bytes_total, bytes_done, speed_bps, eta_seconds,
                    attempt, created_at, updated_at, error,
                    (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id),
@@ -1541,7 +1438,7 @@ impl TaskStore {
         self.connection
             .query_row(
                 r#"
-                SELECT tasks.id, account_id, space_id, state, label, phase, progress_total,
+                SELECT tasks.id, space_id, state, label, phase, progress_total,
                        progress_done, bytes_total, bytes_done, speed_bps, eta_seconds,
                        attempt, created_at, updated_at, error,
                        (SELECT COUNT(*) FROM task_items WHERE task_id = tasks.id),
@@ -1563,7 +1460,6 @@ impl TaskStore {
         };
         Ok(Some(TaskRecord {
             id: summary.id,
-            account_id: summary.account_id,
             space_id: summary.space_id,
             state: summary.state,
             label: summary.label,
@@ -1589,27 +1485,25 @@ fn raw_task_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTaskSummary>
         row.get::<_, String>(1)?,
         row.get::<_, String>(2)?,
         row.get::<_, String>(3)?,
-        row.get::<_, String>(4)?,
-        row.get::<_, Option<String>>(5)?,
+        row.get::<_, Option<String>>(4)?,
+        row.get::<_, i64>(5)?,
         row.get::<_, i64>(6)?,
         row.get::<_, i64>(7)?,
         row.get::<_, i64>(8)?,
         row.get::<_, i64>(9)?,
-        row.get::<_, i64>(10)?,
-        row.get::<_, Option<i64>>(11)?,
-        row.get::<_, i64>(12)?,
+        row.get::<_, Option<i64>>(10)?,
+        row.get::<_, i64>(11)?,
+        row.get::<_, String>(12)?,
         row.get::<_, String>(13)?,
-        row.get::<_, String>(14)?,
-        row.get::<_, Option<String>>(15)?,
-        row.get::<_, i64>(16)?,
-        row.get::<_, Option<String>>(17)?,
+        row.get::<_, Option<String>>(14)?,
+        row.get::<_, i64>(15)?,
+        row.get::<_, Option<String>>(16)?,
     ))
 }
 
 fn decode_task_summary(raw: RawTaskSummary) -> Result<TaskSummary> {
     let (
         id,
-        account_id,
         space_id,
         state,
         label,
@@ -1631,7 +1525,6 @@ fn decode_task_summary(raw: RawTaskSummary) -> Result<TaskSummary> {
     let can_retry = state == TaskState::Failed && valid_task_spec(spec_json.as_deref());
     Ok(TaskSummary {
         id: Uuid::parse_str(&id)?,
-        account_id,
         space_id,
         state,
         label,
@@ -1734,13 +1627,12 @@ fn upsert_task_on(
     connection.execute(
         r#"
         INSERT INTO tasks
-            (id, account_id, space_id, state, label, phase, progress_total, progress_done,
+            (id, space_id, state, label, phase, progress_total, progress_done,
              bytes_total, bytes_done, speed_bps, eta_seconds, attempt, spec_json,
              created_at, updated_at, error)
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(id) DO UPDATE SET
-            account_id = excluded.account_id,
             space_id = excluded.space_id,
             state = excluded.state,
             label = excluded.label,
@@ -1758,7 +1650,6 @@ fn upsert_task_on(
         "#,
         rusqlite::params![
             task.id.to_string(),
-            &task.account_id,
             &task.space_id,
             task.state.as_str(),
             &task.label,
@@ -1905,7 +1796,6 @@ fn ensure_task_store_schema(connection: &mut rusqlite::Connection) -> Result<()>
         r#"
         CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY NOT NULL,
-            account_id TEXT NOT NULL DEFAULT '',
             space_id TEXT NOT NULL DEFAULT '',
             state TEXT NOT NULL,
             label TEXT NOT NULL,
@@ -1955,7 +1845,7 @@ fn ensure_task_store_schema(connection: &mut rusqlite::Connection) -> Result<()>
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
         CREATE INDEX IF NOT EXISTS idx_tasks_space_state
-            ON tasks(account_id, space_id, state);
+            ON tasks(space_id, state);
         "#,
     )?;
     transaction.pragma_update(None, "user_version", TASK_SCHEMA_VERSION)?;

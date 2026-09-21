@@ -11,8 +11,6 @@ mod task_center;
 #[path = "../build_support.rs"]
 mod build_support;
 
-#[cfg(test)]
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -32,8 +30,13 @@ use command_error::{CommandError, CommandErrorCode};
 use command_surface::with_registered_commands;
 use config_mutation_gate::ConfigMutationGate;
 use download_service::prepare_download_task;
+use lios_application::location::LocalLocation;
 use lios_application::service::Application;
 use lios_application::space_registry::SpaceRegistry;
+use lios_application::transfer_planner::PlanOptions;
+use lios_application::transfer_request::{
+    catalog_node_path, catalog_tree_entries, prepare_pull, prepare_upload, RemoteSource,
+};
 use lios_core::cache::{prune_unreferenced_staging, CacheCleanupReport};
 use lios_core::catalog::{
     Catalog, CatalogRebuildReport, CatalogRemoteFile, CatalogSelection, CatalogTreeNode,
@@ -47,7 +50,6 @@ use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
 use lios_core::credentials::{protect_to_file, unprotect_from_file};
 use lios_core::crypto::KeyFile;
 use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUserSummary};
-use lios_core::pack::PackOptions;
 use lios_core::space_lock::SpaceLockError;
 #[cfg(test)]
 use lios_core::storage::CatalogSyncFile;
@@ -68,9 +70,9 @@ use task_center::{
     emit_removed_tasks, emit_task, list_task_items_for_paths, task_summaries_for_paths,
     task_summary_for_paths, webview_safe_task_summary, TaskItemsPageDto,
 };
-use task_support::{persist_submission, snapshot_upload_sources, TaskScope};
 #[cfg(test)]
-use task_support::{retry_backoff, TransferMetrics};
+use task_support::TransferMetrics;
+use task_support::{persist_submission, persist_transfer_submission, TaskScope};
 use tauri::Manager;
 use uuid::Uuid;
 
@@ -223,7 +225,6 @@ fn recovery_log_details(catalog_checked: bool, repo: Option<&RepoConfig>) -> ser
     let scope = repo.map(TaskScope::from_repo);
     serde_json::json!({
         "catalog_checked": catalog_checked,
-        "account_id": scope.as_ref().map(|scope| scope.account_id.as_str()),
         "space_id": scope.as_ref().map(|scope| scope.space_id.as_str()),
     })
 }
@@ -505,10 +506,8 @@ async fn clear_task_record(paths: &LiosPaths, task_id: Uuid) -> CommandResult<()
         return Err(CommandError::invalid_input("active task cannot be cleared"));
     }
     if let Some(spec) = store.load_spec(task_id).map_err(to_err)? {
-        let cleanup_label = terminal_staging_cleanup_label(&spec);
-        let task_paths = paths
-            .for_task(spec.account_id(), spec.space_id(), task_id)
-            .map_err(to_err)?;
+        let cleanup_label = spec.label();
+        let task_paths = paths.for_task(spec.space_id(), task_id).map_err(to_err)?;
         if let Err(error) = cleanup_terminal_task_staging(&task_paths, &spec, task_id) {
             append_task_warning(
                 &task_paths,
@@ -523,25 +522,8 @@ async fn clear_task_record(paths: &LiosPaths, task_id: Uuid) -> CommandResult<()
 
 fn task_state_is_active(state: &TaskState) -> bool {
     match state {
-        TaskState::Queued
-        | TaskState::Preparing
-        | TaskState::Running
-        | TaskState::Paused
-        | TaskState::Retrying
-        | TaskState::Committing => true,
+        TaskState::Queued | TaskState::Running | TaskState::Paused | TaskState::Committing => true,
         TaskState::Failed | TaskState::Completed | TaskState::Canceled => false,
-    }
-}
-
-fn terminal_staging_cleanup_label(spec: &TaskSpec) -> &'static str {
-    match spec {
-        TaskSpec::VerifySpace { .. } => "verification",
-        TaskSpec::RebuildCatalog { .. } => "catalog rebuild",
-        TaskSpec::Copy { .. } => "copy",
-        TaskSpec::Sync { .. } => "sync",
-        TaskSpec::Upload { .. } => "upload",
-        TaskSpec::Delete { .. } => "delete",
-        TaskSpec::Download { .. } => "download",
     }
 }
 
@@ -556,12 +538,11 @@ fn cleanup_terminal_task_staging(
     if task_state_is_active(&task.state) || !paths.staging.exists() {
         return Ok(());
     }
-    remove_scoped_staging_directory(paths, spec.account_id(), spec.space_id(), task_id)
+    remove_scoped_staging_directory(paths, spec.space_id(), task_id)
 }
 
 fn remove_scoped_staging_directory(
     paths: &LiosPaths,
-    account_id: &str,
     space_id: &str,
     scope_id: Uuid,
 ) -> CommandResult<()> {
@@ -571,7 +552,6 @@ fn remove_scoped_staging_directory(
     let expected_staging = paths
         .home
         .join("staging")
-        .join(account_id)
         .join(space_id)
         .join(scope_id.to_string());
     if paths.staging != expected_staging {
@@ -580,12 +560,10 @@ fn remove_scoped_staging_directory(
         ));
     }
     let staging_root = paths.home.join("staging");
-    let account_dir = staging_root.join(account_id);
-    let space_dir = account_dir.join(space_id);
+    let space_dir = staging_root.join(space_id);
     for directory in [
         paths.home.as_path(),
         staging_root.as_path(),
-        account_dir.as_path(),
         space_dir.as_path(),
         paths.staging.as_path(),
     ] {
@@ -608,13 +586,6 @@ fn remove_scoped_staging_directory(
                     .unwrap_or(false)
             {
                 let _ = fs::remove_dir(&space_dir);
-            }
-            if account_dir.exists()
-                && fs::read_dir(&account_dir)
-                    .map(|mut i| i.next().is_none())
-                    .unwrap_or(false)
-            {
-                let _ = fs::remove_dir(&account_dir);
             }
             Ok(())
         }
@@ -643,7 +614,7 @@ fn cleanup_terminal_task_staging_and_record(
     spec: &TaskSpec,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    let cleanup_label = terminal_staging_cleanup_label(spec);
+    let cleanup_label = spec.label();
     if let Err(error) = cleanup_terminal_task_staging(paths, spec, task_id) {
         append_task_warning(
             paths,
@@ -663,7 +634,7 @@ fn cleanup_terminal_task_staging_after_restart(paths: &LiosPaths) -> lios_core::
         let Some(spec) = store.load_spec(task.id)? else {
             continue;
         };
-        let task_paths = paths.for_task(spec.account_id(), spec.space_id(), task.id)?;
+        let task_paths = paths.for_task(spec.space_id(), task.id)?;
         cleanup_terminal_task_staging_and_record(&task_paths, &spec, task.id)
             .map_err(|error| lios_core::LiosError::Storage(error.message))?;
     }
@@ -724,13 +695,6 @@ struct StartupTaskRecovery {
     reconcile: Vec<Uuid>,
 }
 
-#[cfg(test)]
-#[derive(Default)]
-struct StartupSpaceWork {
-    reconcile: Vec<Uuid>,
-    queued: Vec<Uuid>,
-}
-
 fn submission_summary(task: &TaskRecord) -> CommandResult<TaskSummary> {
     let item_count = u64::try_from(task.items.len()).map_err(|_| {
         CommandError::new(
@@ -742,7 +706,6 @@ fn submission_summary(task: &TaskRecord) -> CommandResult<TaskSummary> {
     })?;
     Ok(webview_safe_task_summary(TaskSummary {
         id: task.id,
-        account_id: task.account_id.clone(),
         space_id: task.space_id.clone(),
         state: task.state.clone(),
         label: task.label.clone(),
@@ -768,6 +731,19 @@ fn submit_and_spawn(
     spec: TaskSpec,
 ) -> CommandResult<TaskSummary> {
     let task = persist_submission(&state.paths, &spec).map_err(to_err)?;
+    let summary = submission_summary(&task)?;
+    emit_task(app, &state.paths, task.id);
+    start_shared_worker(&state.paths)?;
+    Ok(summary)
+}
+
+fn submit_transfer_and_spawn(
+    app: &tauri::AppHandle,
+    state: &AppContext,
+    spec: TaskSpec,
+    actions: &[lios_core::tasks::PersistedTransferAction],
+) -> CommandResult<TaskSummary> {
+    let task = persist_transfer_submission(&state.paths, &spec, actions).map_err(to_err)?;
     let summary = submission_summary(&task)?;
     emit_task(app, &state.paths, task.id);
     start_shared_worker(&state.paths)?;
@@ -874,87 +850,6 @@ fn recover_startup_tasks(paths: &LiosPaths) -> CommandResult<StartupTaskRecovery
         }
     }
     Ok(StartupTaskRecovery { queued, reconcile })
-}
-
-#[cfg(test)]
-fn group_startup_tasks(
-    paths: &LiosPaths,
-    recovery: StartupTaskRecovery,
-) -> lios_core::Result<Vec<StartupSpaceWork>> {
-    let store = TaskStore::open(&paths.database)?;
-    let mut groups = Vec::<StartupSpaceWork>::new();
-    let mut positions = HashMap::<String, usize>::new();
-    for (task_id, needs_reconciliation) in recovery
-        .reconcile
-        .into_iter()
-        .map(|task_id| (task_id, true))
-        .chain(recovery.queued.into_iter().map(|task_id| (task_id, false)))
-    {
-        let spec = store.load_spec(task_id)?.ok_or_else(|| {
-            lios_core::LiosError::DataCorruption(
-                "startup task has no persisted specification".to_string(),
-            )
-        })?;
-        let space_id = spec.space_id().to_string();
-        let position = *positions.entry(space_id.clone()).or_insert_with(|| {
-            groups.push(StartupSpaceWork::default());
-            groups.len() - 1
-        });
-        if needs_reconciliation {
-            groups[position].reconcile.push(task_id);
-        } else {
-            groups[position].queued.push(task_id);
-        }
-    }
-    Ok(groups)
-}
-
-#[cfg(test)]
-fn reconciliation_error_should_wait(error: &CommandError) -> bool {
-    matches!(
-        error.code,
-        CommandErrorCode::Authentication
-            | CommandErrorCode::Network
-            | CommandErrorCode::RateLimited
-            | CommandErrorCode::RemoteServer
-            | CommandErrorCode::Storage
-    )
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartupReconciliationOutcome {
-    Continue,
-    Replay,
-    Stop,
-}
-
-#[cfg(test)]
-fn startup_reconciliation_terminal_error(
-    outcome: StartupReconciliationOutcome,
-) -> Option<Option<(CommandErrorCode, bool)>> {
-    match outcome {
-        StartupReconciliationOutcome::Continue => Some(None),
-        StartupReconciliationOutcome::Replay => None,
-        StartupReconciliationOutcome::Stop => Some(Some((CommandErrorCode::RemoteConflict, false))),
-    }
-}
-
-#[cfg(test)]
-async fn retry_storage_operation<T>(
-    mut operation: impl FnMut() -> CommandResult<T>,
-) -> CommandResult<T> {
-    let mut attempt = 1;
-    loop {
-        match operation() {
-            Ok(value) => return Ok(value),
-            Err(error) if error.code == CommandErrorCode::Storage => {
-                tokio::time::sleep(retry_backoff(attempt)).await;
-                attempt = attempt.saturating_add(1);
-            }
-            Err(error) => return Err(error),
-        }
-    }
 }
 
 fn recovery_metadata_objects(
@@ -1341,11 +1236,12 @@ fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandRes
     if let Some(repo) = &resolved {
         let scope = TaskScope::from_repo(repo);
         let store = TaskStore::open(&state.paths.database).map_err(to_err)?;
-        if store.list_summaries().map_err(to_err)?.iter().any(|task| {
-            task.account_id == scope.account_id
-                && task.space_id == scope.space_id
-                && task_state_is_active(&task.state)
-        }) {
+        if store
+            .list_summaries()
+            .map_err(to_err)?
+            .iter()
+            .any(|task| task.space_id == scope.space_id && task_state_is_active(&task.state))
+        {
             return Err(CommandError::invalid_input(
                 "cannot remove a space while one of its tasks is active",
             ));
@@ -1354,21 +1250,9 @@ fn remove_space(state: tauri::State<'_, AppContext>, name: String) -> CommandRes
     registry.remove(&name)?;
     if let Some(repo) = resolved {
         let scope = TaskScope::from_repo(&repo);
-        let space_staging = state
-            .paths
-            .staging
-            .join(&scope.account_id)
-            .join(&scope.space_id);
+        let space_staging = state.paths.staging.join(&scope.space_id);
         if space_staging.exists() {
             let _ = fs::remove_dir_all(&space_staging);
-        }
-        let account_staging = state.paths.staging.join(&scope.account_id);
-        if account_staging.exists()
-            && fs::read_dir(&account_staging)
-                .map(|mut i| i.next().is_none())
-                .unwrap_or(false)
-        {
-            let _ = fs::remove_dir(&account_staging);
         }
     }
     Ok(())
@@ -1810,18 +1694,47 @@ async fn enqueue_upload_to_folder(
     key_from_config(&config)?;
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
-    let source_snapshot = snapshot_upload_sources(&upload_paths).map_err(to_err)?;
-    let spec = TaskSpec::Upload {
-        account_id: scope.account_id,
+    let snapshot = Application::new(state.paths.clone())?
+        .open_space(repo.clone())
+        .await?;
+    let parent_path = catalog_node_path(&snapshot.tree, &parent_node_id)
+        .ok_or_else(|| CommandError::invalid_input("upload destination folder was not found"))?;
+    let remote_entries = catalog_tree_entries(&snapshot.tree);
+    let sources = upload_paths
+        .into_iter()
+        .map(|path| LocalLocation {
+            path,
+            trailing_slash: false,
+        })
+        .collect::<Vec<_>>();
+    let prepared = prepare_upload(
+        sources,
+        &parent_path,
+        &remote_entries,
+        &conflict_resolutions,
+    )?;
+    let baseline = lios_application::sha256_hex_file(&snapshot.local_path)?;
+    let source_operand = prepared
+        .source_paths
+        .values()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\0");
+    let persisted = prepared.into_persisted(
+        source_operand,
+        parent_path,
+        false,
+        Vec::new(),
+        Some(baseline),
+        None,
+    );
+    let actions = persisted.actions.clone();
+    let spec = TaskSpec::Transfer {
         space_id: scope.space_id,
         repo,
-        parent_node_id,
-        source_paths: upload_paths,
-        source_snapshot: source_snapshot.clone(),
-        chunk_size: config.chunk_size.unwrap_or(PackOptions::DEFAULT_CHUNK_SIZE),
-        conflict_resolutions,
+        plan: persisted,
     };
-    submit_and_spawn(&app, state.inner(), spec)
+    submit_transfer_and_spawn(&app, state.inner(), spec, &actions)
 }
 
 #[tauri::command]
@@ -1841,7 +1754,6 @@ async fn enqueue_delete_nodes(
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let spec = TaskSpec::Delete {
-        account_id: scope.account_id,
         space_id: scope.space_id,
         repo,
         node_ids,
@@ -1867,14 +1779,41 @@ async fn enqueue_download(
     key_from_config(&config)?;
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
-    let spec = TaskSpec::Download {
-        account_id: scope.account_id,
+    let snapshot = Application::new(state.paths.clone())?
+        .open_space(repo.clone())
+        .await?;
+    let sources = node_ids
+        .iter()
+        .map(|node_id| {
+            let node = find_tree_node(&snapshot.tree, node_id)
+                .ok_or_else(|| CommandError::invalid_input("download selection was not found"))?;
+            Ok(RemoteSource {
+                node: node.clone(),
+                trailing_slash: false,
+            })
+        })
+        .collect::<CommandResult<Vec<_>>>()?;
+    let local_destination = LocalLocation {
+        path: prepared.output_dir,
+        trailing_slash: true,
+    };
+    let prepared_pull = prepare_pull(&sources, &local_destination, &PlanOptions::default())?;
+    let baseline = lios_application::sha256_hex_file(&snapshot.local_path)?;
+    let persisted = prepared_pull.into_persisted(
+        node_ids.join("\0"),
+        local_destination.path.to_string_lossy().into_owned(),
+        false,
+        Vec::new(),
+        Some(baseline),
+        None,
+    );
+    let actions = persisted.actions.clone();
+    let spec = TaskSpec::Transfer {
         space_id: scope.space_id,
         repo,
-        node_ids,
-        output_dir: prepared.output_dir,
+        plan: persisted,
     };
-    submit_and_spawn(&app, state.inner(), spec)
+    submit_transfer_and_spawn(&app, state.inner(), spec, &actions)
 }
 
 #[tauri::command]
@@ -1890,7 +1829,6 @@ async fn enqueue_verify_space(
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let spec = TaskSpec::VerifySpace {
-        account_id: scope.account_id,
         space_id: scope.space_id,
         repo,
         full,
@@ -1931,7 +1869,7 @@ async fn preview_rebuild_catalog(
     let preview_id = Uuid::new_v4();
     let preview_paths = state
         .paths
-        .for_task(&scope.account_id, &scope.space_id, preview_id)
+        .for_task(&scope.space_id, preview_id)
         .map_err(to_err)?;
     preview_paths.ensure_dirs().map_err(to_err)?;
     let operation = async {
@@ -1956,12 +1894,7 @@ async fn preview_rebuild_catalog(
         })
     }
     .await;
-    let cleanup = remove_scoped_staging_directory(
-        &preview_paths,
-        &scope.account_id,
-        &scope.space_id,
-        preview_id,
-    );
+    let cleanup = remove_scoped_staging_directory(&preview_paths, &scope.space_id, preview_id);
     match operation {
         Ok(preview) => {
             cleanup?;
@@ -1993,7 +1926,6 @@ async fn enqueue_rebuild_catalog(
     }
     let scope = TaskScope::from_repo(&repo);
     let spec = TaskSpec::RebuildCatalog {
-        account_id: scope.account_id,
         space_id: scope.space_id,
         repo,
         expected_revision: expected_revision.to_string(),
@@ -2049,10 +1981,7 @@ async fn pause_task(
 ) -> CommandResult<()> {
     let summary = task_summary_for_paths(&state.paths, task_id)?
         .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
-    if matches!(
-        summary.state,
-        TaskState::Queued | TaskState::Preparing | TaskState::Running | TaskState::Retrying
-    ) {
+    if matches!(summary.state, TaskState::Queued | TaskState::Running) {
         Application::new(state.paths.clone())?
             .pause_task(task_id)
             .await?;
@@ -2097,11 +2026,7 @@ async fn cancel_task(
         .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
     if matches!(
         summary.state,
-        TaskState::Queued
-            | TaskState::Preparing
-            | TaskState::Running
-            | TaskState::Paused
-            | TaskState::Retrying
+        TaskState::Queued | TaskState::Running | TaskState::Paused
     ) {
         Application::new(state.paths.clone())?
             .cancel_task(task_id)
@@ -2170,7 +2095,6 @@ pub fn run() {
 mod task_center_backend_tests {
     use std::path::PathBuf;
 
-    use lios_core::catalog::{SourceFileSnapshot, SourceSnapshotReport};
     use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
     use lios_core::tasks::{
         TaskItem, TaskItemState, TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary,
@@ -2182,9 +2106,9 @@ mod task_center_backend_tests {
 
     use super::{
         cleanup_is_safe, clear_task_record, list_task_items_for_paths, paths_dto,
-        persist_submission, recover_startup_tasks, recovery_key_status, submission_summary,
-        task_summaries_for_paths, AppContext, CommandError, CommandErrorCode, SetupSnapshot,
-        TaskUpdateEvent,
+        persist_transfer_submission, recover_startup_tasks, recovery_key_status,
+        submission_summary, task_summaries_for_paths, AppContext, CommandError, CommandErrorCode,
+        SetupSnapshot, TaskUpdateEvent,
     };
 
     fn corrupt_task_item_state(paths: &LiosPaths, item_id: Uuid) {
@@ -2224,7 +2148,6 @@ mod task_center_backend_tests {
     fn summary() -> TaskSummary {
         TaskSummary {
             id: Uuid::new_v4(),
-            account_id: "account-a".to_string(),
             space_id: "space-a".to_string(),
             state: TaskState::Running,
             label: "upload album".to_string(),
@@ -2387,14 +2310,7 @@ mod task_center_backend_tests {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         let sentinel = temp.path().join("private").join("secret.bin");
-        let source = SourceFileSnapshot {
-            source_path: sentinel.clone(),
-            relative_path: "secret.bin".into(),
-            size: 7,
-            modified_at_ns: Some(123_456_789),
-        };
-        let spec = TaskSpec::Upload {
-            account_id: "account-a".to_string(),
+        let spec = TaskSpec::Transfer {
             space_id: "space-a".to_string(),
             repo: RepoConfig {
                 namespace: "novix".to_string(),
@@ -2402,16 +2318,34 @@ mod task_center_backend_tests {
                 endpoint: "https://modelscope.cn".to_string(),
                 title: None,
             },
-            parent_node_id: "root".to_string(),
-            source_paths: vec![sentinel.clone()],
-            source_snapshot: SourceSnapshotReport {
-                files: vec![source.clone()],
-                ..SourceSnapshotReport::default()
+            plan: lios_core::tasks::PersistedTransferPlan {
+                direction: lios_core::tasks::TransferDirection::Push,
+                source_operand: sentinel.to_string_lossy().into_owned(),
+                destination_operand: "/".to_string(),
+                source_trailing_slash: false,
+                excludes: Vec::new(),
+                remote_catalog_baseline: None,
+                delete_scope: None,
+                actions: vec![lios_core::tasks::PersistedTransferAction {
+                    relative_path: "secret.bin".to_string(),
+                    source_path: Some(sentinel.clone()),
+                    remote_node_id: None,
+                    local_destination_path: None,
+                    kind: lios_core::tasks::TransferActionKind::Create,
+                    entry_kind: lios_core::tasks::TransferEntryKind::File,
+                    source_sha256: Some("a".repeat(64)),
+                    source_fingerprint: Some("fingerprint".to_string()),
+                    size: 7,
+                    destination_fingerprint: None,
+                    state: lios_core::tasks::TransferActionState::Pending,
+                }],
             },
-            chunk_size: 1,
-            conflict_resolutions: Vec::new(),
         };
-        let task = persist_submission(&paths, &spec).unwrap();
+        let actions = match &spec {
+            TaskSpec::Transfer { plan, .. } => plan.actions.clone(),
+            _ => Vec::new(),
+        };
+        let task = persist_transfer_submission(&paths, &spec, &actions).unwrap();
 
         let summary = submission_summary(&task).unwrap();
         let value = serde_json::to_value(summary).unwrap();
@@ -2572,7 +2506,6 @@ mod task_center_backend_tests {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         let spec = TaskSpec::Delete {
-            account_id: "a".repeat(64),
             space_id: "b".repeat(64),
             repo: RepoConfig {
                 namespace: "novix".to_string(),
@@ -2613,7 +2546,6 @@ mod task_center_backend_tests {
             .unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].0.id, task.id);
-        assert_eq!(queued[0].1.account_id(), spec.account_id());
         assert_eq!(queued[0].1.space_id(), spec.space_id());
     }
 
@@ -2622,7 +2554,6 @@ mod task_center_backend_tests {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         let spec = TaskSpec::Delete {
-            account_id: "a".repeat(64),
             space_id: "b".repeat(64),
             repo: RepoConfig {
                 namespace: "novix".to_string(),
@@ -2919,19 +2850,13 @@ mod task_cleanup_tests {
     use lios_core::tasks::{TaskRecord, TaskSpec, TaskState, TaskStore};
     use tempfile::tempdir;
 
-    use super::{
-        clear_task_record, group_startup_tasks, reconciliation_error_should_wait,
-        recover_startup_tasks, retry_storage_operation, startup_reconciliation_terminal_error,
-        task_state_is_active, CommandError, CommandErrorCode, StartupReconciliationOutcome,
-        StartupTaskRecovery,
-    };
+    use super::{clear_task_record, recover_startup_tasks, task_state_is_active, CommandErrorCode};
 
     #[test]
     fn startup_requeues_replayable_specs_and_preserves_commits_for_reconciliation() {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         let spec = TaskSpec::Delete {
-            account_id: "a".repeat(64),
             space_id: "b".repeat(64),
             repo: RepoConfig {
                 namespace: "novix".to_string(),
@@ -2965,44 +2890,14 @@ mod task_cleanup_tests {
         let committing = store.get(committing.id).unwrap().unwrap();
         assert_eq!(committing.state, TaskState::Committing);
         assert_eq!(committing.error, None);
-
-        let groups = group_startup_tasks(
-            &paths,
-            StartupTaskRecovery {
-                queued: vec![replayable.id],
-                reconcile: vec![committing.id],
-            },
-        )
-        .unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].reconcile, vec![committing.id]);
-        assert_eq!(groups[0].queued, vec![replayable.id]);
-    }
-
-    #[test]
-    fn startup_reconciliation_logs_only_terminal_decisions() {
-        assert_eq!(
-            startup_reconciliation_terminal_error(StartupReconciliationOutcome::Continue),
-            Some(None)
-        );
-        assert_eq!(
-            startup_reconciliation_terminal_error(StartupReconciliationOutcome::Stop),
-            Some(Some((CommandErrorCode::RemoteConflict, false)))
-        );
-        assert_eq!(
-            startup_reconciliation_terminal_error(StartupReconciliationOutcome::Replay),
-            None
-        );
     }
 
     #[test]
     fn every_nonterminal_task_state_is_active() {
         for state in [
             TaskState::Queued,
-            TaskState::Preparing,
             TaskState::Running,
             TaskState::Paused,
-            TaskState::Retrying,
             TaskState::Committing,
         ] {
             assert!(task_state_is_active(&state), "{state:?} must be active");
@@ -3013,68 +2908,12 @@ mod task_cleanup_tests {
         }
     }
 
-    #[test]
-    fn uncertain_remote_reads_keep_committing_tasks_in_reconciliation() {
-        for code in [
-            CommandErrorCode::Authentication,
-            CommandErrorCode::Network,
-            CommandErrorCode::RateLimited,
-            CommandErrorCode::RemoteServer,
-            CommandErrorCode::Storage,
-        ] {
-            assert!(reconciliation_error_should_wait(&CommandError::new(
-                code,
-                "remote catalog is temporarily unavailable",
-                false,
-                None,
-            )));
-        }
-        for code in [
-            CommandErrorCode::RemoteConflict,
-            CommandErrorCode::CorruptedData,
-            CommandErrorCode::InvalidInput,
-        ] {
-            assert!(!reconciliation_error_should_wait(&CommandError::new(
-                code,
-                "reconciliation cannot continue",
-                false,
-                None,
-            )));
-        }
-    }
-
-    #[tokio::test]
-    async fn reconciliation_retries_local_storage_failures_before_releasing_the_space() {
-        let mut attempts = 0;
-
-        let value = retry_storage_operation(|| {
-            attempts += 1;
-            if attempts < 3 {
-                Err(CommandError::new(
-                    CommandErrorCode::Storage,
-                    "database is temporarily unavailable",
-                    false,
-                    None,
-                ))
-            } else {
-                Ok("persisted")
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(attempts, 3);
-        assert_eq!(value, "persisted");
-    }
-
     #[tokio::test]
     async fn clear_rejects_every_persisted_nonterminal_state() {
         for state in [
             TaskState::Queued,
-            TaskState::Preparing,
             TaskState::Running,
             TaskState::Paused,
-            TaskState::Retrying,
             TaskState::Committing,
         ] {
             let temp = tempdir().unwrap();
@@ -3121,7 +2960,6 @@ mod remote_verification_tests {
 
     fn verification_spec() -> TaskSpec {
         TaskSpec::VerifySpace {
-            account_id: "a".repeat(64),
             space_id: "b".repeat(64),
             repo: RepoConfig {
                 namespace: "novix".to_string(),
@@ -3135,7 +2973,6 @@ mod remote_verification_tests {
 
     fn rebuild_spec() -> TaskSpec {
         TaskSpec::RebuildCatalog {
-            account_id: "a".repeat(64),
             space_id: "b".repeat(64),
             repo: RepoConfig {
                 namespace: "novix".to_string(),
@@ -3182,7 +3019,7 @@ mod remote_verification_tests {
             (TaskState::Failed, false),
             (TaskState::Canceled, false),
             (TaskState::Paused, true),
-            (TaskState::Retrying, true),
+            (TaskState::Running, true),
         ] {
             let temp = tempdir().unwrap();
             let paths = LiosPaths::from_home(temp.path());
@@ -3191,9 +3028,7 @@ mod remote_verification_tests {
             let store = TaskStore::open(&paths.database).unwrap();
             store.insert_with_spec(&task, &spec).unwrap();
             store.update_state(task.id, state, None).unwrap();
-            let task_paths = paths
-                .for_task(spec.account_id(), spec.space_id(), task.id)
-                .unwrap();
+            let task_paths = paths.for_task(spec.space_id(), task.id).unwrap();
             task_paths.ensure_dirs().unwrap();
             fs::write(task_paths.staging.join("cached.lios"), b"cached").unwrap();
 
@@ -3210,7 +3045,7 @@ mod remote_verification_tests {
             (TaskState::Failed, false),
             (TaskState::Canceled, false),
             (TaskState::Paused, true),
-            (TaskState::Retrying, true),
+            (TaskState::Running, true),
         ] {
             let temp = tempdir().unwrap();
             let paths = LiosPaths::from_home(temp.path());
@@ -3219,9 +3054,7 @@ mod remote_verification_tests {
             let store = TaskStore::open(&paths.database).unwrap();
             store.insert_with_spec(&task, &spec).unwrap();
             store.update_state(task.id, state, None).unwrap();
-            let task_paths = paths
-                .for_task(spec.account_id(), spec.space_id(), task.id)
-                .unwrap();
+            let task_paths = paths.for_task(spec.space_id(), task.id).unwrap();
             task_paths.ensure_dirs().unwrap();
             fs::write(task_paths.staging.join("catalog.enc"), b"rebuilt").unwrap();
 
@@ -3243,9 +3076,7 @@ mod remote_verification_tests {
         store
             .update_state(task.id, TaskState::Completed, None)
             .unwrap();
-        let task_paths = paths
-            .for_task(spec.account_id(), spec.space_id(), task.id)
-            .unwrap();
+        let task_paths = paths.for_task(spec.space_id(), task.id).unwrap();
         task_paths.ensure_dirs().unwrap();
         fs::remove_dir_all(&task_paths.staging).unwrap();
         let protected = paths.home.join("protected");
@@ -3289,9 +3120,7 @@ mod remote_verification_tests {
         store
             .update_state(task.id, TaskState::Completed, None)
             .unwrap();
-        let task_paths = paths
-            .for_task(spec.account_id(), spec.space_id(), task.id)
-            .unwrap();
+        let task_paths = paths.for_task(spec.space_id(), task.id).unwrap();
         task_paths.ensure_dirs().unwrap();
         fs::write(task_paths.staging.join("cached.lios"), b"cached").unwrap();
 
@@ -3313,9 +3142,7 @@ mod remote_verification_tests {
         store
             .update_state(task.id, TaskState::Completed, None)
             .unwrap();
-        let task_paths = paths
-            .for_task(spec.account_id(), spec.space_id(), task.id)
-            .unwrap();
+        let task_paths = paths.for_task(spec.space_id(), task.id).unwrap();
         task_paths.ensure_dirs().unwrap();
         fs::write(task_paths.staging.join("catalog.enc"), b"rebuilt").unwrap();
 
@@ -3379,9 +3206,7 @@ mod remote_verification_tests {
         store
             .update_state(task.id, TaskState::Completed, None)
             .unwrap();
-        let task_paths = paths
-            .for_task(spec.account_id(), spec.space_id(), task.id)
-            .unwrap();
+        let task_paths = paths.for_task(spec.space_id(), task.id).unwrap();
         task_paths.ensure_dirs().unwrap();
         fs::write(task_paths.staging.join("cached.lios"), b"cached").unwrap();
 
@@ -3399,8 +3224,7 @@ mod remote_verification_tests {
     async fn clearing_terminal_download_removes_staging_before_the_record() {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
-        let spec = TaskSpec::Download {
-            account_id: "a".repeat(64),
+        let spec = TaskSpec::Delete {
             space_id: "b".repeat(64),
             repo: RepoConfig {
                 namespace: "novix".to_string(),
@@ -3409,7 +3233,6 @@ mod remote_verification_tests {
                 title: None,
             },
             node_ids: vec!["node1".to_string()],
-            output_dir: temp.path().join("out"),
         };
         let task = TaskRecord::queued_for_spec(&spec);
         let store = TaskStore::open(&paths.database).unwrap();
@@ -3417,9 +3240,7 @@ mod remote_verification_tests {
         store
             .update_state(task.id, TaskState::Completed, None)
             .unwrap();
-        let task_paths = paths
-            .for_task(spec.account_id(), spec.space_id(), task.id)
-            .unwrap();
+        let task_paths = paths.for_task(spec.space_id(), task.id).unwrap();
         task_paths.ensure_dirs().unwrap();
         fs::write(task_paths.staging.join("chunk.lios"), b"downloaded").unwrap();
 
@@ -3438,7 +3259,6 @@ mod remote_verification_tests {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         paths.ensure_dirs().unwrap();
-        let account_id = "a".repeat(64);
         let space_id = "b".repeat(64);
 
         let completed_id = Uuid::new_v4();
@@ -3454,13 +3274,11 @@ mod remote_verification_tests {
 
         let completed_staged = paths
             .staging
-            .join(&account_id)
             .join(&space_id)
             .join(completed_id.to_string())
             .join("chunk.lios");
         let orphaned_staged = paths
             .staging
-            .join(&account_id)
             .join(&space_id)
             .join(orphaned_id.to_string())
             .join("chunk.lios");
@@ -3492,9 +3310,7 @@ mod remote_verification_tests {
         store
             .update_state(task.id, TaskState::Completed, None)
             .unwrap();
-        let task_paths = paths
-            .for_task(spec.account_id(), spec.space_id(), task.id)
-            .unwrap();
+        let task_paths = paths.for_task(spec.space_id(), task.id).unwrap();
         task_paths.ensure_dirs().unwrap();
         fs::write(task_paths.staging.join("catalog.enc"), b"rebuilt").unwrap();
 

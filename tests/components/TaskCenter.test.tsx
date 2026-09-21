@@ -16,7 +16,6 @@ const TASK_PANEL_STORAGE_KEY = "lios.task-center.height";
 function summary(overrides: Partial<TaskSummary> = {}): TaskSummary {
   return {
     id: "task-a",
-    account_id: "account",
     space_id: "space",
     state: "Running",
     label: "upload",

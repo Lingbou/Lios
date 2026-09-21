@@ -609,7 +609,7 @@ async fn run_cp(
         Vec::new(),
         None,
     )?;
-    let task = application.queue_copy(repo, plan)?;
+    let task = application.queue_transfer(repo, plan)?;
     if args.detach {
         start_worker(application.paths())?;
         return Ok(
@@ -668,7 +668,7 @@ async fn run_sync(
         excludes,
         delete_scope,
     )?;
-    let task = application.queue_sync(repo, plan)?;
+    let task = application.queue_transfer(repo, plan)?;
     if args.detach {
         start_worker(application.paths())?;
         return Ok(

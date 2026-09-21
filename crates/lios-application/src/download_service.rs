@@ -1,14 +1,12 @@
 //! Validation and preparation for persisted download tasks.
 
 use lios_core::catalog::CatalogSelection;
-use lios_core::tasks::TaskRecord;
 use std::path::PathBuf;
 
 use crate::command_error::CommandError;
 
 #[derive(Debug)]
 pub struct PreparedDownload {
-    pub task: TaskRecord,
     pub selection: CatalogSelection,
     pub output_dir: PathBuf,
 }
@@ -37,9 +35,7 @@ pub fn prepare_download_task(
         CommandError::invalid_input("download output must be an existing absolute directory")
     })?;
 
-    let task = TaskRecord::queued("download", 1);
     Ok(PreparedDownload {
-        task,
         selection: CatalogSelection::Nodes(ids),
         output_dir,
     })

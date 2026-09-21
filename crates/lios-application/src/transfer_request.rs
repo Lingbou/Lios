@@ -7,9 +7,13 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::location::LocalLocation;
-use crate::transfer_planner::{EntryKind, PlanOptions, TransferPlan, TransferPlanner, TreeEntry};
+use crate::transfer_planner::{
+    EntryKind, PlanActionKind, PlanOptions, TransferPlan, TransferPlanner, TreeEntry,
+};
 use crate::{sha256_hex_file, to_err, CommandError, CommandResult};
-use lios_core::catalog::{CatalogTreeNode, CatalogTreeNodeKind};
+use lios_core::catalog::{
+    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution,
+};
 use lios_core::tasks::{
     PersistedTransferAction, PersistedTransferPlan, TransferActionKind, TransferActionState,
     TransferDirection, TransferEntryKind,
@@ -154,6 +158,68 @@ pub fn fingerprint_path(path: &Path) -> CommandResult<String> {
     local_fingerprint(&metadata)
 }
 
+pub fn catalog_tree_entries(root: &CatalogTreeNode) -> Vec<TreeEntry> {
+    let mut entries = Vec::new();
+    if let CatalogTreeNodeKind::Directory { children } = &root.kind {
+        for child in children {
+            flatten_catalog_node(child, "", &mut entries);
+        }
+    }
+    entries
+}
+
+pub fn catalog_node_path(root: &CatalogTreeNode, node_id: &str) -> Option<String> {
+    if root.id == node_id {
+        return Some(String::new());
+    }
+    find_catalog_node_path(root, "", node_id)
+}
+
+fn find_catalog_node_path(
+    node: &CatalogTreeNode,
+    parent_path: &str,
+    node_id: &str,
+) -> Option<String> {
+    let CatalogTreeNodeKind::Directory { children } = &node.kind else {
+        return None;
+    };
+    for child in children {
+        let child_path = join_catalog(parent_path, &child.name);
+        if child.id == node_id {
+            return Some(child_path);
+        }
+        if let Some(path) = find_catalog_node_path(child, &child_path, node_id) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn flatten_catalog_node(node: &CatalogTreeNode, parent_path: &str, entries: &mut Vec<TreeEntry>) {
+    let path = join_catalog(parent_path, &node.name);
+    if !path.is_empty() {
+        match &node.kind {
+            CatalogTreeNodeKind::Directory { .. } => {
+                entries.push(TreeEntry::directory(path.clone()))
+            }
+            CatalogTreeNodeKind::File {
+                original_size,
+                sha256,
+                ..
+            } => entries.push(TreeEntry::file(
+                path.clone(),
+                sha256.clone(),
+                *original_size,
+            )),
+        }
+    }
+    if let CatalogTreeNodeKind::Directory { children } = &node.kind {
+        for child in children {
+            flatten_catalog_node(child, &path, entries);
+        }
+    }
+}
+
 pub fn prepare_push(
     sources: &[LocalLocation],
     remote_destination: &str,
@@ -234,6 +300,12 @@ pub fn prepare_push(
         }
         if !base.is_empty() {
             insert_directory_with_ancestors(&mut source_entries, &base);
+            source_paths
+                .entry(base.clone())
+                .or_insert_with(|| source.path.clone());
+            source_fingerprints
+                .entry(base.clone())
+                .or_insert(local_fingerprint(&metadata)?);
         }
         snapshot_directory(
             &source.path,
@@ -259,6 +331,166 @@ pub fn prepare_push(
         source_paths,
         source_fingerprints,
     })
+}
+
+pub fn prepare_upload(
+    sources: Vec<LocalLocation>,
+    parent_path: &str,
+    remote_entries: &[TreeEntry],
+    resolutions: &[ConflictResolution],
+) -> CommandResult<PreparedPush> {
+    let destination = if parent_path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{parent_path}")
+    };
+    let mut prepared = prepare_push(
+        &sources,
+        &destination,
+        remote_entries,
+        &PlanOptions {
+            replace_type: true,
+            yes: true,
+            ..PlanOptions::default()
+        },
+    )?;
+    for resolution in resolutions {
+        let target = prepared
+            .source_paths
+            .iter()
+            .filter(|(_path, source)| {
+                let source = source.to_string_lossy();
+                source == resolution.source_path
+                    || source.starts_with(&format!(
+                        "{}{}",
+                        resolution.source_path,
+                        std::path::MAIN_SEPARATOR
+                    ))
+            })
+            .min_by_key(|(path, _source)| path.matches('/').count())
+            .map(|(path, _source)| path.clone());
+        let Some(target) = target else {
+            continue;
+        };
+        match resolution.action {
+            ConflictAction::Replace => {}
+            ConflictAction::Skip => {
+                prepared
+                    .plan
+                    .actions
+                    .retain(|action| !is_path_or_descendant(&action.path, &target));
+                prepared
+                    .source_paths
+                    .retain(|path, _source| !is_path_or_descendant(path, &target));
+                prepared
+                    .source_fingerprints
+                    .retain(|path, _fingerprint| !is_path_or_descendant(path, &target));
+            }
+            ConflictAction::KeepBoth => {
+                let name = target.rsplit('/').next().unwrap_or(target.as_str());
+                let existing = remote_entries
+                    .iter()
+                    .filter_map(|entry| sibling_name(&entry.path, parent_path))
+                    .chain(
+                        prepared
+                            .source_paths
+                            .keys()
+                            .filter_map(|path| sibling_name(path, parent_path)),
+                    );
+                let replacement_name = available_name(existing, name);
+                let replacement = if parent_path.is_empty() {
+                    replacement_name
+                } else {
+                    join_catalog(parent_path, &replacement_name)
+                };
+                rewrite_target(&mut prepared, &target, &replacement);
+            }
+        }
+    }
+    Ok(prepared)
+}
+
+fn rewrite_target(prepared: &mut PreparedPush, old: &str, new: &str) {
+    for action in &mut prepared.plan.actions {
+        if is_path_or_descendant(&action.path, old) {
+            action.path = format!("{new}{}", &action.path[old.len()..]);
+            action.destination_path = action.path.clone();
+            action.kind = PlanActionKind::Create;
+        }
+    }
+    prepared.plan.actions.sort_by(|left, right| {
+        (left.path.matches('/').count(), &left.path)
+            .cmp(&(right.path.matches('/').count(), &right.path))
+    });
+    if let Some(value) = prepared.source_paths.remove(old) {
+        prepared.source_paths.insert(new.to_string(), value);
+    }
+    if let Some(value) = prepared.source_fingerprints.remove(old) {
+        prepared.source_fingerprints.insert(new.to_string(), value);
+    }
+    let rewritten_paths = prepared
+        .source_paths
+        .keys()
+        .filter(|path| path.starts_with(&format!("{old}/")))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in rewritten_paths {
+        let value = prepared.source_paths.remove(&path).unwrap();
+        prepared
+            .source_paths
+            .insert(format!("{new}{}", &path[old.len()..]), value);
+    }
+    let rewritten_fingerprints = prepared
+        .source_fingerprints
+        .keys()
+        .filter(|path| path.starts_with(&format!("{old}/")))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in rewritten_fingerprints {
+        let value = prepared.source_fingerprints.remove(&path).unwrap();
+        prepared
+            .source_fingerprints
+            .insert(format!("{new}{}", &path[old.len()..]), value);
+    }
+}
+
+fn sibling_name<'a>(path: &'a str, parent_path: &str) -> Option<&'a str> {
+    let relative = if parent_path.is_empty() {
+        path
+    } else {
+        path.strip_prefix(&format!("{parent_path}/"))?
+    };
+    (!relative.is_empty() && !relative.contains('/')).then_some(relative)
+}
+
+fn available_name<'a>(existing: impl IntoIterator<Item = &'a str>, name: &str) -> String {
+    let existing = existing
+        .into_iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if !existing.contains(&name.to_ascii_lowercase()) {
+        return name.to_string();
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name);
+    let extension = path.extension().and_then(|value| value.to_str());
+    for index in 1u64.. {
+        let candidate = match extension {
+            Some(extension) => format!("{stem} ({index}).{extension}"),
+            None => format!("{stem} ({index})"),
+        };
+        if !existing.contains(&candidate.to_ascii_lowercase()) {
+            return candidate;
+        }
+    }
+    unreachable!("available file name search is unbounded")
+}
+
+fn is_path_or_descendant(path: &str, root: &str) -> bool {
+    path == root || path.starts_with(&format!("{root}/"))
 }
 
 pub fn prepare_pull(

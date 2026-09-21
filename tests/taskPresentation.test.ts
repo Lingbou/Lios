@@ -21,7 +21,7 @@ test("task state predicates distinguish interactive, live, and terminal states",
   assert.equal(isLiveTask({ state: "Paused" }), false);
   assert.equal(isTerminalTask({ state: "Completed" }), true);
 
-  for (const state of ["Queued", "Preparing", "Running", "Retrying", "Committing"] as const) {
+  for (const state of ["Queued", "Running", "Committing"] as const) {
     assert.equal(isActiveTask({ state }), true);
     assert.equal(isLiveTask({ state }), true);
     assert.equal(isTerminalTask({ state }), false);
@@ -36,9 +36,7 @@ test("task state predicates distinguish interactive, live, and terminal states",
 
 test("task states expose only their real supported actions", () => {
   assert.deepEqual(taskActionsForTask({ state: "Queued", can_retry: false }), ["pause", "cancel"]);
-  assert.deepEqual(taskActionsForTask({ state: "Preparing", can_retry: false }), ["pause", "cancel"]);
   assert.deepEqual(taskActionsForTask({ state: "Running", can_retry: false }), ["pause", "cancel"]);
-  assert.deepEqual(taskActionsForTask({ state: "Retrying", can_retry: false }), ["pause", "cancel"]);
   assert.deepEqual(taskActionsForTask({ state: "Paused", can_retry: false }), ["resume", "cancel"]);
   assert.deepEqual(taskActionsForTask({ state: "Failed", can_retry: false }), ["clear"]);
   assert.deepEqual(taskActionsForTask({ state: "Failed", can_retry: true }), ["retry", "clear"]);
@@ -149,9 +147,9 @@ test("canceled task status preserves cleanup warnings", () => {
 test("verification preparing status is not described as file packing", () => {
   assert.equal(
     taskStatusText({
-      state: "Preparing",
+      state: "Running",
       label: "verify_full",
-      phase: null,
+      phase: "preparing",
       progress_total: 0,
       progress_done: 0
     }),
@@ -161,9 +159,9 @@ test("verification preparing status is not described as file packing", () => {
 
 test("catalog rebuild statuses describe recovery work", () => {
   const task = {
-    state: "Preparing",
+    state: "Running",
     label: "rebuild",
-    phase: null,
+    phase: "preparing",
     progress_total: 0,
     progress_done: 0
   } as const;

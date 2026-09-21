@@ -1,6 +1,8 @@
+use lios_core::catalog::{ConflictAction, ConflictResolution};
+
 use lios_application::location::LocalLocation;
 use lios_application::transfer_planner::{PlanActionKind, PlanOptions, TreeEntry};
-use lios_application::transfer_request::prepare_push;
+use lios_application::transfer_request::{prepare_push, prepare_upload};
 use tempfile::tempdir;
 
 #[test]
@@ -60,6 +62,103 @@ fn push_uses_sha256_to_skip_identical_remote_files() {
     assert_eq!(
         prepared.plan.action("backup/file.txt").unwrap().kind,
         PlanActionKind::Skip
+    );
+}
+
+#[test]
+fn upload_keep_both_rewrites_the_confirmed_plan_target() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("file.txt");
+    std::fs::write(&source, b"new").unwrap();
+    let prepared = prepare_upload(
+        vec![LocalLocation {
+            path: source.clone(),
+            trailing_slash: false,
+        }],
+        "docs",
+        &[
+            TreeEntry::directory("docs"),
+            TreeEntry::file("docs/file.txt", "old", 3),
+        ],
+        &[ConflictResolution {
+            source_path: source.to_string_lossy().into_owned(),
+            action: ConflictAction::KeepBoth,
+        }],
+    )
+    .unwrap();
+
+    assert!(prepared.plan.action("docs/file.txt").is_none());
+    assert_eq!(
+        prepared.plan.action("docs/file (1).txt").unwrap().kind,
+        PlanActionKind::Create
+    );
+    assert_eq!(
+        prepared
+            .source_paths
+            .get("docs/file (1).txt")
+            .map(|path| path.as_path()),
+        Some(source.as_path())
+    );
+}
+
+#[test]
+fn upload_keep_both_rewrites_every_descendant_of_a_folder() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("folder");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("nested.txt"), b"new").unwrap();
+    let prepared = prepare_upload(
+        vec![LocalLocation {
+            path: source.clone(),
+            trailing_slash: false,
+        }],
+        "",
+        &[
+            TreeEntry::directory("folder"),
+            TreeEntry::file("folder/nested.txt", "old", 3),
+        ],
+        &[ConflictResolution {
+            source_path: source.to_string_lossy().into_owned(),
+            action: ConflictAction::KeepBoth,
+        }],
+    )
+    .unwrap();
+
+    assert!(prepared.plan.action("folder").is_none());
+    assert!(prepared.plan.action("folder/nested.txt").is_none());
+    assert_eq!(
+        prepared.plan.action("folder (1)").unwrap().kind,
+        PlanActionKind::Create
+    );
+    assert_eq!(
+        prepared.plan.action("folder (1)/nested.txt").unwrap().kind,
+        PlanActionKind::Create
+    );
+}
+
+#[test]
+fn upload_replace_accepts_a_type_change_after_conflict_confirmation() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("entry");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("nested.txt"), b"new").unwrap();
+    let prepared = prepare_upload(
+        vec![LocalLocation {
+            path: source.clone(),
+            trailing_slash: false,
+        }],
+        "docs",
+        &[TreeEntry::file("docs/entry", "old", 3)],
+        &[ConflictResolution {
+            source_path: source.to_string_lossy().into_owned(),
+            action: ConflictAction::Replace,
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.plan.action("docs/entry").unwrap().kind,
+        PlanActionKind::ReplaceType
     );
 }
 

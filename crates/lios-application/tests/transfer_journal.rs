@@ -48,7 +48,7 @@ fn copy_submission_persists_every_planned_action_as_a_journal_item() {
         actions,
     };
     let task = application
-        .queue_copy(
+        .queue_transfer(
             RepoConfig {
                 namespace: "allen".to_string(),
                 dataset: "photos".to_string(),

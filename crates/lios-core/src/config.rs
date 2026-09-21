@@ -205,16 +205,12 @@ impl LiosPaths {
         )
     }
 
-    pub fn for_task(&self, account_id: &str, space_id: &str, task_id: Uuid) -> Result<Self> {
-        if !is_internal_scope_id(account_id) || !is_internal_scope_id(space_id) {
+    pub fn for_task(&self, space_id: &str, task_id: Uuid) -> Result<Self> {
+        if !is_internal_scope_id(space_id) {
             return Err(LiosError::InvalidTaskScopeId);
         }
         let mut paths = self.clone();
-        paths.staging = self
-            .staging
-            .join(account_id)
-            .join(space_id)
-            .join(task_id.to_string());
+        paths.staging = self.staging.join(space_id).join(task_id.to_string());
         Ok(paths)
     }
 }

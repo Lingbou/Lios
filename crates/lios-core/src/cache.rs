@@ -75,36 +75,23 @@ pub fn cleanup_temporary_staging(staging: impl AsRef<Path>) -> Result<CacheClean
 
 pub fn cleanup_task_staging(
     staging_root: impl AsRef<Path>,
-    account_id: &str,
     space_id: &str,
     task_id: Uuid,
 ) -> Result<CacheCleanupReport> {
     let staging_root = staging_root.as_ref();
-    let task_staging = staging_root
-        .join(account_id)
-        .join(space_id)
-        .join(task_id.to_string());
+    let task_staging = staging_root.join(space_id).join(task_id.to_string());
     let mut report = CacheCleanupReport::default();
     if !task_staging.exists() {
         return Ok(report);
     }
     report.add(remove_path_counting(&task_staging)?);
-    let space_dir = staging_root.join(account_id).join(space_id);
+    let space_dir = staging_root.join(space_id);
     if space_dir.exists()
         && fs::read_dir(&space_dir)
             .map(|mut iter| iter.next().is_none())
             .unwrap_or(false)
     {
         let _ = fs::remove_dir(&space_dir);
-        report.dirs_removed += 1;
-    }
-    let account_dir = staging_root.join(account_id);
-    if account_dir.exists()
-        && fs::read_dir(&account_dir)
-            .map(|mut iter| iter.next().is_none())
-            .unwrap_or(false)
-    {
-        let _ = fs::remove_dir(&account_dir);
         report.dirs_removed += 1;
     }
     Ok(report)
@@ -141,51 +128,29 @@ pub fn cleanup_all_inactive_staging(
             continue;
         }
 
-        let space_entries = match fs::read_dir(&entry_path) {
+        let task_entries = match fs::read_dir(&entry_path) {
             Ok(entries) => entries,
             Err(_) => continue,
         };
 
-        for space_entry in space_entries.flatten() {
-            let space_path = space_entry.path();
-            if !space_path.is_dir() {
-                if let Ok(file_report) = remove_file_counting(&space_path) {
+        for task_entry in task_entries.flatten() {
+            let task_path = task_entry.path();
+            if !task_path.is_dir() {
+                if let Ok(file_report) = remove_file_counting(&task_path) {
                     report.add(file_report);
                 }
                 continue;
             }
 
-            let space_file_name = space_entry.file_name();
-            let space_name = space_file_name.to_string_lossy();
-            if !is_scope_hex(&space_name) {
+            let task_name = task_entry.file_name().to_string_lossy().into_owned();
+            let Ok(uuid) = Uuid::parse_str(&task_name) else {
+                continue;
+            };
+            if active_task_ids.contains(&uuid) {
                 continue;
             }
-
-            let task_entries = match fs::read_dir(&space_path) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-
-            for task_entry in task_entries.flatten() {
-                let task_path = task_entry.path();
-                let task_name = task_entry.file_name().to_string_lossy().into_owned();
-                let Ok(uuid) = Uuid::parse_str(&task_name) else {
-                    continue;
-                };
-                if active_task_ids.contains(&uuid) {
-                    continue;
-                }
-                if let Ok(task_report) = remove_path_counting(&task_path) {
-                    report.add(task_report);
-                }
-            }
-
-            if fs::read_dir(&space_path)
-                .map(|mut iter| iter.next().is_none())
-                .unwrap_or(false)
-                && fs::remove_dir(&space_path).is_ok()
-            {
-                report.dirs_removed += 1;
+            if let Ok(task_report) = remove_path_counting(&task_path) {
+                report.add(task_report);
             }
         }
 
@@ -237,15 +202,12 @@ fn path_is_in_active_task(staging: &Path, path: &Path, active_task_ids: &HashSet
         return false;
     };
     let mut components = relative.components();
-    let (
-        Some(Component::Normal(account)),
-        Some(Component::Normal(space)),
-        Some(Component::Normal(task)),
-    ) = (components.next(), components.next(), components.next())
+    let (Some(Component::Normal(space)), Some(Component::Normal(task))) =
+        (components.next(), components.next())
     else {
         return false;
     };
-    if !is_scope_hex(&account.to_string_lossy()) || !is_scope_hex(&space.to_string_lossy()) {
+    if !is_scope_hex(&space.to_string_lossy()) {
         return false;
     }
     task.to_str()

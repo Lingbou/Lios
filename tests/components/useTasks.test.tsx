@@ -10,7 +10,6 @@ import type {
 function summary(overrides: Partial<TaskSummary> = {}): TaskSummary {
   return {
     id: "task-a",
-    account_id: "account",
     space_id: "space",
     state: "Queued",
     label: "upload",

@@ -2,20 +2,12 @@ import type { TaskAction, TaskItem, TaskState, TaskSummary } from "./taskTypes.t
 
 const activeTaskStates = new Set<TaskState>([
   "Queued",
-  "Preparing",
   "Running",
   "Paused",
-  "Retrying",
   "Committing"
 ]);
 const terminalTaskStates = new Set<TaskState>(["Failed", "Completed", "Canceled"]);
-const liveTaskStates = new Set<TaskState>([
-  "Queued",
-  "Preparing",
-  "Running",
-  "Retrying",
-  "Committing"
-]);
+const liveTaskStates = new Set<TaskState>(["Queued", "Running", "Committing"]);
 
 export function isActiveTask(task: Pick<TaskSummary, "state">) {
   return activeTaskStates.has(task.state);
@@ -84,7 +76,7 @@ export function taskActionsForTask(
   task: Pick<TaskSummary, "state" | "can_retry">
 ): TaskAction[] {
   const { state } = task;
-  if (["Queued", "Preparing", "Running", "Retrying"].includes(state)) {
+  if (state === "Queued" || state === "Running") {
     return ["pause", "cancel"];
   }
   if (state === "Paused") return ["resume", "cancel"];
@@ -161,14 +153,14 @@ export function taskProgressText(task: TaskPresentationRecord) {
   } else if (task.progress_total > 0) {
     parts.push(`${task.progress_done}/${task.progress_total} 项`);
     parts.push(`${percent}%`);
-  } else if (["Preparing", "Running", "Retrying", "Committing"].includes(task.state)) {
+  } else if (task.state === "Running" || task.state === "Committing") {
     parts.push("准备中");
   } else if (task.state === "Queued") {
     parts.push("等待开始");
   } else {
     parts.push("-");
   }
-  const showsLiveRate = ["Preparing", "Running", "Retrying", "Committing"].includes(task.state);
+  const showsLiveRate = task.state === "Running" || task.state === "Committing";
   if (showsLiveRate) {
     const speed = finiteNonNegative(task.speed_bps);
     if (speed > 0) parts.push(`${formatTaskBytes(speed)}/s`);
@@ -194,11 +186,11 @@ export function taskStatusText(task: TaskPresentationRecord) {
   if (task.state === "Completed") return task.error ? `已完成：${task.error}` : "已完成";
   if (task.state === "Canceled") return task.error ? `已取消：${task.error}` : "已取消";
   if (task.state === "Failed") return task.error ? `失败：${task.error}` : "失败";
-  if (task.state === "Preparing" && task.label.startsWith("verify_")) {
+  if (task.phase === "preparing" && task.label.startsWith("verify_")) {
     return "正在准备空间检查";
   }
-  if (task.state === "Preparing" && task.label === "rebuild") return "正在准备目录重建";
-  if (task.state === "Preparing" || task.phase === "preparing") return "正在切片加密";
+  if (task.phase === "preparing" && task.label === "rebuild") return "正在准备目录重建";
+  if (task.phase === "preparing") return "正在切片加密";
   if (task.state === "Running" && task.phase === "uploading") return "正在同步到远端";
   if (task.state === "Running" && task.phase === "downloading") return "正在下载";
   if (task.state === "Running" && task.phase === "checking_remote") return "正在核对远端清单";
@@ -215,9 +207,6 @@ export function taskStatusText(task: TaskPresentationRecord) {
   }
   if (task.state === "Running" && task.phase === "restoring") return "正在恢复到本地";
   if (task.state === "Running") return task.progress_total > 0 ? "正在处理" : "正在准备";
-  if (task.state === "Retrying") {
-    return `正在重试${(task.attempt ?? 0) > 0 ? `（第 ${task.attempt} 次）` : ""}`;
-  }
   if (task.state === "Committing" && task.phase === "reconciling") return "正在核对远端提交结果";
   if (task.state === "Committing") return "正在提交远端变更";
   return "处理中";

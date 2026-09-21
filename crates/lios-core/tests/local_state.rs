@@ -1,13 +1,12 @@
 use lios_core::{
-    catalog::{ConflictAction, ConflictResolution, SourceSnapshotReport},
     config::{
         ensure_default_key_configured, LiosConfig, LiosPaths, RepoConfig, CONFIG_SCHEMA_VERSION,
     },
     credentials::{protect_to_file, unprotect_from_file},
     crypto::KeyFile,
     tasks::{
-        CheckpointState, TaskCatalogCheckpoint, TaskItem, TaskItemState, TaskObjectCheckpoint,
-        TaskRecord, TaskSpec, TaskState, TaskStore,
+        CheckpointState, PersistedTransferPlan, TaskCatalogCheckpoint, TaskItem, TaskItemState,
+        TaskObjectCheckpoint, TaskRecord, TaskSpec, TaskState, TaskStore, TransferDirection,
     },
     LiosError,
 };
@@ -79,25 +78,18 @@ fn task_scoped_paths_are_nested_under_staging_and_reject_unsafe_ids() {
     let tmp = tempdir().unwrap();
     let paths = LiosPaths::from_home(tmp.path());
     let task_id = Uuid::new_v4();
-    let account_id = "a".repeat(64);
     let space_id = "b".repeat(64);
 
-    let scoped = paths.for_task(&account_id, &space_id, task_id).unwrap();
+    let scoped = paths.for_task(&space_id, task_id).unwrap();
     assert_eq!(
         scoped.staging,
-        paths
-            .staging
-            .join(&account_id)
-            .join(&space_id)
-            .join(task_id.to_string())
+        paths.staging.join(&space_id).join(task_id.to_string())
     );
     assert_eq!(scoped.database, paths.database);
     assert_eq!(scoped.config, paths.config);
-    assert!(paths.for_task("../account", &space_id, task_id).is_err());
-    assert!(paths
-        .for_task(&account_id.to_uppercase(), &space_id, task_id)
-        .is_err());
-    assert!(paths.for_task(&account_id, "short", task_id).is_err());
+    assert!(paths.for_task("../space", task_id).is_err());
+    assert!(paths.for_task(&space_id.to_uppercase(), task_id).is_err());
+    assert!(paths.for_task("short", task_id).is_err());
 }
 
 #[test]
@@ -591,7 +583,6 @@ fn task_store_summaries_report_retry_capability_without_failing_on_malformed_spe
     let db_path = tmp.path().join("lios.db");
     let store = TaskStore::open(&db_path).unwrap();
     let spec = TaskSpec::Delete {
-        account_id: "account-a".to_string(),
         space_id: "space-a".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -734,7 +725,6 @@ fn task_store_lists_queued_summaries_with_specs_without_decoding_items() {
     let db_path = tmp.path().join("lios.db");
     let store = TaskStore::open(&db_path).unwrap();
     let spec = TaskSpec::Delete {
-        account_id: "account-a".to_string(),
         space_id: "space-a".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -782,7 +772,6 @@ fn task_store_lists_queued_summaries_with_specs_without_decoding_items() {
 
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].0.id, task.id);
-    assert_eq!(queued[0].1.account_id(), spec.account_id());
     assert_eq!(queued[0].1.space_id(), spec.space_id());
 }
 
@@ -792,7 +781,6 @@ fn task_store_lists_startup_summaries_with_specs_using_direct_state_filtering() 
     let db_path = tmp.path().join("lios.db");
     let store = TaskStore::open(&db_path).unwrap();
     let spec = TaskSpec::Delete {
-        account_id: "account-a".to_string(),
         space_id: "space-a".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -827,9 +815,6 @@ fn task_store_lists_startup_summaries_with_specs_using_direct_state_filtering() 
     assert_eq!(startup[0].0.state, TaskState::Queued);
     assert_eq!(startup[1].0.id, committing.id);
     assert_eq!(startup[1].0.state, TaskState::Committing);
-    assert!(startup
-        .iter()
-        .all(|(_, loaded)| loaded.account_id() == spec.account_id()));
 }
 
 #[test]
@@ -838,7 +823,6 @@ fn task_store_spec_summary_queries_skip_malformed_specs() {
     let db_path = tmp.path().join("lios.db");
     let store = TaskStore::open(&db_path).unwrap();
     let spec = TaskSpec::Delete {
-        account_id: "account-a".to_string(),
         space_id: "space-a".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -880,16 +864,12 @@ fn task_store_spec_summary_queries_skip_malformed_specs() {
     let queued = store.list_queued_summaries_with_specs().unwrap();
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].0.id, valid_queued.id);
-    assert_eq!(queued[0].1.account_id(), spec.account_id());
     assert_eq!(queued[0].1.space_id(), spec.space_id());
 
     let startup = store.list_startup_summaries_with_specs().unwrap();
     assert_eq!(startup.len(), 2);
     assert_eq!(startup[0].0.id, valid_queued.id);
     assert_eq!(startup[1].0.id, valid_committing.id);
-    assert!(startup
-        .iter()
-        .all(|(_, loaded)| loaded.account_id() == spec.account_id()));
 }
 
 #[test]
@@ -1005,8 +985,7 @@ fn task_store_persists_specs_items_and_checkpoints() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("lios.db");
     let store = TaskStore::open(&db_path).unwrap();
-    let spec = TaskSpec::Upload {
-        account_id: "account-a".to_string(),
+    let spec = TaskSpec::Delete {
         space_id: "novix/cold".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -1014,14 +993,7 @@ fn task_store_persists_specs_items_and_checkpoints() {
             endpoint: "https://modelscope.cn".to_string(),
             title: None,
         },
-        parent_node_id: "root".to_string(),
-        source_paths: vec![tmp.path().join("album.bin")],
-        source_snapshot: SourceSnapshotReport::default(),
-        chunk_size: 128 * 1024 * 1024,
-        conflict_resolutions: vec![ConflictResolution {
-            source_path: tmp.path().join("album.bin").to_string_lossy().into_owned(),
-            action: ConflictAction::KeepBoth,
-        }],
+        node_ids: vec!["node-a".to_string()],
     };
     let task = TaskRecord::queued_for_spec(&spec);
     let item = TaskItem {
@@ -1049,7 +1021,7 @@ fn task_store_persists_specs_items_and_checkpoints() {
     store.upsert_item(&item).unwrap();
     store.upsert_checkpoint(&checkpoint).unwrap();
     let mut updated_task = task.clone();
-    updated_task.state = TaskState::Preparing;
+    updated_task.state = TaskState::Running;
     updated_task.progress_total = 4;
     store.insert(&updated_task).unwrap();
     drop(store);
@@ -1057,33 +1029,23 @@ fn task_store_persists_specs_items_and_checkpoints() {
     let reopened = TaskStore::open(&db_path).unwrap();
     let loaded_spec = reopened.load_spec(task.id).unwrap().unwrap();
     match loaded_spec {
-        TaskSpec::Upload {
-            account_id,
+        TaskSpec::Delete {
             space_id,
             repo,
-            parent_node_id,
-            source_paths,
-            chunk_size,
-            conflict_resolutions,
+            node_ids,
             ..
         } => {
-            assert_eq!(account_id, "account-a");
             assert_eq!(space_id, "novix/cold");
             assert_eq!(repo.namespace, "novix");
             assert_eq!(repo.dataset, "cold");
             assert_eq!(repo.endpoint, "https://modelscope.cn");
-            assert_eq!(parent_node_id, "root");
-            assert_eq!(source_paths, vec![tmp.path().join("album.bin")]);
-            assert_eq!(chunk_size, 128 * 1024 * 1024);
-            assert_eq!(conflict_resolutions.len(), 1);
-            assert_eq!(conflict_resolutions[0].action, ConflictAction::KeepBoth);
+            assert_eq!(node_ids, ["node-a"]);
         }
-        other => panic!("expected upload task spec, got {other:?}"),
+        other => panic!("expected delete task spec, got {other:?}"),
     }
     let tasks = reopened.list().unwrap();
-    assert_eq!(tasks[0].account_id, "account-a");
     assert_eq!(tasks[0].space_id, "novix/cold");
-    assert_eq!(tasks[0].state, TaskState::Preparing);
+    assert_eq!(tasks[0].state, TaskState::Running);
     assert_eq!(tasks[0].progress_total, 4);
     assert_eq!(tasks[0].items, vec![item.clone()]);
     assert_eq!(
@@ -1155,7 +1117,6 @@ fn task_store_requeues_an_interrupted_active_task_without_restarting_completed_i
     let tmp = tempdir().unwrap();
     let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
     let spec = TaskSpec::Delete {
-        account_id: "a".repeat(64),
         space_id: "b".repeat(64),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -1233,7 +1194,6 @@ fn task_store_requeues_a_committing_task_for_safe_replay() {
     let tmp = tempdir().unwrap();
     let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
     let spec = TaskSpec::Delete {
-        account_id: "a".repeat(64),
         space_id: "b".repeat(64),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -1293,7 +1253,6 @@ fn task_store_completes_a_reconciled_commit_and_its_checkpoints() {
     let tmp = tempdir().unwrap();
     let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
     let spec = TaskSpec::Delete {
-        account_id: "a".repeat(64),
         space_id: "b".repeat(64),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -1362,7 +1321,6 @@ fn task_store_fails_a_reconciled_conflict_atomically_without_discarding_checkpoi
     let tmp = tempdir().unwrap();
     let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
     let spec = TaskSpec::Delete {
-        account_id: "a".repeat(64),
         space_id: "b".repeat(64),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -1446,9 +1404,6 @@ fn task_store_makes_committing_monotonic_against_pause_cancel_and_progress() {
     assert!(!store
         .set_transaction_state(running.id, TaskState::Running)
         .unwrap());
-    assert!(!store
-        .schedule_retry(running.id, 1, "network unavailable")
-        .unwrap());
     assert_eq!(
         store.get(running.id).unwrap().unwrap().state,
         TaskState::Committing
@@ -1465,9 +1420,6 @@ fn task_store_makes_committing_monotonic_against_pause_cancel_and_progress() {
     assert!(!store
         .set_transaction_state(canceled.id, TaskState::Committing)
         .unwrap());
-    assert!(!store
-        .schedule_retry(canceled.id, 1, "network unavailable")
-        .unwrap());
     assert_eq!(
         store.get(canceled.id).unwrap().unwrap().state,
         TaskState::Canceled
@@ -1479,8 +1431,7 @@ fn task_store_rolls_back_submission_when_any_item_is_invalid() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("lios.db");
     let mut store = TaskStore::open(&db_path).unwrap();
-    let spec = TaskSpec::Upload {
-        account_id: "account-a".to_string(),
+    let spec = TaskSpec::Delete {
         space_id: "space-a".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -1488,11 +1439,7 @@ fn task_store_rolls_back_submission_when_any_item_is_invalid() {
             endpoint: "https://modelscope.cn".to_string(),
             title: None,
         },
-        parent_node_id: "root".to_string(),
-        source_paths: vec![tmp.path().join("album.bin")],
-        source_snapshot: SourceSnapshotReport::default(),
-        chunk_size: 128 * 1024 * 1024,
-        conflict_resolutions: Vec::new(),
+        node_ids: vec!["node-a".to_string()],
     };
     let task = TaskRecord::queued_for_spec(&spec);
     let invalid_item = TaskItem {
@@ -1561,11 +1508,10 @@ fn task_store_updates_all_file_items_to_a_terminal_state() {
 }
 
 #[test]
-fn task_store_schedules_automatic_retry_and_requeues_manual_retry() {
+fn task_store_requeues_manual_retry() {
     let tmp = tempdir().unwrap();
     let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
-    let spec = TaskSpec::Upload {
-        account_id: "account-a".to_string(),
+    let spec = TaskSpec::Delete {
         space_id: "space-a".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -1573,11 +1519,7 @@ fn task_store_schedules_automatic_retry_and_requeues_manual_retry() {
             endpoint: "https://modelscope.cn".to_string(),
             title: None,
         },
-        parent_node_id: "root".to_string(),
-        source_paths: vec![tmp.path().join("album.bin")],
-        source_snapshot: SourceSnapshotReport::default(),
-        chunk_size: 128 * 1024 * 1024,
-        conflict_resolutions: Vec::new(),
+        node_ids: vec!["node-a".to_string()],
     };
     let task = TaskRecord::queued_for_spec(&spec);
     store.insert_with_spec(&task, &spec).unwrap();
@@ -1600,15 +1542,6 @@ fn task_store_schedules_automatic_retry_and_requeues_manual_retry() {
             error: None,
         })
         .unwrap();
-
-    assert!(store
-        .schedule_retry(task.id, 1, "network unavailable")
-        .unwrap());
-    let retrying = store.get(task.id).unwrap().unwrap();
-    assert_eq!(retrying.state, TaskState::Retrying);
-    assert_eq!(retrying.phase.as_deref(), Some("retrying"));
-    assert_eq!(retrying.attempt, 1);
-    assert_eq!(retrying.error.as_deref(), Some("network unavailable"));
 
     store
         .update_state(
@@ -1635,8 +1568,7 @@ fn task_store_does_not_requeue_failed_tasks_with_malformed_specs() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("lios.db");
     let mut store = TaskStore::open(&db_path).unwrap();
-    let spec = TaskSpec::Upload {
-        account_id: "account-a".to_string(),
+    let spec = TaskSpec::Delete {
         space_id: "space-a".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -1644,11 +1576,7 @@ fn task_store_does_not_requeue_failed_tasks_with_malformed_specs() {
             endpoint: "https://modelscope.cn".to_string(),
             title: None,
         },
-        parent_node_id: "root".to_string(),
-        source_paths: vec![tmp.path().join("album.bin")],
-        source_snapshot: SourceSnapshotReport::default(),
-        chunk_size: 128 * 1024 * 1024,
-        conflict_resolutions: Vec::new(),
+        node_ids: vec!["node-a".to_string()],
     };
     let task = TaskRecord::queued_for_spec(&spec);
     let item = TaskItem {
@@ -1670,9 +1598,15 @@ fn task_store_does_not_requeue_failed_tasks_with_malformed_specs() {
     store
         .update_state(task.id, TaskState::Running, None)
         .unwrap();
-    assert!(store
-        .schedule_retry(task.id, 3, "network unavailable")
-        .unwrap());
+    {
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET attempt = 3 WHERE id = ?1",
+                rusqlite::params![task.id.to_string()],
+            )
+            .unwrap();
+    }
     store
         .update_transfer(task.id, 3, 5, 2048, 4096, 128)
         .unwrap();
@@ -1740,8 +1674,7 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("lios.db");
     let mut store = TaskStore::open(&db_path).unwrap();
-    let spec = TaskSpec::Upload {
-        account_id: "account-a".to_string(),
+    let spec = TaskSpec::Delete {
         space_id: "novix/cold".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -1749,17 +1682,9 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
             endpoint: "https://modelscope.cn".to_string(),
             title: None,
         },
-        parent_node_id: "root".to_string(),
-        source_paths: vec![tmp.path().join("source.bin")],
-        source_snapshot: SourceSnapshotReport::default(),
-        chunk_size: 128 * 1024 * 1024,
-        conflict_resolutions: Vec::new(),
+        node_ids: vec!["node-a".to_string()],
     };
-    let replayable_states = [
-        TaskState::Preparing,
-        TaskState::Running,
-        TaskState::Retrying,
-    ];
+    let replayable_states = [TaskState::Running];
     let mut replayable_ids = Vec::new();
     for state in replayable_states {
         let task = TaskRecord::queued_for_spec(&spec);
@@ -1769,7 +1694,7 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
     }
     let running_item = TaskItem {
         id: Uuid::new_v4(),
-        task_id: replayable_ids[1],
+        task_id: replayable_ids[0],
         name: "source.bin".to_string(),
         relative_path: Some("source.bin".into()),
         source_path: Some(tmp.path().join("source.bin")),
@@ -1852,7 +1777,7 @@ fn task_store_recovers_only_replayable_tasks_and_resets_running_items() {
         assert_eq!(task.attempt, 1);
         assert_eq!(task.phase, None);
     }
-    let recovered_item = store.list_items(replayable_ids[1]).unwrap().remove(0);
+    let recovered_item = store.list_items(replayable_ids[0]).unwrap().remove(0);
     assert_eq!(recovered_item.state, TaskItemState::Queued);
     assert_eq!(recovered_item.phase, None);
     assert_eq!(recovered_item.error, None);
@@ -1919,7 +1844,6 @@ fn task_store_restart_recovery_can_be_scoped_to_one_locked_space() {
     let tmp = tempdir().unwrap();
     let mut store = TaskStore::open(tmp.path().join("lios.db")).unwrap();
     let spec_for = |space_id: &str| TaskSpec::Delete {
-        account_id: "a".repeat(64),
         space_id: space_id.to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -2036,7 +1960,6 @@ fn task_store_lists_valid_queued_specs_and_claims_each_task_once() {
     let db_path = tmp.path().join("lios.db");
     let mut store = TaskStore::open(&db_path).unwrap();
     let spec = TaskSpec::Delete {
-        account_id: "account-a".to_string(),
         space_id: "novix/cold".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -2085,8 +2008,8 @@ fn task_store_lists_valid_queued_specs_and_claims_each_task_once() {
         TaskState::Queued
     );
     let claimed = second_connection.get(queued.id).unwrap().unwrap();
-    assert_eq!(claimed.state, TaskState::Preparing);
-    assert_eq!(claimed.phase.as_deref(), Some("preparing"));
+    assert_eq!(claimed.state, TaskState::Running);
+    assert_eq!(claimed.phase, None);
 }
 
 #[test]
@@ -2098,13 +2021,11 @@ fn verify_task_labels_distinguish_quick_and_full_checks() {
         title: None,
     };
     let quick = TaskSpec::VerifySpace {
-        account_id: "account".to_string(),
         space_id: "space".to_string(),
         repo: repo.clone(),
         full: false,
     };
     let full = TaskSpec::VerifySpace {
-        account_id: "account".to_string(),
         space_id: "space".to_string(),
         repo,
         full: true,
@@ -2117,7 +2038,6 @@ fn verify_task_labels_distinguish_quick_and_full_checks() {
 #[test]
 fn rebuild_task_spec_roundtrips_the_confirmed_revision() {
     let spec = TaskSpec::RebuildCatalog {
-        account_id: "account".to_string(),
         space_id: "space".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -2141,10 +2061,18 @@ fn rebuild_task_spec_roundtrips_the_confirmed_revision() {
 }
 
 #[test]
-fn upload_task_spec_roundtrips_the_persisted_source_snapshot() {
-    let snapshot = SourceSnapshotReport::default();
-    let spec = TaskSpec::Upload {
-        account_id: "account-a".to_string(),
+fn transfer_task_spec_roundtrips_the_persisted_plan() {
+    let plan = PersistedTransferPlan {
+        direction: TransferDirection::Push,
+        source_operand: "source".to_string(),
+        destination_operand: "/".to_string(),
+        source_trailing_slash: false,
+        excludes: Vec::new(),
+        remote_catalog_baseline: None,
+        delete_scope: None,
+        actions: Vec::new(),
+    };
+    let spec = TaskSpec::Transfer {
         space_id: "space-a".to_string(),
         repo: RepoConfig {
             namespace: "novix".to_string(),
@@ -2152,23 +2080,16 @@ fn upload_task_spec_roundtrips_the_persisted_source_snapshot() {
             endpoint: "https://modelscope.cn".to_string(),
             title: None,
         },
-        parent_node_id: "root".to_string(),
-        source_paths: vec!["C:/source".into()],
-        source_snapshot: snapshot.clone(),
-        chunk_size: 128 * 1024 * 1024,
-        conflict_resolutions: Vec::new(),
+        plan: plan.clone(),
     };
 
     let encoded = serde_json::to_string(&spec).unwrap();
     let decoded: TaskSpec = serde_json::from_str(&encoded).unwrap();
-    let TaskSpec::Upload {
-        source_snapshot, ..
-    } = decoded
-    else {
-        panic!("expected upload task");
+    let TaskSpec::Transfer { plan: decoded, .. } = decoded else {
+        panic!("expected transfer task");
     };
 
-    assert_eq!(source_snapshot, snapshot);
+    assert_eq!(decoded, plan);
 }
 
 #[test]

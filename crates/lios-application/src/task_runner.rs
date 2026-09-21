@@ -1,10 +1,8 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use lios_core::catalog::{
     Catalog, CatalogIntegrityReport, CatalogRemoteIntegrityReport, CatalogSelection,
-    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution, SourceSnapshotReport,
-    CATALOG_FILE,
+    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution, CATALOG_FILE,
 };
 use lios_core::catalog_transaction::{
     probe_catalog_sha256, CatalogBlobCheckpointState, CatalogTransactionOutcome,
@@ -27,8 +25,8 @@ use crate::catalog_sync::{
 };
 use crate::service::{key_from_config, Application};
 use crate::task_support::{
-    apply_pack_progress, persist_submission, persist_transfer_submission, reconcile_catalog_hash,
-    validate_task_sources, CatalogReconcileDecision, TaskScope,
+    persist_submission, persist_transfer_submission, reconcile_catalog_hash,
+    CatalogReconcileDecision, TaskScope,
 };
 use crate::transfer_request::fingerprint_path;
 use crate::{remote_to_staging_path, to_err, CommandError, CommandErrorCode, CommandResult};
@@ -56,7 +54,6 @@ impl Application {
         let node_ids = clean_ids(node_ids, "delete selection cannot be empty")?;
         let scope = TaskScope::from_repo(&repo);
         let spec = TaskSpec::Delete {
-            account_id: scope.account_id,
             space_id: scope.space_id,
             repo,
             node_ids,
@@ -70,7 +67,6 @@ impl Application {
         key_from_config(&config)?;
         let scope = TaskScope::from_repo(&repo);
         let spec = TaskSpec::VerifySpace {
-            account_id: scope.account_id,
             space_id: scope.space_id,
             repo,
             full,
@@ -79,46 +75,19 @@ impl Application {
         summary_for(&self.paths, task.id)
     }
 
-    pub fn queue_copy(
+    pub fn queue_transfer(
         &self,
         repo: RepoConfig,
         plan: PersistedTransferPlan,
-    ) -> CommandResult<TaskSummary> {
-        self.queue_transfer(repo, plan, false)
-    }
-
-    pub fn queue_sync(
-        &self,
-        repo: RepoConfig,
-        plan: PersistedTransferPlan,
-    ) -> CommandResult<TaskSummary> {
-        self.queue_transfer(repo, plan, true)
-    }
-
-    fn queue_transfer(
-        &self,
-        repo: RepoConfig,
-        plan: PersistedTransferPlan,
-        sync: bool,
     ) -> CommandResult<TaskSummary> {
         let config = LiosConfig::load(&self.paths.config).map_err(to_err)?;
         key_from_config(&config)?;
         let scope = TaskScope::from_repo(&repo);
         let actions = plan.actions.clone();
-        let spec = if sync {
-            TaskSpec::Sync {
-                account_id: scope.account_id,
-                space_id: scope.space_id,
-                repo,
-                plan,
-            }
-        } else {
-            TaskSpec::Copy {
-                account_id: scope.account_id,
-                space_id: scope.space_id,
-                repo,
-                plan,
-            }
+        let spec = TaskSpec::Transfer {
+            space_id: scope.space_id,
+            repo,
+            plan,
         };
         let task = persist_transfer_submission(&self.paths, &spec, &actions).map_err(to_err)?;
         summary_for(&self.paths, task.id)
@@ -156,7 +125,7 @@ impl Application {
         }
         let task_paths = self
             .paths
-            .for_task(spec.account_id(), spec.space_id(), task_id)
+            .for_task(spec.space_id(), task_id)
             .map_err(to_err)?;
         task_paths.ensure_dirs().map_err(to_err)?;
         let mut task = TaskStore::open(&self.paths.database)
@@ -168,7 +137,6 @@ impl Application {
             .map_err(to_err)?
             .set_transaction_state(task_id, TaskState::Running)
             .map_err(to_err)?;
-        let account_id = spec.account_id().to_string();
         let space_id_str = spec.space_id().to_string();
         let result = self.execute_task_spec(&task_paths, &mut task, spec).await;
         let store = TaskStore::open(&self.paths.database).map_err(to_err)?;
@@ -184,7 +152,6 @@ impl Application {
                 store.complete_active_items(task_id).map_err(to_err)?;
                 let _ = lios_core::cache::cleanup_task_staging(
                     &self.paths.staging,
-                    &account_id,
                     &space_id_str,
                     task_id,
                 );
@@ -291,18 +258,13 @@ impl Application {
                 "only terminal task records can be cleared",
             ));
         }
-        let (account_id, space_id) = if let Ok(Some(spec)) = store.load_spec(task_id) {
-            (spec.account_id().to_string(), spec.space_id().to_string())
+        let space_id = if let Ok(Some(spec)) = store.load_spec(task_id) {
+            spec.space_id().to_string()
         } else {
-            (summary.account_id.clone(), summary.space_id.clone())
+            summary.space_id.clone()
         };
-        if !account_id.is_empty() && !space_id.is_empty() {
-            let _ = lios_core::cache::cleanup_task_staging(
-                &self.paths.staging,
-                &account_id,
-                &space_id,
-                task_id,
-            );
+        if !space_id.is_empty() {
+            let _ = lios_core::cache::cleanup_task_staging(&self.paths.staging, &space_id, task_id);
         }
         store.delete(task_id).map_err(to_err)
     }
@@ -329,7 +291,7 @@ impl Application {
                 }
                 Ok(false)
             }
-            TaskState::Preparing | TaskState::Running | TaskState::Retrying => {
+            TaskState::Running => {
                 if !store.requeue_interrupted(task_id).map_err(to_err)? {
                     return Err(CommandError::invalid_input(
                         "interrupted task could not be resumed",
@@ -393,7 +355,7 @@ impl Application {
         let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
         let task_paths = self
             .paths
-            .for_task(spec.account_id(), spec.space_id(), task_id)
+            .for_task(spec.space_id(), task_id)
             .map_err(to_err)?;
         task_paths.ensure_dirs().map_err(to_err)?;
         let probe_path = task_paths.staging.join("catalog-reconcile.enc");
@@ -410,42 +372,12 @@ impl Application {
         spec: TaskSpec,
     ) -> CommandResult<Vec<String>> {
         match spec {
-            TaskSpec::Copy { repo, plan, .. } | TaskSpec::Sync { repo, plan, .. } => {
+            TaskSpec::Transfer { repo, plan, .. } => {
                 self.run_persisted_transfer(task_paths, task, repo, plan)
                     .await
             }
-            TaskSpec::Upload {
-                repo,
-                parent_node_id,
-                source_paths,
-                source_snapshot,
-                chunk_size,
-                conflict_resolutions,
-                ..
-            } => {
-                self.run_upload(
-                    task_paths,
-                    task,
-                    repo,
-                    parent_node_id,
-                    source_paths,
-                    source_snapshot,
-                    chunk_size,
-                    conflict_resolutions,
-                )
-                .await
-            }
             TaskSpec::Delete { repo, node_ids, .. } => {
                 self.run_delete(task_paths, task, repo, node_ids).await
-            }
-            TaskSpec::Download {
-                repo,
-                node_ids,
-                output_dir,
-                ..
-            } => {
-                self.run_download(task_paths, task, repo, node_ids, output_dir)
-                    .await
             }
             TaskSpec::VerifySpace { repo, full, .. } => {
                 self.run_verify(task_paths, repo, full).await
@@ -798,69 +730,6 @@ impl Application {
         Ok(Vec::new())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn run_upload(
-        &self,
-        paths: &LiosPaths,
-        task: &mut TaskRecord,
-        repo: RepoConfig,
-        parent_node_id: String,
-        source_paths: Vec<PathBuf>,
-        source_snapshot: SourceSnapshotReport,
-        chunk_size: usize,
-        conflict_resolutions: Vec<ConflictResolution>,
-    ) -> CommandResult<Vec<String>> {
-        let config = LiosConfig::load(&paths.config).map_err(to_err)?;
-        let key = key_from_config(&config)?;
-        let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
-        validate_task_sources(&source_paths, &source_snapshot, &task.items).map_err(to_err)?;
-        let (catalog, baseline) = download_catalog_baseline(paths, &key, &adapter, &repo).await?;
-        let remote_inventory = baseline.remote_objects.clone();
-        let pause_path = paths.worker_pause_path(task.id);
-        let cancel_path = paths.worker_cancel_path(task.id);
-        let report = catalog
-            .add_paths_to_folder_with_remote_inventory_and_progress_and_report_interruptible(
-                &parent_node_id,
-                &source_paths,
-                &conflict_resolutions,
-                &key,
-                PackOptions {
-                    chunk_size,
-                    staging_dir: paths.staging.clone(),
-                },
-                &remote_inventory,
-                |pack| {
-                    if let Ok(changed) = apply_pack_progress(
-                        &mut task.items,
-                        pack.completed_chunks,
-                        pack.completed_bytes,
-                        chunk_size,
-                    ) {
-                        if let Ok(store) = TaskStore::open(&paths.database) {
-                            for item in changed {
-                                let _ = store.upsert_item(&item);
-                            }
-                            let _ = store.update_transfer(
-                                task.id,
-                                pack.completed_chunks,
-                                pack.total_chunks,
-                                pack.completed_bytes,
-                                pack.total_bytes,
-                                0,
-                            );
-                        }
-                    }
-                },
-                || pause_path.exists() || cancel_path.exists(),
-            )
-            .map_err(to_err)?;
-        report.ensure_no_skipped_paths().map_err(to_err)?;
-        let work = plan_catalog_sync(paths, &catalog, &key, baseline)?;
-        persist_sync_checkpoints(paths, task.id, &work)?;
-        self.publish_sync(paths, task.id, &adapter, &repo, work)
-            .await
-    }
-
     async fn run_delete(
         &self,
         paths: &LiosPaths,
@@ -915,104 +784,6 @@ impl Application {
                 None,
             )),
         }
-    }
-
-    async fn run_download(
-        &self,
-        paths: &LiosPaths,
-        task: &mut TaskRecord,
-        repo: RepoConfig,
-        node_ids: Vec<String>,
-        output_dir: PathBuf,
-    ) -> CommandResult<Vec<String>> {
-        let config = LiosConfig::load(&paths.config).map_err(to_err)?;
-        let key = key_from_config(&config)?;
-        let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), self.read_token()?);
-        let catalog_path = paths.staging.join(CATALOG_FILE);
-        adapter
-            .download_object(&repo.namespace, &repo.dataset, CATALOG_FILE, &catalog_path)
-            .await
-            .map_err(to_err)?;
-        let catalog = Catalog::from_staging(paths.staging.clone());
-        let selection = CatalogSelection::Nodes(node_ids);
-        let remote_files = catalog
-            .remote_files_for_selection(&selection, &key)
-            .map_err(to_err)?;
-        let remote_sizes = adapter
-            .list_objects(&repo.namespace, &repo.dataset, "")
-            .await
-            .map_err(to_err)?
-            .into_iter()
-            .map(|object| (object.path, object.size))
-            .collect::<HashMap<_, _>>();
-        let bytes_total = remote_files.iter().fold(0u64, |total, file| {
-            total.saturating_add(remote_sizes.get(&file.path).copied().unwrap_or(0))
-        });
-        let store = TaskStore::open(&paths.database).map_err(to_err)?;
-        let total = remote_files.len() as u64 + 1;
-        store
-            .update_transfer(task.id, 0, total, 0, bytes_total, 0)
-            .map_err(to_err)?;
-        let mut metrics = crate::task_support::TransferMetrics::new();
-        let mut bytes_done = 0u64;
-        for (index, file) in remote_files.iter().enumerate() {
-            let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
-            let file_bytes_start = bytes_done;
-            adapter
-                .download_object_with_progress(
-                    &repo.namespace,
-                    &repo.dataset,
-                    &file.path,
-                    &local_path,
-                    |chunk_bytes| {
-                        let current_bytes_done = file_bytes_start.saturating_add(chunk_bytes);
-                        let observation = metrics.observe(current_bytes_done, bytes_total, false);
-                        if let Ok(store) = TaskStore::open(&paths.database) {
-                            let _ = store.update_transfer(
-                                task.id,
-                                index as u64,
-                                total,
-                                current_bytes_done,
-                                bytes_total,
-                                observation.speed_bps,
-                            );
-                            let _ = store.update_eta(task.id, observation.eta_seconds);
-                        }
-                    },
-                )
-                .await
-                .map_err(to_err)?;
-            bytes_done = bytes_done.saturating_add(
-                std::fs::metadata(&local_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0),
-            );
-            let observation = metrics.observe(bytes_done, bytes_total, true);
-            let completed = index as u64 + 1;
-            store
-                .update_transfer(
-                    task.id,
-                    completed,
-                    total,
-                    bytes_done,
-                    bytes_total,
-                    observation.speed_bps,
-                )
-                .map_err(to_err)?;
-            store
-                .update_eta(task.id, observation.eta_seconds)
-                .map_err(to_err)?;
-        }
-        store
-            .update_phase(task.id, Some("restoring".to_string()))
-            .map_err(to_err)?;
-        catalog
-            .restore(selection, &key, RestoreOptions { output_dir })
-            .map_err(to_err)?;
-        store
-            .update_transfer(task.id, total, total, bytes_done, bytes_total, 0)
-            .map_err(to_err)?;
-        Ok(Vec::new())
     }
 
     async fn run_rebuild(
@@ -1581,11 +1352,8 @@ fn summary_for(paths: &LiosPaths, task_id: Uuid) -> CommandResult<TaskSummary> {
 
 fn task_repo(spec: &TaskSpec) -> &RepoConfig {
     match spec {
-        TaskSpec::Copy { repo, .. }
-        | TaskSpec::Sync { repo, .. }
-        | TaskSpec::Upload { repo, .. }
+        TaskSpec::Transfer { repo, .. }
         | TaskSpec::Delete { repo, .. }
-        | TaskSpec::Download { repo, .. }
         | TaskSpec::VerifySpace { repo, .. }
         | TaskSpec::RebuildCatalog { repo, .. } => repo,
     }

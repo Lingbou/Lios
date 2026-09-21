@@ -49,7 +49,7 @@ const TASK_PANEL_COLLAPSED_HEIGHT = 40;
 const TASK_PANEL_MAX_RATIO = 0.6;
 const WORKSPACE_MIN_HEIGHT = 240;
 
-const runningStates = new Set<TaskState>(["Preparing", "Running", "Retrying", "Committing"]);
+const runningStates = new Set<TaskState>(["Running", "Committing"]);
 
 function readStoredTaskPanelHeight() {
   if (typeof window === "undefined") return TASK_PANEL_DEFAULT_HEIGHT;

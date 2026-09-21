@@ -16,7 +16,7 @@ fn repo() -> RepoConfig {
 }
 
 #[test]
-fn copy_and_sync_specs_persist_the_confirmed_plan() {
+fn transfer_spec_persists_the_confirmed_plan() {
     let plan = PersistedTransferPlan {
         direction: TransferDirection::Push,
         source_operand: "photos/".to_string(),
@@ -39,23 +39,23 @@ fn copy_and_sync_specs_persist_the_confirmed_plan() {
             state: TransferActionState::Pending,
         }],
     };
-    let copy = TaskSpec::Copy {
-        account_id: "a".repeat(64),
+    let transfer = TaskSpec::Transfer {
         space_id: "b".repeat(64),
         repo: repo(),
         plan: plan.clone(),
     };
-    let sync = TaskSpec::Sync {
-        account_id: "a".repeat(64),
+    let mut pull_plan = plan;
+    pull_plan.direction = TransferDirection::Pull;
+    let pull = TaskSpec::Transfer {
         space_id: "b".repeat(64),
         repo: repo(),
-        plan,
+        plan: pull_plan,
     };
 
-    let copy_roundtrip: TaskSpec =
-        serde_json::from_str(&serde_json::to_string(&copy).unwrap()).unwrap();
-    let sync_roundtrip: TaskSpec =
-        serde_json::from_str(&serde_json::to_string(&sync).unwrap()).unwrap();
-    assert_eq!(copy_roundtrip.label(), "copy");
-    assert_eq!(sync_roundtrip.label(), "sync");
+    let transfer_roundtrip: TaskSpec =
+        serde_json::from_str(&serde_json::to_string(&transfer).unwrap()).unwrap();
+    let pull_roundtrip: TaskSpec =
+        serde_json::from_str(&serde_json::to_string(&pull).unwrap()).unwrap();
+    assert_eq!(transfer_roundtrip.label(), "upload");
+    assert_eq!(pull_roundtrip.label(), "download");
 }

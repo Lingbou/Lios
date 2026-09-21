@@ -1,9 +1,7 @@
 export type TaskState =
   | "Queued"
-  | "Preparing"
   | "Running"
   | "Paused"
-  | "Retrying"
   | "Committing"
   | "Failed"
   | "Completed"
@@ -21,7 +19,6 @@ export type TaskAction = "pause" | "resume" | "retry" | "cancel" | "clear";
 
 export type TaskSummary = {
   id: string;
-  account_id: string;
   space_id: string;
   state: TaskState;
   label: string;
