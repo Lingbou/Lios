@@ -1029,49 +1029,48 @@ fn apply_push_create_or_update(
                     None,
                 )
             })?;
-            let input_dir = paths
-                .staging
-                .join("transfer-input")
-                .join(Uuid::new_v4().simple().to_string());
-            std::fs::create_dir_all(&input_dir).map_err(to_err)?;
-            let staged_source = input_dir.join(name);
-            let linked = std::fs::hard_link(source, &staged_source).is_ok();
-            if !linked {
-                std::fs::copy(source, &staged_source).map_err(to_err)?;
-            }
-            if !linked
-                && action.source_sha256.as_deref().is_some_and(|expected| {
-                    crate::sha256_hex_file(&staged_source).ok().as_deref() != Some(expected)
-                })
-            {
-                return Err(CommandError::new(
-                    CommandErrorCode::RemoteConflict,
-                    format!("local source content changed: {}", action.relative_path),
-                    true,
-                    None,
-                ));
-            }
-            let resolutions = if resolve_relative_node(&tree, &action.relative_path).is_some() {
-                vec![ConflictResolution {
-                    source_path: staged_source.display().to_string(),
-                    action: ConflictAction::Replace,
-                }]
-            } else {
-                Vec::new()
-            };
-            catalog
-                .add_paths_to_folder_with_remote_inventory(
-                    &parent.id,
-                    std::slice::from_ref(&staged_source),
-                    &resolutions,
-                    key,
-                    PackOptions {
-                        chunk_size,
-                        staging_dir: paths.staging.clone(),
-                    },
-                    remote_objects,
-                )
-                .map_err(to_err)
+            let input_base = paths.staging.join("transfer-input");
+            with_scratch_dir(&input_base, |input_dir| {
+                let staged_source = input_dir.join(name);
+                let linked = std::fs::hard_link(source, &staged_source).is_ok();
+                if !linked {
+                    std::fs::copy(source, &staged_source).map_err(to_err)?;
+                }
+                if !linked
+                    && action.source_sha256.as_deref().is_some_and(|expected| {
+                        crate::sha256_hex_file(&staged_source).ok().as_deref() != Some(expected)
+                    })
+                {
+                    return Err(CommandError::new(
+                        CommandErrorCode::RemoteConflict,
+                        format!("local source content changed: {}", action.relative_path),
+                        true,
+                        None,
+                    ));
+                }
+                let resolutions = if resolve_relative_node(&tree, &action.relative_path).is_some() {
+                    vec![ConflictResolution {
+                        source_path: staged_source.display().to_string(),
+                        action: ConflictAction::Replace,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                catalog
+                    .add_paths_to_folder_with_remote_inventory(
+                        &parent.id,
+                        std::slice::from_ref(&staged_source),
+                        &resolutions,
+                        key,
+                        PackOptions {
+                            chunk_size,
+                            staging_dir: paths.staging.clone(),
+                        },
+                        remote_objects,
+                    )
+                    .map_err(to_err)
+            })?;
+            Ok(())
         }
     }
 }
@@ -1200,36 +1199,46 @@ fn apply_pull_action(
                     None,
                 )
             })?;
-            let restore_dir = paths
-                .staging
-                .join("pull-ready")
-                .join(Uuid::new_v4().simple().to_string());
-            std::fs::create_dir_all(&restore_dir).map_err(to_err)?;
-            catalog
-                .restore(
-                    CatalogSelection::Node(node_id.clone()),
-                    key,
-                    RestoreOptions {
-                        output_dir: restore_dir.clone(),
-                    },
-                )
-                .map_err(to_err)?;
-            let restored = restore_dir.join(&node.name);
-            if action.kind == TransferActionKind::ReplaceType {
-                replace_local_type(destination, || {
-                    lios_core::copy_file_atomic(&restored, destination, false).map_err(to_err)
-                })?;
-            } else {
-                lios_core::copy_file_atomic(
-                    &restored,
-                    destination,
-                    action.kind == TransferActionKind::Update,
-                )
-                .map_err(to_err)?;
-            }
+            let restore_base = paths.staging.join("pull-ready");
+            with_scratch_dir(&restore_base, |restore_dir| {
+                let restored = restore_dir.join(&node.name);
+                catalog
+                    .restore(
+                        CatalogSelection::Node(node_id.clone()),
+                        key,
+                        RestoreOptions {
+                            output_dir: restore_dir.to_path_buf(),
+                        },
+                    )
+                    .map_err(to_err)?;
+                if action.kind == TransferActionKind::ReplaceType {
+                    replace_local_type(destination, || {
+                        lios_core::copy_file_atomic(&restored, destination, false).map_err(to_err)
+                    })?;
+                } else {
+                    lios_core::copy_file_atomic(
+                        &restored,
+                        destination,
+                        action.kind == TransferActionKind::Update,
+                    )
+                    .map_err(to_err)?;
+                }
+                Ok(())
+            })?;
             Ok(())
         }
     }
+}
+
+fn with_scratch_dir<T>(
+    base: &std::path::Path,
+    run: impl FnOnce(&std::path::Path) -> CommandResult<T>,
+) -> CommandResult<T> {
+    let dir = base.join(Uuid::new_v4().simple().to_string());
+    std::fs::create_dir_all(&dir).map_err(to_err)?;
+    let result = run(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 fn replace_local_type(
@@ -1467,8 +1476,33 @@ mod tests {
 
     use super::{
         delete_local_destination, fingerprint_path, persist_transaction_progress,
-        validate_local_destination_fingerprint,
+        validate_local_destination_fingerprint, with_scratch_dir,
     };
+    use crate::{to_err, CommandError, CommandResult};
+
+    #[test]
+    fn scratch_directories_are_removed_after_use() {
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("scratch");
+
+        let mut seen = std::path::PathBuf::new();
+        let value = with_scratch_dir(&base, |dir| {
+            seen = dir.to_path_buf();
+            std::fs::write(dir.join("payload"), b"bytes").map_err(to_err)?;
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!(value, 7);
+        assert!(seen.starts_with(&base));
+        assert!(!seen.exists());
+
+        let failed = with_scratch_dir(&base, |dir| -> CommandResult<()> {
+            seen = dir.to_path_buf();
+            Err(CommandError::invalid_input("boom"))
+        });
+        assert!(failed.is_err());
+        assert!(!seen.exists());
+    }
 
     #[test]
     fn transaction_progress_persists_uploaded_and_committed_checkpoints() {
