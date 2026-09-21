@@ -226,6 +226,16 @@ pub fn prepare_push(
     remote_entries: &[TreeEntry],
     options: &PlanOptions,
 ) -> CommandResult<PreparedPush> {
+    prepare_push_with_destination_kind(sources, remote_destination, remote_entries, options, false)
+}
+
+fn prepare_push_with_destination_kind(
+    sources: &[LocalLocation],
+    remote_destination: &str,
+    remote_entries: &[TreeEntry],
+    options: &PlanOptions,
+    destination_is_directory: bool,
+) -> CommandResult<PreparedPush> {
     if sources.is_empty() {
         return Err(CommandError::invalid_input("copy source cannot be empty"));
     }
@@ -262,7 +272,10 @@ pub fn prepare_push(
                     "a trailing slash is only valid for a directory source",
                 ));
             }
-            let target = if sources.len() > 1 || destination_kind == Some(EntryKind::Directory) {
+            let target = if sources.len() > 1
+                || destination_is_directory
+                || destination_kind == Some(EntryKind::Directory)
+            {
                 join_catalog(&destination, &source_name)
             } else {
                 destination.clone()
@@ -344,7 +357,7 @@ pub fn prepare_upload(
     } else {
         format!("/{parent_path}")
     };
-    let mut prepared = prepare_push(
+    let mut prepared = prepare_push_with_destination_kind(
         &sources,
         &destination,
         remote_entries,
@@ -353,6 +366,7 @@ pub fn prepare_upload(
             yes: true,
             ..PlanOptions::default()
         },
+        true,
     )?;
     for resolution in resolutions {
         let target = prepared

@@ -146,6 +146,28 @@ fn upload_keep_both_rewrites_the_confirmed_plan_target() {
 }
 
 #[test]
+fn upload_single_file_to_space_root_uses_the_file_name() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("root.txt");
+    std::fs::write(&source, b"new").unwrap();
+    let prepared = prepare_upload(
+        vec![LocalLocation {
+            path: source,
+            trailing_slash: false,
+        }],
+        "",
+        &[],
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.plan.action("root.txt").unwrap().kind,
+        PlanActionKind::Create
+    );
+}
+
+#[test]
 fn upload_keep_both_rewrites_every_descendant_of_a_folder() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("folder");
