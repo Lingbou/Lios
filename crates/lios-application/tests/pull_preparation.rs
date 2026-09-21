@@ -71,6 +71,36 @@ fn download_preserves_existing_conflicting_file() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn download_ignores_unrelated_destination_entries() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().unwrap();
+    let destination = temp.path().join("restore");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("unrelated.bin"), b"data").unwrap();
+    symlink("missing-target", destination.join("unrelated-link")).unwrap();
+
+    let prepared = prepare_download(
+        &[RemoteSource {
+            node: remote_file("report.txt", &"a".repeat(64), 6),
+            trailing_slash: false,
+        }],
+        &LocalLocation {
+            path: destination.clone(),
+            trailing_slash: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.plan.action("report.txt").unwrap().kind,
+        PlanActionKind::Create
+    );
+    assert!(destination.join("unrelated-link").is_symlink());
+}
+
 #[test]
 fn download_uses_next_restored_name_when_first_is_taken() {
     let temp = tempdir().unwrap();

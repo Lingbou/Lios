@@ -547,6 +547,23 @@ pub fn prepare_pull(
     local_destination: &LocalLocation,
     options: &PlanOptions,
 ) -> CommandResult<PreparedPull> {
+    prepare_pull_with_snapshot(
+        sources,
+        local_destination,
+        options,
+        |root, _source_entries| snapshot_local_destination(root),
+    )
+}
+
+fn prepare_pull_with_snapshot(
+    sources: &[RemoteSource],
+    local_destination: &LocalLocation,
+    options: &PlanOptions,
+    snapshot_destination: impl FnOnce(
+        &Path,
+        &[TreeEntry],
+    ) -> CommandResult<(Vec<TreeEntry>, BTreeMap<String, String>)>,
+) -> CommandResult<PreparedPull> {
     if sources.is_empty() {
         return Err(CommandError::invalid_input("copy source cannot be empty"));
     }
@@ -632,9 +649,9 @@ pub fn prepare_pull(
         }
     }
 
-    let (destination_entries, destination_fingerprints) =
-        snapshot_local_destination(&destination_root)?;
     let source_entries = source_entries.into_values().collect::<Vec<_>>();
+    let (destination_entries, destination_fingerprints) =
+        snapshot_destination(&destination_root, &source_entries)?;
     let scoped_destination = transfer_scope_entries(
         &source_entries,
         &destination_entries,
@@ -672,9 +689,53 @@ pub fn prepare_download(
     sources: &[RemoteSource],
     local_destination: &LocalLocation,
 ) -> CommandResult<PreparedPull> {
-    let mut prepared = prepare_pull(sources, local_destination, &PlanOptions::default())?;
+    let mut prepared = prepare_pull_with_snapshot(
+        sources,
+        local_destination,
+        &PlanOptions::default(),
+        snapshot_download_destination,
+    )?;
     rename_existing_file_conflicts(&mut prepared)?;
     Ok(prepared)
+}
+
+/// Desktop downloads only care about the exact destination paths they are
+/// about to write. Scanning (and hashing) the whole destination tree makes
+/// downloading into a large folder needlessly slow.
+fn snapshot_download_destination(
+    root: &Path,
+    source_entries: &[TreeEntry],
+) -> CommandResult<(Vec<TreeEntry>, BTreeMap<String, String>)> {
+    let mut entries = Vec::new();
+    let mut fingerprints = BTreeMap::new();
+    for source in source_entries {
+        let path = root.join(Path::new(&source.path));
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(to_err(error)),
+        };
+        if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
+            return Err(CommandError::invalid_input(
+                "restore destination contains unsupported symbolic links or junctions",
+            ));
+        }
+        fingerprints.insert(source.path.clone(), local_fingerprint(&metadata)?);
+        if metadata.is_dir() {
+            entries.push(TreeEntry::directory(&source.path));
+        } else if metadata.is_file() {
+            entries.push(TreeEntry::file(
+                &source.path,
+                sha256_hex_file(&path)?,
+                metadata.len(),
+            ));
+        } else {
+            return Err(CommandError::invalid_input(
+                "restore destination contains an unsupported file type",
+            ));
+        }
+    }
+    Ok((entries, fingerprints))
 }
 
 fn rename_existing_file_conflicts(prepared: &mut PreparedPull) -> CommandResult<()> {
