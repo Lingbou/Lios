@@ -171,7 +171,10 @@ async fn modelscope_private_dataset_roundtrip() {
     write_file(&source_dir.join("nested/deep/b.txt"), b"deep data");
     fs::create_dir_all(source_dir.join("empty-dir")).unwrap();
 
-    adapter.create_repo(&namespace, &dataset).await.unwrap();
+    adapter
+        .create_repo(&namespace, &dataset, None)
+        .await
+        .unwrap();
     assert!(adapter.repo_exists(&namespace, &dataset).await.unwrap());
 
     let result = async {

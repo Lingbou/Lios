@@ -20,7 +20,7 @@ import {
   UploadCloud,
   X
 } from "lucide-react";
-import { type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import liosPetalMark from "./assets/lios-petal-mark.svg";
 import type {
   CacheCleanupReport,
@@ -84,7 +84,7 @@ import type {
   ViewMode
 } from "./features/drive/driveTypes.ts";
 import { CreateSpaceModal } from "./features/spaces/CreateSpaceModal.tsx";
-import { nameToSafeSlug } from "./features/spaces/spaceMapping.ts";
+import { nameToSafeSlug, sanitizeSpaceAlias } from "./features/spaces/spaceMapping.ts";
 import { SpaceGrid } from "./features/spaces/SpaceGrid.tsx";
 import { RebuildCatalogModal } from "./features/catalog/RebuildCatalogModal.tsx";
 import { ImportKeyModal } from "./features/recoveryKey/ImportKeyModal.tsx";
@@ -402,22 +402,22 @@ function App() {
 
       // Auto-register any discovered ASCII ModelScope dataset into local space registry
       const registeredSet = new Set(next.spaces.map((s) => `${s.namespace}/${s.dataset}`));
+      const takenAliases = new Set(next.spaces.map((s) => s.space_name));
       let anyRegistered = false;
       for (const repo of result.repositories) {
         if (!registeredSet.has(`${repo.namespace}/${repo.dataset}`)) {
-          const defaultAlias = repo.dataset.toLowerCase();
-          if (/^[a-z][a-z0-9_-]{0,31}$/.test(defaultAlias)) {
-            try {
-              await appInvoke("register_space", {
-                name: defaultAlias,
-                namespace: repo.namespace,
-                dataset: repo.dataset,
-                endpoint: repo.endpoint
-              });
-              anyRegistered = true;
-            } catch {
-              // Ignore alias collision or format error
-            }
+          const defaultAlias = sanitizeSpaceAlias(repo.dataset, takenAliases);
+          try {
+            await appInvoke("register_space", {
+              name: defaultAlias,
+              namespace: repo.namespace,
+              dataset: repo.dataset,
+              endpoint: repo.endpoint
+            });
+            takenAliases.add(defaultAlias);
+            anyRegistered = true;
+          } catch {
+            // Ignore alias collision or format error
           }
         }
       }
@@ -683,7 +683,9 @@ function App() {
         }
         const result = outcome.catalog;
         setCatalogTree(result.tree);
-        if (!currentFolderId) setCurrentFolderId(result.tree.id);
+        setCurrentFolderId((current) =>
+          !current || !findNode(result.tree, current) ? result.tree.id : current
+        );
         setCatalogStatus("ready");
         setSelectedIds(new Set());
         setLastSelectedId(null);
@@ -785,19 +787,23 @@ function App() {
     }
   }
 
+  function navigateToFolder(folderId: string) {
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+      searchTimeoutRef.current = null;
+    }
+    searchSeqRef.current += 1;
+    setCurrentFolderId(folderId);
+    setSelectedIds(new Set());
+    setLastSelectedId(null);
+    setQuery("");
+    setAppliedQuery("");
+    setSearchResults([]);
+  }
+
   function enterItem(item: DriveItem) {
     if (item.kind === "Directory") {
-      if (searchTimeoutRef.current) {
-        clearTimeout(searchTimeoutRef.current);
-        searchTimeoutRef.current = null;
-      }
-      searchSeqRef.current += 1;
-      setCurrentFolderId(item.id);
-      setSelectedIds(new Set());
-      setLastSelectedId(null);
-      setQuery("");
-      setAppliedQuery("");
-      setSearchResults([]);
+      navigateToFolder(item.id);
     } else {
       toggleSelection(item.id);
       void openFilePreview(item);
@@ -913,17 +919,40 @@ function App() {
         name
       });
       setCatalogTree(result.tree);
+      setCurrentFolderId((current) =>
+        !current || !findNode(result.tree, current) ? result.tree.id : current
+      );
       setCatalogStatus("ready");
       setMessage(result.warnings.join("; "));
     });
   }
 
-  async function renameSelected() {
+  function isDriveItem(target: unknown): target is DriveItem {
+    return (
+      typeof target === "object" &&
+      target !== null &&
+      "id" in target &&
+      typeof (target as any).id === "string"
+    );
+  }
+
+  function resolveTargetNodeIds(target?: DriveItem | string[]): string[] {
+    if (Array.isArray(target)) {
+      return target;
+    }
+    if (isDriveItem(target)) {
+      return selectedIds.has(target.id) && selectedIds.size > 1 ? [...selectedIds] : [target.id];
+    }
+    return [...selectedIds];
+  }
+
+  async function renameSelected(target?: DriveItem | string) {
     if (!activeSpace) return;
-    const [nodeId] = [...selectedIds];
+    const targetItem = isDriveItem(target) ? target : undefined;
+    const nodeId = typeof target === "string" ? target : targetItem?.id ?? [...selectedIds][0];
     if (!nodeId) return;
     const node = findNode(catalogTree, nodeId);
-    const newName = window.prompt("新名称", node?.name ?? "");
+    const newName = window.prompt("新名称", node?.name ?? targetItem?.name ?? "");
     if (!newName) return;
     await run("重命名", async () => {
       const result = await appInvoke<CatalogLoadResult>("rename_node", {
@@ -932,6 +961,9 @@ function App() {
         newName
       });
       setCatalogTree(result.tree);
+      setCurrentFolderId((current) =>
+        !current || !findNode(result.tree, current) ? result.tree.id : current
+      );
       setCatalogStatus("ready");
       setSelectedIds(new Set());
       setLastSelectedId(null);
@@ -939,25 +971,28 @@ function App() {
     });
   }
 
-  async function deleteSelected() {
-    if (selectedIds.size === 0 || !activeSpace) return;
+  async function deleteSelected(target?: DriveItem | string[]) {
+    if (!activeSpace) return;
+    const nodeIds = resolveTargetNodeIds(target);
+    if (nodeIds.length === 0) return;
     const ok = window.confirm(
-      `从 Lios 目录中删除 ${selectedIds.size} 个项目？此操作不会进入回收站。\n\nModelScope 的令牌接口目前不支持物理删除远端文件；如需释放远端空间，请在 ModelScope 网页端删除或重建这个空间。`
+      `从 Lios 目录中删除 ${nodeIds.length} 个项目？此操作不会进入回收站。\n\nModelScope 的令牌接口目前不支持物理删除远端文件；如需释放远端空间，请在 ModelScope 网页端删除或重建这个空间。`
     );
     if (!ok) return;
-    const nodeIds = [...selectedIds];
     await run("删除", async () => {
       const task = await appInvoke<TaskSummary>("enqueue_delete_nodes", {
         spaceName: activeSpace.space_name,
         nodeIds
       });
       upsertTask(task);
+      setSelectedIds(new Set());
+      setLastSelectedId(null);
     });
   }
 
-  async function downloadSelected(nodeIdsOverride?: string[]) {
+  async function downloadSelected(target?: DriveItem | string[]) {
     if (!activeSpace) return;
-    const nodeIds = nodeIdsOverride ?? [...selectedIds];
+    const nodeIds = resolveTargetNodeIds(target);
     if (nodeIds.length === 0) return;
     const output = await open({ directory: true, multiple: false });
     if (typeof output !== "string") return;
@@ -1388,6 +1423,9 @@ function App() {
                     onClick={() => {
                       setView("spaces");
                       setQuery("");
+                      setSearchResults([]);
+                      setSelectedIds(new Set());
+                      setLastSelectedId(null);
                     }}
                     title="空间列表"
                     aria-label="返回空间列表"
@@ -1398,18 +1436,19 @@ function App() {
                   {crumbs.length > 0 && <ChevronRight aria-hidden className="crumbSeparator" />}
                   {crumbs.length > 0 ? (
                     crumbs.map((crumb, index) => (
-                      <button
-                        key={crumb.id}
-                        type="button"
-                        onClick={() => setCurrentFolderId(crumb.id)}
-                        className={index === crumbs.length - 1 ? "current" : ""}
-                        title={crumbPaths[index]}
-                        aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
-                        aria-current={index === crumbs.length - 1 ? "page" : undefined}
-                      >
-                        {index > 0 && <ChevronRight aria-hidden />}
-                        <span className="crumbLabel">{crumb.name}</span>
-                      </button>
+                      <Fragment key={crumb.id}>
+                        {index > 0 && <ChevronRight aria-hidden className="crumbSeparator" />}
+                        <button
+                          type="button"
+                          onClick={() => navigateToFolder(crumb.id)}
+                          className={index === crumbs.length - 1 ? "current" : ""}
+                          title={crumbPaths[index]}
+                          aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
+                          aria-current={index === crumbs.length - 1 ? "page" : undefined}
+                        >
+                          <span className="crumbLabel">{crumb.name}</span>
+                        </button>
+                      </Fragment>
                     ))
                   ) : (
                     <span className="crumbFallback" title={crumbFallbackLabel}>
@@ -1697,9 +1736,9 @@ function App() {
                 onUploadFiles={() => pickUpload(false)}
                 onUploadFolder={() => pickUpload(true)}
                 onNewFolder={createFolder}
-                onDownload={downloadSelected}
-                onRename={renameSelected}
-                onDelete={deleteSelected}
+                onDownload={() => void downloadSelected()}
+                onRename={() => void renameSelected()}
+                onDelete={() => void deleteSelected()}
                 onRefresh={() => reloadCatalog()}
                 onClearSelection={() => {
                   setSelectedIds(new Set());
@@ -1839,7 +1878,11 @@ function App() {
         <ContextMenu
           state={contextMenu}
           onClose={closeContextMenu}
-          selectedCount={selectedCount}
+          selectedCount={
+            contextMenu.item != null && !selectedIds.has(contextMenu.item.id)
+              ? 1
+              : selectedCount
+          }
           onOpenItem={enterItem}
           onPreviewItem={openFilePreview}
           onDownload={downloadSelected}

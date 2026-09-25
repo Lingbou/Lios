@@ -76,6 +76,30 @@ export function FilePreviewModal({
             </div>
           </div>
           <div className="previewHeaderActions">
+            {(onPrev || onNext) && (
+              <div className="previewNavGroup">
+                <button
+                  type="button"
+                  className="previewNavBtn"
+                  onClick={onPrev}
+                  disabled={!hasPrev || !onPrev}
+                  title="上一个文件 (←)"
+                  aria-label="上一个文件"
+                >
+                  <ChevronLeft aria-hidden />
+                </button>
+                <button
+                  type="button"
+                  className="previewNavBtn"
+                  onClick={onNext}
+                  disabled={!hasNext || !onNext}
+                  title="下一个文件 (→)"
+                  aria-label="下一个文件"
+                >
+                  <ChevronRight aria-hidden />
+                </button>
+              </div>
+            )}
             <button
               type="button"
               className="previewDownloadBtn"
@@ -92,18 +116,6 @@ export function FilePreviewModal({
         </div>
 
         <div className="previewModalBody">
-          {hasPrev && onPrev && (
-            <button
-              type="button"
-              className="previewNavBtn prev"
-              onClick={onPrev}
-              title="上一个文件 (←)"
-              aria-label="上一个文件"
-            >
-              <ChevronLeft aria-hidden />
-            </button>
-          )}
-
           {loading && (
             <div className="previewLoadingState">
               <RefreshCw className="loadingGlyph" aria-hidden />
@@ -146,18 +158,6 @@ export function FilePreviewModal({
                 <span>下载到本地查看</span>
               </button>
             </div>
-          )}
-
-          {hasNext && onNext && (
-            <button
-              type="button"
-              className="previewNavBtn next"
-              onClick={onNext}
-              title="下一个文件 (→)"
-              aria-label="下一个文件"
-            >
-              <ChevronRight aria-hidden />
-            </button>
           )}
         </div>
       </section>
