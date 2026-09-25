@@ -961,6 +961,8 @@ function App() {
         nodeIds
       });
       upsertTask(task);
+      setSelectedIds(new Set());
+      setLastSelectedId(null);
     });
   }
 
