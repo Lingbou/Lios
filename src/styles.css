@@ -649,12 +649,16 @@ select:focus {
 }
 
 .fileName {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
   justify-content: flex-start;
   min-width: 0;
   border-color: transparent;
   background: transparent;
   padding: 0;
+  color: var(--ink);
 }
 
 .fileName svg {
