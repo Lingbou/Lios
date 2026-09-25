@@ -1,3 +1,4 @@
+import { ToastContainer, type ToastItem, type ToastType } from "./features/toast/Toast.tsx";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -140,8 +141,48 @@ function App() {
   const [newSpaceName, setNewSpaceName] = useState("");
   const [createSpaceError, setCreateSpaceError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
-  const [message, setMessage] = useState("");
-  const handleTaskError = useCallback((error: unknown) => setMessage(errorText(error)), []);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const showToast = useCallback((msg: string, type: ToastType = "info", duration = 3500) => {
+    if (!msg) return;
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    setToasts((prev) => [...prev.slice(-3), { id, type, message: msg, duration }]);
+  }, []);
+
+  const setMessage = useCallback((text: string, typeOverride?: ToastType) => {
+    if (!text) {
+      setToasts([]);
+      return;
+    }
+    let type: ToastType = typeOverride ?? "info";
+    if (!typeOverride) {
+      if (text.includes("已导出") || text.includes("已导入") || text.includes("成功") || text.includes("完成")) {
+        type = "success";
+      } else if (
+        text.includes("失败") ||
+        text.includes("错误") ||
+        text.includes("异常") ||
+        text.includes("拒绝") ||
+        text.startsWith("CommandError")
+      ) {
+        type = "error";
+      } else if (
+        text.includes("警告") ||
+        text.includes("请等待") ||
+        text.startsWith("先从") ||
+        text.startsWith("先连接")
+      ) {
+        type = "warning";
+      }
+    }
+    showToast(text, type);
+  }, [showToast]);
+
+  const handleTaskError = useCallback((error: unknown) => setMessage(errorText(error), "error"), [setMessage]);
   const {
     tasks,
     ready: tasksReady,
@@ -989,7 +1030,7 @@ function App() {
     if (typeof destination !== "string") return;
     await run("导出恢复密钥", async () => {
       await appInvoke<RecoveryKeyStatus>("export_recovery_key", { destination });
-      setMessage("恢复密钥备份已导出。请将它保存在独立且安全的位置。");
+      setMessage("恢复密钥备份已导出。请将它保存在独立且安全的位置。", "success");
     });
   }
 
@@ -1070,12 +1111,12 @@ function App() {
         sameSpace(selectedSpace, verification.checked_space)
       ) {
         await refreshVerifiedCatalog(selectedSpace);
-        setMessage("恢复密钥已导入，并已刷新验证过的空间。");
+        setMessage("恢复密钥已导入，并已刷新验证过的空间。", "success");
       } else {
-        setMessage("恢复密钥已导入。外部密钥文件必须保持可用。");
+        setMessage("恢复密钥已导入。外部密钥文件必须保持可用。", "success");
       }
     } catch (error) {
-      setMessage(`恢复密钥已导入，但刷新状态失败：${errorText(error)}`);
+      setMessage(`恢复密钥已导入，但刷新状态失败：${errorText(error)}`, "error");
     } finally {
       setBusy(null);
     }
@@ -1295,6 +1336,7 @@ function App() {
           </button>
         </div>
       </header>
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
 
       <main className="driveShell">
         <aside className="spaceRail">
@@ -1388,15 +1430,7 @@ function App() {
             </header>
           )}
 
-          {message && (
-            <div className="noticeBar">
-              <AlertTriangle aria-hidden />
-              <span>{message}</span>
-              <button onClick={() => setMessage("")} title="关闭">
-                <X aria-hidden />
-              </button>
-            </div>
-          )}
+
 
           {view === "settings" ? (
             <section className="settingsPage">
