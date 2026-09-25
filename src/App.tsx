@@ -898,12 +898,32 @@ function App() {
     });
   }
 
-  async function renameSelected() {
+  function isDriveItem(target: unknown): target is DriveItem {
+    return (
+      typeof target === "object" &&
+      target !== null &&
+      "id" in target &&
+      typeof (target as any).id === "string"
+    );
+  }
+
+  function resolveTargetNodeIds(target?: DriveItem | string[]): string[] {
+    if (Array.isArray(target)) {
+      return target;
+    }
+    if (isDriveItem(target)) {
+      return selectedIds.has(target.id) && selectedIds.size > 1 ? [...selectedIds] : [target.id];
+    }
+    return [...selectedIds];
+  }
+
+  async function renameSelected(target?: DriveItem | string) {
     if (!activeSpace) return;
-    const [nodeId] = [...selectedIds];
+    const targetItem = isDriveItem(target) ? target : undefined;
+    const nodeId = typeof target === "string" ? target : targetItem?.id ?? [...selectedIds][0];
     if (!nodeId) return;
     const node = findNode(catalogTree, nodeId);
-    const newName = window.prompt("新名称", node?.name ?? "");
+    const newName = window.prompt("新名称", node?.name ?? targetItem?.name ?? "");
     if (!newName) return;
     await run("重命名", async () => {
       const result = await appInvoke<CatalogLoadResult>("rename_node", {
@@ -919,13 +939,14 @@ function App() {
     });
   }
 
-  async function deleteSelected() {
-    if (selectedIds.size === 0 || !activeSpace) return;
+  async function deleteSelected(target?: DriveItem | string[]) {
+    if (!activeSpace) return;
+    const nodeIds = resolveTargetNodeIds(target);
+    if (nodeIds.length === 0) return;
     const ok = window.confirm(
-      `从 Lios 目录中删除 ${selectedIds.size} 个项目？此操作不会进入回收站。\n\nModelScope 的令牌接口目前不支持物理删除远端文件；如需释放远端空间，请在 ModelScope 网页端删除或重建这个空间。`
+      `从 Lios 目录中删除 ${nodeIds.length} 个项目？此操作不会进入回收站。\n\nModelScope 的令牌接口目前不支持物理删除远端文件；如需释放远端空间，请在 ModelScope 网页端删除或重建这个空间。`
     );
     if (!ok) return;
-    const nodeIds = [...selectedIds];
     await run("删除", async () => {
       const task = await appInvoke<TaskSummary>("enqueue_delete_nodes", {
         spaceName: activeSpace.space_name,
@@ -935,9 +956,9 @@ function App() {
     });
   }
 
-  async function downloadSelected(nodeIdsOverride?: string[]) {
+  async function downloadSelected(target?: DriveItem | string[]) {
     if (!activeSpace) return;
-    const nodeIds = nodeIdsOverride ?? [...selectedIds];
+    const nodeIds = resolveTargetNodeIds(target);
     if (nodeIds.length === 0) return;
     const output = await open({ directory: true, multiple: false });
     if (typeof output !== "string") return;
@@ -1614,9 +1635,9 @@ function App() {
                 onUploadFiles={() => pickUpload(false)}
                 onUploadFolder={() => pickUpload(true)}
                 onNewFolder={createFolder}
-                onDownload={downloadSelected}
-                onRename={renameSelected}
-                onDelete={deleteSelected}
+                onDownload={() => void downloadSelected()}
+                onRename={() => void renameSelected()}
+                onDelete={() => void deleteSelected()}
                 onRefresh={() => reloadCatalog()}
                 onClearSelection={() => {
                   setSelectedIds(new Set());
@@ -1756,7 +1777,11 @@ function App() {
         <ContextMenu
           state={contextMenu}
           onClose={closeContextMenu}
-          selectedCount={selectedCount}
+          selectedCount={
+            contextMenu.item != null && !selectedIds.has(contextMenu.item.id)
+              ? 1
+              : selectedCount
+          }
           onOpenItem={enterItem}
           onPreviewItem={openFilePreview}
           onDownload={downloadSelected}
