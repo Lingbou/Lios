@@ -73,3 +73,40 @@ export function nameToSafeSlug(name: string): string {
 
   return slug.slice(0, 32);
 }
+
+/**
+ * Normalizes a ModelScope repository name into a valid Lios local space alias
+ * matching ^[a-z][a-z0-9_-]{0,31}$.
+ *
+ * If `existingAliases` is provided, ensures uniqueness by appending a suffix.
+ */
+export function sanitizeSpaceAlias(repoName: string, existingAliases?: Set<string>): string {
+  const trimmed = repoName.trim().toLowerCase();
+  let cleaned = trimmed
+    .replace(/[^a-z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  if (!/^[a-z]/.test(cleaned)) {
+    cleaned = `s_${cleaned}`.replace(/_+/g, "_");
+  }
+
+  let base = cleaned.slice(0, 32).replace(/[-_]+$/, "");
+  if (!/^[a-z]/.test(base)) {
+    base = "space";
+  }
+
+  if (!existingAliases || !existingAliases.has(base)) {
+    return base;
+  }
+
+  for (let i = 2; i < 1000; i++) {
+    const suffix = `_${i}`;
+    const candidate = `${base.slice(0, 32 - suffix.length)}${suffix}`;
+    if (!existingAliases.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  return base;
+}

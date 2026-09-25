@@ -84,7 +84,7 @@ import type {
   ViewMode
 } from "./features/drive/driveTypes.ts";
 import { CreateSpaceModal } from "./features/spaces/CreateSpaceModal.tsx";
-import { nameToSafeSlug } from "./features/spaces/spaceMapping.ts";
+import { nameToSafeSlug, sanitizeSpaceAlias } from "./features/spaces/spaceMapping.ts";
 import { SpaceGrid } from "./features/spaces/SpaceGrid.tsx";
 import { RebuildCatalogModal } from "./features/catalog/RebuildCatalogModal.tsx";
 import { ImportKeyModal } from "./features/recoveryKey/ImportKeyModal.tsx";
@@ -399,22 +399,22 @@ function App() {
 
       // Auto-register any discovered ASCII ModelScope dataset into local space registry
       const registeredSet = new Set(next.spaces.map((s) => `${s.namespace}/${s.dataset}`));
+      const takenAliases = new Set(next.spaces.map((s) => s.space_name));
       let anyRegistered = false;
       for (const repo of result.repositories) {
         if (!registeredSet.has(`${repo.namespace}/${repo.dataset}`)) {
-          const defaultAlias = repo.dataset.toLowerCase();
-          if (/^[a-z][a-z0-9_-]{0,31}$/.test(defaultAlias)) {
-            try {
-              await appInvoke("register_space", {
-                name: defaultAlias,
-                namespace: repo.namespace,
-                dataset: repo.dataset,
-                endpoint: repo.endpoint
-              });
-              anyRegistered = true;
-            } catch {
-              // Ignore alias collision or format error
-            }
+          const defaultAlias = sanitizeSpaceAlias(repo.dataset, takenAliases);
+          try {
+            await appInvoke("register_space", {
+              name: defaultAlias,
+              namespace: repo.namespace,
+              dataset: repo.dataset,
+              endpoint: repo.endpoint
+            });
+            takenAliases.add(defaultAlias);
+            anyRegistered = true;
+          } catch {
+            // Ignore alias collision or format error
           }
         }
       }
