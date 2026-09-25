@@ -669,7 +669,9 @@ function App() {
         }
         const result = outcome.catalog;
         setCatalogTree(result.tree);
-        if (!currentFolderId) setCurrentFolderId(result.tree.id);
+        setCurrentFolderId((current) =>
+          !current || !findNode(result.tree, current) ? result.tree.id : current
+        );
         setCatalogStatus("ready");
         setSelectedIds(new Set());
         setLastSelectedId(null);
@@ -893,6 +895,9 @@ function App() {
         name
       });
       setCatalogTree(result.tree);
+      setCurrentFolderId((current) =>
+        !current || !findNode(result.tree, current) ? result.tree.id : current
+      );
       setCatalogStatus("ready");
       setMessage(result.warnings.join("; "));
     });
@@ -912,6 +917,9 @@ function App() {
         newName
       });
       setCatalogTree(result.tree);
+      setCurrentFolderId((current) =>
+        !current || !findNode(result.tree, current) ? result.tree.id : current
+      );
       setCatalogStatus("ready");
       setSelectedIds(new Set());
       setLastSelectedId(null);
