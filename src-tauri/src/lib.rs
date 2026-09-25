@@ -45,7 +45,9 @@ use lios_core::catalog::{
 use lios_core::catalog_transaction::{
     CatalogBlobCheckpointState, CatalogTransactionPhase, CatalogTransactionProgress,
 };
-use lios_core::config::{validate_modelscope_production_endpoint, LiosConfig, LiosPaths, RepoConfig};
+use lios_core::config::{
+    validate_modelscope_production_endpoint, LiosConfig, LiosPaths, RepoConfig,
+};
 use lios_core::credentials::{protect_to_file, unprotect_from_file};
 use lios_core::crypto::KeyFile;
 use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUserSummary};
@@ -56,7 +58,9 @@ use lios_core::storage::{RepoRevision, StorageAdapter, StorageObject};
 #[cfg(test)]
 use lios_core::tasks::{CheckpointState, TaskItemState, TaskObjectCheckpoint};
 use lios_core::tasks::{TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary};
-use production_config::{configured_endpoint, persist_config, prepare_startup_config, validate_repo};
+use production_config::{
+    configured_endpoint, persist_config, prepare_startup_config, validate_repo,
+};
 use recovery_key_service::{
     export_recovery_key_for_paths, import_recovery_key_for_paths, recovery_key_status,
     verify_recovery_key_for_paths, RecoveryKeyStatus, RecoveryKeyVerification,
@@ -1181,10 +1185,7 @@ fn clear_token(state: tauri::State<'_, AppContext>) -> CommandResult<()> {
 }
 
 #[tauri::command]
-fn set_endpoint(
-    state: tauri::State<'_, AppContext>,
-    endpoint: String,
-) -> CommandResult<()> {
+fn set_endpoint(state: tauri::State<'_, AppContext>, endpoint: String) -> CommandResult<()> {
     state.paths.ensure_dirs().map_err(to_err)?;
     let _config_guard = state.config_mutation_gate.lock()?;
     let _lock = state.paths.try_lock_config().map_err(CommandError::from)?;
@@ -4065,7 +4066,8 @@ mod settings_command_tests {
         paths.ensure_dirs().unwrap();
         let mut config = LiosConfig::default();
 
-        let validated = validate_modelscope_production_endpoint("https://www.modelscope.cn/").unwrap();
+        let validated =
+            validate_modelscope_production_endpoint("https://www.modelscope.cn/").unwrap();
         assert_eq!(validated, MODELSCOPE_WWW_ENDPOINT);
         config.endpoint = Some(validated);
         persist_config(&paths, &mut config).unwrap();

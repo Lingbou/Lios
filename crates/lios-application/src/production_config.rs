@@ -199,7 +199,8 @@ mod tests {
         let endpoint = configured_endpoint(&config, None).unwrap();
         assert_eq!(endpoint, "https://www.modelscope.cn");
 
-        let explicit = configured_endpoint(&config, Some("https://modelscope.cn/".to_string())).unwrap();
+        let explicit =
+            configured_endpoint(&config, Some("https://modelscope.cn/".to_string())).unwrap();
         assert_eq!(explicit, "https://modelscope.cn");
     }
 
@@ -213,7 +214,10 @@ mod tests {
             ..LiosConfig::default()
         };
         persist_config(&paths, &mut config).unwrap();
-        assert_eq!(config.endpoint.as_deref(), Some("https://www.modelscope.cn"));
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("https://www.modelscope.cn")
+        );
 
         let mut invalid_config = LiosConfig {
             endpoint: Some("http://invalid.endpoint".to_string()),
