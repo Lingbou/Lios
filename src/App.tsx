@@ -77,6 +77,10 @@ import { DriveToolbar } from "./features/drive/DriveToolbar.tsx";
 import { FileGrid } from "./features/drive/FileGrid.tsx";
 import { FileTable } from "./features/drive/FileTable.tsx";
 import { FilePreviewModal, type FilePreviewContent } from "./features/drive/FilePreviewModal.tsx";
+import {
+  calculateNextArrowIndex,
+  getGridColumnCount
+} from "./features/drive/driveNavigation.ts";
 import type {
   ContextMenuState,
   SortDirection,
@@ -540,6 +544,14 @@ function App() {
         return;
       }
 
+      if (previewOpen) {
+        if (event.key === " " || event.key === "Spacebar") {
+          event.preventDefault();
+          closePreview();
+        }
+        return;
+      }
+
       if (view === "drive" && activeSpace && catalogTree) {
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
           event.preventDefault();
@@ -564,9 +576,20 @@ function App() {
           if (selectedIds.size === 1) {
             const [selectedId] = [...selectedIds];
             const target = sortedItems.find((item) => item.id === selectedId);
-            if (target && target.kind === "Directory") {
+            if (target) {
               event.preventDefault();
               enterItem(target);
+            }
+          }
+          return;
+        }
+        if (event.key === " " || event.key === "Spacebar") {
+          if (selectedIds.size === 1) {
+            const [selectedId] = [...selectedIds];
+            const target = sortedItems.find((item) => item.id === selectedId);
+            if (target && target.kind === "File") {
+              event.preventDefault();
+              void openFilePreview(target);
             }
           }
           return;
@@ -578,12 +601,53 @@ function App() {
           }
           return;
         }
+
+        if (
+          event.key === "ArrowUp" ||
+          event.key === "ArrowDown" ||
+          event.key === "ArrowLeft" ||
+          event.key === "ArrowRight"
+        ) {
+          let currentIndex = -1;
+          if (lastSelectedId) {
+            currentIndex = sortedItems.findIndex((item) => item.id === lastSelectedId);
+          }
+          if (currentIndex === -1 && selectedIds.size > 0) {
+            const [first] = [...selectedIds];
+            currentIndex = sortedItems.findIndex((item) => item.id === first);
+          }
+
+          const gridColumns = viewMode === "grid" ? getGridColumnCount() : 1;
+          const nextIndex = calculateNextArrowIndex({
+            key: event.key,
+            viewMode,
+            currentIndex,
+            totalItems: sortedItems.length,
+            gridColumns
+          });
+
+          if (nextIndex !== null && sortedItems[nextIndex]) {
+            event.preventDefault();
+            selectOnly(sortedItems[nextIndex].id);
+            return;
+          }
+        }
       }
     }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [view, activeSpace, catalogTree, selectedIds, sortedItems, busy]);
+  }, [
+    view,
+    activeSpace,
+    catalogTree,
+    selectedIds,
+    sortedItems,
+    busy,
+    previewOpen,
+    viewMode,
+    lastSelectedId
+  ]);
 
   async function loadSpace(space: SpaceSummary) {
     setView("drive");
@@ -771,6 +835,12 @@ function App() {
     }
   }
 
+  function closePreview() {
+    previewRequest.current += 1;
+    setPreviewOpen(false);
+    setPreviewItem(null);
+  }
+
   function enterItem(item: DriveItem) {
     if (item.kind === "Directory") {
       setCurrentFolderId(item.id);
@@ -779,7 +849,7 @@ function App() {
       setQuery("");
       setSearchResults([]);
     } else {
-      toggleSelection(item.id);
+      selectOnly(item.id);
       void openFilePreview(item);
     }
   }
@@ -1821,11 +1891,7 @@ function App() {
           hasNext={hasNextPreview}
           onPrev={handlePrevPreview}
           onNext={handleNextPreview}
-          onClose={() => {
-            previewRequest.current += 1;
-            setPreviewOpen(false);
-            setPreviewItem(null);
-          }}
+          onClose={closePreview}
           onDownload={(item) => void downloadSelected([item.id])}
         />
       </main>

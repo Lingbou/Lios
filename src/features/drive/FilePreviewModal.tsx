@@ -40,7 +40,7 @@ export function FilePreviewModal({
     if (!open) return;
 
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
+      if (event.key === "Escape" || event.key === " " || event.key === "Spacebar") {
         event.preventDefault();
         onClose();
       } else if (event.key === "ArrowLeft" && hasPrev && onPrev) {
