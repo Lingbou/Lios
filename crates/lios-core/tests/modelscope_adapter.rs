@@ -207,13 +207,34 @@ async fn create_repo_does_not_swallow_repo_exists_failure() {
     });
 
     let error = ModelScopeAdapter::new(server.base_url(), "token")
-        .create_repo("novix", "cold")
+        .create_repo("novix", "cold", None)
         .await
         .unwrap_err();
 
     assert_remote_error(error, RemoteErrorKind::Authentication, Some(401));
     create.assert();
     exists.assert();
+}
+
+#[tokio::test]
+async fn create_repo_transmits_chinese_name_when_provided() {
+    let server = MockServer::start();
+    let create = server.mock(|when, then| {
+        when.method(POST)
+            .path("/api/v1/datasets")
+            .body_contains("ChineseName")
+            .body_contains("神秘图片");
+        then.status(200)
+            .json_body(json!({ "Data": { "Name": "cold" } }));
+    });
+
+    let adapter = ModelScopeAdapter::new(server.base_url(), "token");
+    adapter
+        .create_repo("novix", "cold", Some("神秘图片"))
+        .await
+        .unwrap();
+
+    create.assert();
 }
 
 #[tokio::test]
@@ -233,7 +254,7 @@ async fn create_repo_is_idempotent_when_dataset_already_exists() {
     });
 
     let adapter = ModelScopeAdapter::new(server.base_url(), "token");
-    adapter.create_repo("novix", "cold").await.unwrap();
+    adapter.create_repo("novix", "cold", None).await.unwrap();
 
     create.assert();
     exists.assert();

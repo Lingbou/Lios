@@ -40,6 +40,12 @@ fn setup_creates_shared_state_and_persists_a_token() {
     assert!(configured.has_token);
     assert!(paths.credentials.is_file());
     assert!(fs::metadata(&paths.credentials).unwrap().len() > 0);
+
+    application.clear_token().unwrap();
+    let cleared = application.setup().unwrap();
+    assert!(!cleared.has_token);
+    assert!(!paths.credentials.exists());
+    application.clear_token().unwrap();
 }
 
 #[test]

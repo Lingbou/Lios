@@ -19,9 +19,9 @@ interface ContextMenuProps {
   selectedCount: number;
   onOpenItem?: (item: DriveItem) => void;
   onPreviewItem?: (item: DriveItem) => void;
-  onDownload?: () => void;
-  onRename?: () => void;
-  onDelete?: () => void;
+  onDownload?: (item: DriveItem) => void;
+  onRename?: (item: DriveItem) => void;
+  onDelete?: (item: DriveItem) => void;
   onUploadFiles?: () => void;
   onUploadFolder?: () => void;
   onNewFolder?: () => void;
@@ -142,7 +142,7 @@ export function ContextMenu({
               className="contextMenuItem"
               role="menuitem"
               onClick={() => {
-                onDownload();
+                onDownload(item);
                 onClose();
               }}
             >
@@ -155,7 +155,7 @@ export function ContextMenu({
               className="contextMenuItem"
               role="menuitem"
               onClick={() => {
-                onRename();
+                onRename(item);
                 onClose();
               }}
             >
@@ -169,7 +169,7 @@ export function ContextMenu({
               className="contextMenuItem danger"
               role="menuitem"
               onClick={() => {
-                onDelete();
+                onDelete(item);
                 onClose();
               }}
             >

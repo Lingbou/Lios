@@ -3,9 +3,11 @@ import { AlertCircle, X } from "lucide-react";
 interface CreateSpaceModalProps {
   open: boolean;
   name: string;
+  slug: string;
   error: string;
   busy: boolean;
   onChangeName: (name: string) => void;
+  onChangeSlug: (slug: string) => void;
   onClose: () => void;
   onSubmit: () => void;
 }
@@ -13,15 +15,18 @@ interface CreateSpaceModalProps {
 export function CreateSpaceModal({
   open,
   name,
+  slug,
   error,
   busy,
   onChangeName,
+  onChangeSlug,
   onClose,
   onSubmit
 }: CreateSpaceModalProps) {
   if (!open) return null;
 
-  const trimmed = name.trim();
+  const trimmedName = name.trim();
+  const trimmedSlug = slug.trim();
 
   return (
     <div className="modalBackdrop">
@@ -46,12 +51,28 @@ export function CreateSpaceModal({
             <input
               autoFocus
               value={name}
+              placeholder="例如：我的工作文档"
               onChange={(event) => onChangeName(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && trimmed && !busy) onSubmit();
+                if (event.key === "Enter" && trimmedName && !busy) onSubmit();
                 if (event.key === "Escape") onClose();
               }}
             />
+          </label>
+          <label>
+            <span>远端仓库标识 (Slug)</span>
+            <input
+              value={slug}
+              placeholder="例如：my_workspace"
+              onChange={(event) => onChangeSlug(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && trimmedName && !busy) onSubmit();
+                if (event.key === "Escape") onClose();
+              }}
+            />
+            <span className="fieldHint">
+              远端 ModelScope 数据集仓库名称，需使用小写字母、数字、短横线或下划线
+            </span>
           </label>
           {error && (
             <div className="fieldError">
@@ -68,7 +89,7 @@ export function CreateSpaceModal({
             type="button"
             className="primary"
             onClick={onSubmit}
-            disabled={!trimmed || busy}
+            disabled={!trimmedName || !trimmedSlug || busy}
           >
             创建
           </button>

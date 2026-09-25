@@ -401,8 +401,7 @@ select:focus {
 .searchBox {
   min-width: 0;
   height: 40px;
-  display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
+  display: flex;
   align-items: center;
   gap: 8px;
   border: 1px solid var(--line);
@@ -415,18 +414,48 @@ select:focus {
   width: 18px;
   height: 18px;
   color: var(--muted);
+  flex-shrink: 0;
 }
 
 .searchBox input {
+  flex: 1 1 auto;
+  min-width: 0;
   height: 26px;
   line-height: 26px;
   border: 0;
   padding: 0;
   min-height: 0;
+  background: transparent;
 }
 
 .searchBox input:focus {
   outline: 0;
+}
+
+.searchClearBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.searchClearBtn:hover {
+  color: var(--ink);
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.searchClearBtn svg {
+  width: 16px;
+  height: 16px;
+  color: currentColor;
 }
 
 .noticeBar {
@@ -670,12 +699,16 @@ select:focus {
 }
 
 .fileName {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
   justify-content: flex-start;
   min-width: 0;
   border-color: transparent;
   background: transparent;
   padding: 0;
+  color: var(--ink);
 }
 
 .fileName svg {
@@ -1407,7 +1440,9 @@ select:focus {
 .conflictModal,
 .spaceModal,
 .recoveryKeyModal,
-.rebuildModal {
+.rebuildModal,
+.inputModal,
+.confirmModal {
   width: min(720px, 100%);
   max-height: min(680px, calc(100vh - 40px));
   overflow: hidden;
@@ -1419,7 +1454,9 @@ select:focus {
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
-.spaceModal {
+.spaceModal,
+.inputModal,
+.confirmModal {
   width: min(460px, 100%);
 }
 
@@ -1727,20 +1764,74 @@ select:focus {
   padding: 12px 16px;
 }
 
-.spaceModalBody {
+.spaceModalBody,
+.inputModalBody,
+.confirmModalBody {
   display: grid;
-  gap: 8px;
+  gap: 12px;
   padding: 16px;
 }
 
-.spaceModalBody label {
+.spaceModalBody label,
+.inputModalBody label {
   display: grid;
   gap: 8px;
 }
 
-.spaceModalBody label span {
+.spaceModalBody label span,
+.inputModalBody label span {
   color: var(--muted);
   font-size: 13px;
+}
+
+.fieldHint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.confirmModalDescription {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink);
+}
+
+.confirmModalNotice {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  border-radius: 8px;
+  padding: 12px;
+  border: 1px solid #f1cddd;
+  background: #fff7fb;
+  color: #6f5265;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.confirmModalNotice.danger {
+  border-color: #efb9c0;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.confirmNoticeIcon {
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  color: var(--pink-strong);
+  flex-shrink: 0;
+}
+
+.confirmModalNotice.danger .confirmNoticeIcon {
+  color: var(--danger);
+}
+
+.confirmNoticeContent p {
+  margin: 0;
 }
 
 .fieldError {
@@ -2517,39 +2608,42 @@ select:focus {
   position: relative;
 }
 
+.previewNavGroup {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .previewNavBtn {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  z-index: 10;
-  width: 40px;
-  height: 40px;
-  min-height: auto;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.88);
-  border: 1px solid var(--line);
-  box-shadow: var(--shadow);
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 0;
   color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
   cursor: pointer;
   transition: all 0.15s ease;
 }
 
-.previewNavBtn:hover {
-  background: var(--surface-strong);
+.previewNavBtn:hover:not(:disabled) {
+  border-color: var(--pink-strong);
   color: var(--pink-strong);
-  transform: translateY(-50%) scale(1.06);
+  background: var(--surface-strong);
 }
 
-.previewNavBtn.prev {
-  left: 16px;
+.previewNavBtn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
-.previewNavBtn.next {
-  right: 16px;
+.previewNavBtn svg {
+  width: 16px;
+  height: 16px;
 }
 
 .spaceCardActions {

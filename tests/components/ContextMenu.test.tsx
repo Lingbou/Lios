@@ -48,8 +48,14 @@ describe("ContextMenu", () => {
     expect(screen.getByText("删除")).toBeInTheDocument();
 
     fireEvent.click(screen.getByText("下载"));
-    expect(onDownload).toHaveBeenCalledOnce();
+    expect(onDownload).toHaveBeenCalledWith(mockFile);
     expect(onClose).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByText("重命名"));
+    expect(onRename).toHaveBeenCalledWith(mockFile);
+
+    fireEvent.click(screen.getByText("删除"));
+    expect(onDelete).toHaveBeenCalledWith(mockFile);
   });
 
   it("renders canvas actions when opened on empty area", () => {

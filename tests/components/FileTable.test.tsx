@@ -98,6 +98,15 @@ describe("FileTable", () => {
 
     fireEvent.doubleClick(docRow);
     expect(onEnterItem).toHaveBeenCalledWith(mockItems[0]);
+
+    // Clicking directly on the filename element selects the item (does not enter)
+    const fileSpan = screen.getByText("report.pdf");
+    fireEvent.click(fileSpan);
+    expect(onSelectOnly).toHaveBeenCalledWith("file-1");
+
+    // Double clicking directly on the filename enters the item
+    fireEvent.doubleClick(fileSpan);
+    expect(onEnterItem).toHaveBeenCalledWith(mockItems[1]);
   });
 
   it("handles select all in header", () => {
