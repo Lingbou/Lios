@@ -95,7 +95,7 @@ describe("Breadcrumb separator hierarchy", () => {
     render(<App />);
 
     // Enter Drive view
-    const spaceCard = await screen.findByText("demo-dataset");
+    const spaceCard = (await screen.findAllByText("demo-dataset"))[0];
     fireEvent.click(spaceCard);
     expect(await screen.findByText("parent-folder")).toBeInTheDocument();
 
