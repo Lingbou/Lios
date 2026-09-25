@@ -100,6 +100,8 @@ type TaskCenterProps = {
   onAction: (action: TaskAction, taskId: string) => Promise<void>;
   listTaskItems: (taskId: string, offset: number, limit: number) => Promise<TaskItemsPage>;
   onError?: (error: unknown) => void;
+  isCollapsed?: boolean;
+  onToggleCollapse?: (collapsed: boolean) => void;
 };
 
 function TaskStateIcon({ state }: { state: TaskState }) {
@@ -327,8 +329,21 @@ function TaskCenterComponent({
   pendingActions,
   onAction,
   listTaskItems,
-  onError
+  onError,
+  isCollapsed: isCollapsedProp,
+  onToggleCollapse
 }: TaskCenterProps) {
+  const isControlled = isCollapsedProp !== undefined;
+  const [internalCollapsed, setInternalCollapsed] = useState(false);
+  const isCollapsed = isControlled ? isCollapsedProp : internalCollapsed;
+
+  const toggleCollapsed = useCallback(() => {
+    const next = !isCollapsed;
+    if (!isControlled) {
+      setInternalCollapsed(next);
+    }
+    onToggleCollapse?.(next);
+  }, [isCollapsed, isControlled, onToggleCollapse]);
   const panelRef = useRef<HTMLElement>(null);
   const resizeStateRef = useRef<{
     pointerId: number;
@@ -342,7 +357,7 @@ function TaskCenterComponent({
   const [workspaceHeight, setWorkspaceHeight] = useState(() =>
     typeof window === "undefined" ? 720 : window.innerHeight
   );
-  const [isCollapsed, setIsCollapsed] = useState(false);
+
   const [isResizing, setIsResizing] = useState(false);
   const counts = useMemo(
     () => ({
@@ -477,7 +492,7 @@ function TaskCenterComponent({
             title={isCollapsed ? "展开任务面板" : "收起任务面板"}
             aria-label={isCollapsed ? "展开任务面板" : "收起任务面板"}
             aria-expanded={!isCollapsed}
-            onClick={() => setIsCollapsed((current) => !current)}
+            onClick={toggleCollapsed}
           >
             {isCollapsed ? <ChevronsUp aria-hidden /> : <ChevronsDown aria-hidden />}
           </button>

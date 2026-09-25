@@ -303,9 +303,167 @@ select:focus {
   justify-content: flex-start;
 }
 
-.accountListSpacer {
+.railHeader {
+  display: grid;
+  gap: 10px;
+}
+
+.railBrand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px;
+}
+
+.railBrandLogo {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+}
+
+.railBrandText {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.railBrandTitle {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink);
+  line-height: 1.2;
+}
+
+.railBrandSubtitle {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.2;
+}
+
+.railSpacesSection {
   min-height: 0;
-  border-radius: 8px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  overflow: hidden;
+}
+
+.railSectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px;
+}
+
+.railAddSpaceBtn {
+  width: 24px;
+  min-height: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.railAddSpaceBtn:hover:not(:disabled) {
+  background: var(--pink-weak);
+  color: var(--pink-strong);
+  border-color: var(--line);
+}
+
+.railAddSpaceBtn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.railSpaceList {
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-right: 2px;
+}
+
+.railSpaceItem {
+  width: 100%;
+  min-height: 36px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.railSpaceItem:hover:not(:disabled) {
+  background: var(--pink-weak);
+  color: var(--pink-strong);
+}
+
+.railSpaceItem.active {
+  background: var(--pink-weak);
+  border-color: var(--line-strong);
+  color: var(--pink-strong);
+  font-weight: 600;
+}
+
+.railSpaceItem svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.railSpaceName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.railEmptySpaces {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.railEmptyCreateBtn {
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+
+.railTaskBadge {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--pink);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .railFooter {
@@ -1779,7 +1937,8 @@ select:focus {
   }
 
   .spaceRail .sectionLabel,
-  .accountListSpacer {
+  .railBrandSubtitle,
+  .railSpacesSection {
     display: none;
   }
 
