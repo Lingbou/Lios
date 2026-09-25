@@ -20,7 +20,7 @@ import {
   UploadCloud,
   X
 } from "lucide-react";
-import { type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import liosPetalMark from "./assets/lios-petal-mark.svg";
 import type {
   CacheCleanupReport,
@@ -1351,18 +1351,19 @@ function App() {
                   {crumbs.length > 0 && <ChevronRight aria-hidden className="crumbSeparator" />}
                   {crumbs.length > 0 ? (
                     crumbs.map((crumb, index) => (
-                      <button
-                        key={crumb.id}
-                        type="button"
-                        onClick={() => setCurrentFolderId(crumb.id)}
-                        className={index === crumbs.length - 1 ? "current" : ""}
-                        title={crumbPaths[index]}
-                        aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
-                        aria-current={index === crumbs.length - 1 ? "page" : undefined}
-                      >
-                        {index > 0 && <ChevronRight aria-hidden />}
-                        <span className="crumbLabel">{crumb.name}</span>
-                      </button>
+                      <Fragment key={crumb.id}>
+                        {index > 0 && <ChevronRight aria-hidden className="crumbSeparator" />}
+                        <button
+                          type="button"
+                          onClick={() => setCurrentFolderId(crumb.id)}
+                          className={index === crumbs.length - 1 ? "current" : ""}
+                          title={crumbPaths[index]}
+                          aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
+                          aria-current={index === crumbs.length - 1 ? "page" : undefined}
+                        >
+                          <span className="crumbLabel">{crumb.name}</span>
+                        </button>
+                      </Fragment>
                     ))
                   ) : (
                     <span className="crumbFallback" title={crumbFallbackLabel}>
