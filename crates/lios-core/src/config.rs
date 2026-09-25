@@ -50,6 +50,8 @@ pub struct LiosConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<PathBuf>,
     pub chunk_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 impl Default for LiosConfig {
@@ -60,6 +62,7 @@ impl Default for LiosConfig {
             key_file_path: None,
             backup_path: None,
             chunk_size: None,
+            endpoint: None,
         }
     }
 }

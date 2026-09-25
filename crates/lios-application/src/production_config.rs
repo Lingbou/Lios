@@ -7,7 +7,7 @@ use lios_core::config::{
 };
 
 pub fn configured_endpoint(
-    _config: &LiosConfig,
+    config: &LiosConfig,
     endpoint: Option<String>,
 ) -> Result<String, CommandError> {
     let endpoint = endpoint
@@ -15,6 +15,7 @@ pub fn configured_endpoint(
             let trimmed = value.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
         })
+        .or_else(|| config.endpoint.clone())
         .unwrap_or_else(|| MODELSCOPE_ENDPOINT.to_string());
     validate_modelscope_production_endpoint(&endpoint).map_err(Into::into)
 }
@@ -59,6 +60,9 @@ pub fn validate_repo(repo: RepoConfig) -> Result<RepoConfig, CommandError> {
 
 fn validated_config(config: &LiosConfig) -> Result<LiosConfig, CommandError> {
     let mut validated = config.clone();
+    if let Some(endpoint) = &validated.endpoint {
+        validated.endpoint = Some(validate_modelscope_production_endpoint(endpoint)?);
+    }
     for repo in validated.spaces.values_mut() {
         *repo = validate_repo(repo.clone())?;
     }
@@ -185,5 +189,37 @@ mod tests {
         prepare_startup_config(&paths, &mut config).unwrap();
         assert_eq!(config.key_file_path, Some(paths.home.join("recovery.key")));
         assert!(paths.home.join("recovery.key").exists());
+    }
+    #[test]
+    fn configured_endpoint_falls_back_to_saved_config_endpoint() {
+        let config = LiosConfig {
+            endpoint: Some("https://www.modelscope.cn".to_string()),
+            ..LiosConfig::default()
+        };
+        let endpoint = configured_endpoint(&config, None).unwrap();
+        assert_eq!(endpoint, "https://www.modelscope.cn");
+
+        let explicit = configured_endpoint(&config, Some("https://modelscope.cn/".to_string())).unwrap();
+        assert_eq!(explicit, "https://modelscope.cn");
+    }
+
+    #[test]
+    fn validates_and_normalizes_config_endpoint_on_persist() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let mut config = LiosConfig {
+            endpoint: Some("https://www.modelscope.cn/".to_string()),
+            ..LiosConfig::default()
+        };
+        persist_config(&paths, &mut config).unwrap();
+        assert_eq!(config.endpoint.as_deref(), Some("https://www.modelscope.cn"));
+
+        let mut invalid_config = LiosConfig {
+            endpoint: Some("http://invalid.endpoint".to_string()),
+            ..LiosConfig::default()
+        };
+        let error = persist_config(&paths, &mut invalid_config).unwrap_err();
+        assert_eq!(error.code, CommandErrorCode::InvalidInput);
     }
 }

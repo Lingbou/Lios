@@ -34,6 +34,7 @@ type LiosConfig = {
   key_file_path?: string | null;
   backup_path?: string | null;
   chunk_size?: number | null;
+  endpoint?: string | null;
 };
 
 type PathsDto = {

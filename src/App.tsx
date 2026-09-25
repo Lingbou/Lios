@@ -45,6 +45,7 @@ import {
 } from "./catalogState.ts";
 import { errorText } from "./commandError.ts";
 import { AboutSection } from "./features/settings/AboutSection.tsx";
+import { ConnectionSection, EndpointSection } from "./features/settings/ConnectionSettings.tsx";
 import {
   breadcrumb,
   displayPath,
@@ -370,13 +371,13 @@ function App() {
     setSpacesLoaded(true);
     const preferredName =
       activeSpace?.space_name ?? globalThis.localStorage?.getItem("lios.lastSpaceName") ?? null;
-    const visibleActiveRepo = preferredName
+    const visibleActiveRepo = next.has_token && preferredName
       ? next.spaces.find((space) => space.space_name === preferredName) ?? null
       : null;
-    setManualEndpoint((current) => visibleActiveRepo?.endpoint || current);
+    setManualEndpoint((current) => next.config.endpoint || visibleActiveRepo?.endpoint || current);
     if (loadSpaces && next.has_token) {
       const result = await appInvoke<DatasetRepoListResult>("list_dataset_repos", {
-        endpoint: visibleActiveRepo?.endpoint || manualEndpoint
+        endpoint: next.config.endpoint || visibleActiveRepo?.endpoint || manualEndpoint
       });
       setModelscopeUser(result.user);
 
@@ -434,6 +435,8 @@ function App() {
         }
         return updatedActive;
       }
+    } else if (!next.has_token) {
+      setModelscopeUser(null);
     }
 
     if (visibleActiveRepo) {
@@ -967,10 +970,41 @@ function App() {
   }
 
   async function saveToken() {
+    const trimmed = token.trim();
+    if (!trimmed) return;
     await run("连接账号", async () => {
-      await appInvoke("setup_token", { token });
+      if (manualEndpoint.trim()) {
+        await appInvoke("set_endpoint", { endpoint: manualEndpoint.trim() });
+      }
+      await appInvoke("setup_token", { token: trimmed });
       setToken("");
       await refreshSetup(true);
+      setMessage("ModelScope 账号已连接");
+    });
+  }
+
+  async function disconnectToken() {
+    await run("断开连接", async () => {
+      await appInvoke("clear_token");
+      setToken("");
+      setModelscopeUser(null);
+      setActiveSpace(null);
+      setCatalogTree(null);
+      setCatalogStatus("idle");
+      setCurrentFolderId(null);
+      globalThis.localStorage?.removeItem("lios.lastSpaceName");
+      await refreshSetup(false);
+      setMessage("已断开 ModelScope 连接并清除凭据");
+    });
+  }
+
+  async function saveEndpoint() {
+    const trimmed = manualEndpoint.trim();
+    if (!trimmed) return;
+    await run("保存端点", async () => {
+      await appInvoke("set_endpoint", { endpoint: trimmed });
+      await refreshSetup(hasToken);
+      setMessage("服务地址已保存");
     });
   }
 
@@ -1407,39 +1441,22 @@ function App() {
                 </div>
               </div>
               <div className="settingsBlocks">
-              <div className="settingsBlock">
-                <div>
-                  <h2>连接</h2>
-                  <p>
-                    {modelscopeUser?.username
-                      ? `已连接 ${modelscopeUser.username}`
-                      : "输入访问凭证连接 ModelScope 账号"}
-                  </p>
-                </div>
-                <div className="connectionGrid">
-                  <input
-                    type="password"
-                    value={token}
-                    onChange={(event) => setToken(event.target.value)}
-                    placeholder="ModelScope access token"
-                    autoComplete="off"
-                  />
-                  <input
-                    className="endpointInput"
-                    value={manualEndpoint}
-                    onChange={(event) => setManualEndpoint(event.target.value)}
-                    placeholder="服务地址"
-                  />
-                  <button
-                    className="primary"
-                    onClick={saveToken}
-                    disabled={!token || !manualEndpoint || busy !== null}
-                  >
-                    <ShieldCheck aria-hidden />
-                    连接
-                  </button>
-                </div>
-              </div>
+              <ConnectionSection
+                hasToken={hasToken}
+                username={modelscopeUser?.username}
+                token={token}
+                onTokenChange={setToken}
+                onConnect={saveToken}
+                onDisconnect={disconnectToken}
+                busy={busy !== null}
+              />
+
+              <EndpointSection
+                endpoint={manualEndpoint}
+                onEndpointChange={setManualEndpoint}
+                onSave={saveEndpoint}
+                busy={busy !== null}
+              />
 
               <div className="settingsBlock recoveryKeyBlock">
                 <div className="settingsHeaderRow">

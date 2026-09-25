@@ -122,6 +122,14 @@ impl Application {
         protect_to_file(token, &self.paths.credentials).map_err(to_err)
     }
 
+    pub fn clear_token(&self) -> CommandResult<()> {
+        match fs::remove_file(&self.paths.credentials) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(to_err(error)),
+        }
+    }
+
     pub async fn list_dataset_repos(
         &self,
         endpoint: Option<String>,

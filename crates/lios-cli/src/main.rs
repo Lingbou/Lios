@@ -156,11 +156,7 @@ async fn run_inner(cli: Cli) -> CliResult<CommandOutput> {
                 }))
             }
             AuthCommand::Logout => {
-                match fs::remove_file(&paths.credentials) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
+                application.clear_token()?;
                 Ok(CommandOutput::new(json!({"authenticated": false}))
                     .human("ModelScope token removed"))
             }
