@@ -453,12 +453,15 @@ impl ModelScopeAdapter {
 
 #[async_trait]
 impl StorageAdapter for ModelScopeAdapter {
-    async fn create_repo(&self, namespace: &str, dataset: &str) -> Result<()> {
-        let form = multipart::Form::new()
+    async fn create_repo(&self, namespace: &str, dataset: &str, title: Option<&str>) -> Result<()> {
+        let mut form = multipart::Form::new()
             .text("Owner", namespace.to_string())
             .text("Name", dataset.to_string())
             .text("Visibility", PRIVATE_VISIBILITY.to_string())
             .text("License", "Apache-2.0".to_string());
+        if let Some(title) = title.filter(|t| !t.trim().is_empty()) {
+            form = form.text("ChineseName", title.trim().to_string());
+        }
         let response = self
             .auth(
                 self.client

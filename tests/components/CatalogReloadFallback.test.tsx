@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 import App from "../../src/App.tsx";
 import type { CatalogLoadResult, Snapshot } from "../../src/appTypes.ts";
 
@@ -19,7 +19,7 @@ vi.mock("@tauri-apps/api/window", () => ({
   }))
 }));
 
-const tree = {
+const initialTree = {
   id: "root",
   name: "root",
   updated_at: "2026-01-01T00:00:00Z",
@@ -27,8 +27,8 @@ const tree = {
     type: "Directory" as const,
     children: [
       {
-        id: "folder-1",
-        name: "subfolder",
+        id: "folder-deleted",
+        name: "deleted-folder",
         updated_at: "2026-01-01T00:00:00Z",
         kind: {
           type: "Directory" as const,
@@ -39,8 +39,34 @@ const tree = {
   }
 };
 
-describe("Breadcrumb navigation", () => {
-  it("resets query, search results, and selection when navigating via breadcrumbs", async () => {
+const updatedTree = {
+  id: "root",
+  name: "root",
+  updated_at: "2026-01-02T00:00:00Z",
+  kind: {
+    type: "Directory" as const,
+    children: [
+      {
+        id: "folder-new",
+        name: "new-folder",
+        updated_at: "2026-01-02T00:00:00Z",
+        kind: {
+          type: "Directory" as const,
+          children: []
+        }
+      }
+    ]
+  }
+};
+
+describe("Catalog reload fallback", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("falls back to root folder when current folder no longer exists after reload", async () => {
+    let currentTree = initialTree;
+
     const { invoke } = await import("@tauri-apps/api/core");
     vi.mocked(invoke).mockImplementation(async (cmd, args?: any) => {
       if (cmd === "current_setup") {
@@ -71,61 +97,32 @@ describe("Breadcrumb navigation", () => {
         return {
           local_path: "/dummy",
           bytes: 100,
-          tree,
+          tree: currentTree,
           warnings: []
         } as CatalogLoadResult;
-      }
-      if (cmd === "search_catalog") {
-        return [
-          {
-            id: "search-result-1",
-            name: "searched-file.txt",
-            kind: "File",
-            size: 123,
-            updated_at: "2026-01-01T00:00:00Z",
-            children_count: 0
-          }
-        ];
       }
       return null;
     });
 
     render(<App />);
 
-    // Click on the space card to enter Drive view
+    // Enter Drive view
     const spaceCard = await screen.findByText("demo-dataset");
     fireEvent.click(spaceCard);
+    expect(await screen.findByText("deleted-folder")).toBeInTheDocument();
 
-    // Now in Drive view, wait for subfolder to be displayed
-    expect(await screen.findByText("subfolder")).toBeInTheDocument();
-
-    // Enter subfolder by clicking the folder button
-    fireEvent.doubleClick(screen.getByText("subfolder"));
+    // Enter the folder that will be deleted
+    fireEvent.doubleClick(screen.getByText("deleted-folder"));
     expect(await screen.findByText("此文件夹为空")).toBeInTheDocument();
 
-    // Search something
-    const searchInput = screen.getByPlaceholderText("搜索当前空间");
-    fireEvent.change(searchInput, { target: { value: "search-term" } });
-    fireEvent.keyDown(searchInput, { key: "Enter" });
+    // Now update the tree on server (deleted-folder is gone, replaced with new-folder)
+    currentTree = updatedTree;
 
-    expect(await screen.findByText("searched-file.txt")).toBeInTheDocument();
+    // Trigger reload via the toolbar Refresh button
+    const refreshBtn = screen.getByRole("button", { name: "刷新" });
+    fireEvent.click(refreshBtn);
 
-    // Select the search result item checkbox
-    const checkboxes = screen.getAllByRole("checkbox");
-    // checkboxes[0] is select all, checkboxes[1] is the item
-    fireEvent.click(checkboxes[1]);
-    expect(await screen.findByText("已选 1 / 1 项")).toBeInTheDocument();
-
-    // Find breadcrumb for demo-dataset (root of space)
-    const rootCrumb = screen.getByRole("button", { name: "转到路径：demo-dataset" });
-    fireEvent.click(rootCrumb);
-
-    // After clicking breadcrumb, search input should be cleared, search results gone, selection cleared, and subfolder visible again
-    await waitFor(() => {
-      expect((searchInput as HTMLInputElement).value).toBe("");
-    });
-    expect(screen.queryByText("searched-file.txt")).not.toBeInTheDocument();
-    expect(screen.queryByText(/已选/)).not.toBeInTheDocument();
-    expect(screen.getByText("subfolder")).toBeInTheDocument();
+    // After reload, since current folder is gone, it should smoothly fall back to root, showing new-folder
+    expect(await screen.findByText("new-folder")).toBeInTheDocument();
   });
 });

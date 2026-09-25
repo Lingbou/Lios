@@ -3631,7 +3631,12 @@ mod recovery_key_service_tests {
 
     #[async_trait]
     impl StorageAdapter for FakeCatalogAdapter {
-        async fn create_repo(&self, _namespace: &str, _dataset: &str) -> lios_core::Result<()> {
+        async fn create_repo(
+            &self,
+            _namespace: &str,
+            _dataset: &str,
+            _title: Option<&str>,
+        ) -> lios_core::Result<()> {
             Ok(())
         }
 

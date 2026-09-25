@@ -82,7 +82,12 @@ mod tests {
 
     #[async_trait]
     impl StorageAdapter for InterruptedAdapter {
-        async fn create_repo(&self, _namespace: &str, _dataset: &str) -> lios_core::Result<()> {
+        async fn create_repo(
+            &self,
+            _namespace: &str,
+            _dataset: &str,
+            _title: Option<&str>,
+        ) -> lios_core::Result<()> {
             unreachable!()
         }
 
