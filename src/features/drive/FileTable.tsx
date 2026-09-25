@@ -1,3 +1,4 @@
+import { getFileCategory } from "./fileCategory.ts";
 import { ChevronDown, ChevronUp, File, Folder } from "lucide-react";
 import { type MouseEvent, memo, useEffect, useRef } from "react";
 import type { DriveItem } from "../../appTypes.ts";
@@ -115,6 +116,8 @@ function FileTableComponent({
         <tbody>
           {items.map((item) => {
             const isSelected = selectedIds.has(item.id);
+            const isDir = item.kind === "Directory";
+            const category = !isDir ? getFileCategory(item.name) : undefined;
             return (
               <tr
                 key={item.id}
@@ -137,17 +140,17 @@ function FileTableComponent({
                     className="fileName"
                     title={item.name}
                   >
-                    {item.kind === "Directory" ? (
+                    {isDir ? (
                       <Folder className="itemIcon folderIcon" aria-hidden />
                     ) : (
-                      <File className="itemIcon fileIcon" aria-hidden />
+                      <File className={`itemIcon fileIcon fileCategory-${category}`} aria-hidden />
                     )}
                     <span>{item.name}</span>
                   </span>
                 </td>
-                <td>{item.kind === "Directory" ? `${item.children_count} 项` : "文件"}</td>
-                <td>{item.kind === "File" ? formatBytes(item.size) : "-"}</td>
-                <td>{formatDate(item.updated_at)}</td>
+                <td>{isDir ? `${item.children_count} 项` : "文件"}</td>
+                <td>{!isDir ? formatBytes(item.size) : "-"}</td>
+                <td className="dateCol">{formatDate(item.updated_at)}</td>
               </tr>
             );
           })}
