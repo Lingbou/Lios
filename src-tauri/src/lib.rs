@@ -45,7 +45,9 @@ use lios_core::catalog::{
 use lios_core::catalog_transaction::{
     CatalogBlobCheckpointState, CatalogTransactionPhase, CatalogTransactionProgress,
 };
-use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
+use lios_core::config::{
+    validate_modelscope_production_endpoint, LiosConfig, LiosPaths, RepoConfig,
+};
 use lios_core::credentials::{protect_to_file, unprotect_from_file};
 use lios_core::crypto::KeyFile;
 use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUserSummary};
@@ -56,7 +58,9 @@ use lios_core::storage::{RepoRevision, StorageAdapter, StorageObject};
 #[cfg(test)]
 use lios_core::tasks::{CheckpointState, TaskItemState, TaskObjectCheckpoint};
 use lios_core::tasks::{TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary};
-use production_config::{configured_endpoint, prepare_startup_config, validate_repo};
+use production_config::{
+    configured_endpoint, persist_config, prepare_startup_config, validate_repo,
+};
 use recovery_key_service::{
     export_recovery_key_for_paths, import_recovery_key_for_paths, recovery_key_status,
     verify_recovery_key_for_paths, RecoveryKeyStatus, RecoveryKeyVerification,
@@ -1173,6 +1177,27 @@ fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnap
 fn setup_token(state: tauri::State<'_, AppContext>, token: String) -> CommandResult<()> {
     state.paths.ensure_dirs().map_err(to_err)?;
     protect_to_file(token.trim(), &state.paths.credentials).map_err(to_err)
+}
+
+#[tauri::command]
+fn clear_token(state: tauri::State<'_, AppContext>) -> CommandResult<()> {
+    Application::new(state.paths.clone())?.clear_token()
+}
+
+#[tauri::command]
+fn set_endpoint(state: tauri::State<'_, AppContext>, endpoint: String) -> CommandResult<()> {
+    state.paths.ensure_dirs().map_err(to_err)?;
+    let _config_guard = state.config_mutation_gate.lock()?;
+    let _lock = state.paths.try_lock_config().map_err(CommandError::from)?;
+    let mut config = load_config(&state.paths)?;
+    let trimmed = endpoint.trim();
+    let endpoint = if trimmed.is_empty() {
+        None
+    } else {
+        Some(validate_modelscope_production_endpoint(trimmed)?)
+    };
+    config.endpoint = endpoint;
+    persist_config(&state.paths, &mut config)
 }
 
 #[tauri::command]
@@ -4009,5 +4034,60 @@ mod recovery_key_service_tests {
         assert!(format_only.format_valid);
         assert!(!format_only.catalog_checked);
         assert_eq!(format_only.checked_space, None);
+    }
+}
+
+#[cfg(test)]
+mod settings_command_tests {
+    use lios_application::service::Application;
+    use lios_core::config::{
+        validate_modelscope_production_endpoint, LiosConfig, LiosPaths, MODELSCOPE_WWW_ENDPOINT,
+    };
+    use tempfile::tempdir;
+
+    use super::production_config::persist_config;
+
+    #[test]
+    fn clear_token_removes_saved_credentials_file() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let app = Application::new(paths.clone()).unwrap();
+        app.set_token("test-token").unwrap();
+        assert!(paths.credentials.is_file());
+
+        app.clear_token().unwrap();
+        assert!(!paths.credentials.exists());
+
+        // Idempotent clear
+        app.clear_token().unwrap();
+        assert!(!paths.credentials.exists());
+    }
+
+    #[test]
+    fn set_endpoint_logic_validates_and_persists() {
+        let temp = tempdir().unwrap();
+        let paths = LiosPaths::from_home(temp.path());
+        paths.ensure_dirs().unwrap();
+        let mut config = LiosConfig::default();
+
+        let validated =
+            validate_modelscope_production_endpoint("https://www.modelscope.cn/").unwrap();
+        assert_eq!(validated, MODELSCOPE_WWW_ENDPOINT);
+        config.endpoint = Some(validated);
+        persist_config(&paths, &mut config).unwrap();
+
+        let loaded = LiosConfig::load(&paths.config).unwrap();
+        assert_eq!(loaded.endpoint.as_deref(), Some(MODELSCOPE_WWW_ENDPOINT));
+
+        // Setting to empty clears endpoint
+        config.endpoint = None;
+        persist_config(&paths, &mut config).unwrap();
+        let loaded = LiosConfig::load(&paths.config).unwrap();
+        assert_eq!(loaded.endpoint, None);
+
+        // Invalid endpoint is rejected
+        let invalid = validate_modelscope_production_endpoint("https://evil.com");
+        assert!(invalid.is_err());
     }
 }

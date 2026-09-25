@@ -3,6 +3,8 @@ macro_rules! with_registered_commands {
         $consumer! {
             current_setup,
             setup_token,
+            clear_token,
+            set_endpoint,
             set_chunk_size,
             register_space,
             remove_space,
