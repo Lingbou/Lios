@@ -390,8 +390,7 @@ select:focus {
 .searchBox {
   min-width: 0;
   height: 40px;
-  display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
+  display: flex;
   align-items: center;
   gap: 8px;
   border: 1px solid var(--line);
@@ -404,18 +403,48 @@ select:focus {
   width: 18px;
   height: 18px;
   color: var(--pink);
+  flex-shrink: 0;
 }
 
 .searchBox input {
+  flex: 1 1 auto;
+  min-width: 0;
   height: 26px;
   line-height: 26px;
   border: 0;
   padding: 0;
   min-height: 0;
+  background: transparent;
 }
 
 .searchBox input:focus {
   outline: 0;
+}
+
+.searchClearBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.searchClearBtn:hover {
+  color: var(--ink);
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.searchClearBtn svg {
+  width: 16px;
+  height: 16px;
+  color: currentColor;
 }
 
 .noticeBar {

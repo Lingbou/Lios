@@ -133,7 +133,10 @@ function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [appliedQuery, setAppliedQuery] = useState("");
   const [searchResults, setSearchResults] = useState<DriveItem[]>([]);
+  const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchSeqRef = useRef(0);
   const [token, setToken] = useState("");
   const [manualEndpoint, setManualEndpoint] = useState("https://modelscope.cn");
   const [createSpaceOpen, setCreateSpaceOpen] = useState(false);
@@ -204,8 +207,8 @@ function App() {
     [currentFolder]
   );
   const visibleItems = useMemo(
-    () => (query.trim() ? searchResults : children),
-    [children, query, searchResults]
+    () => (appliedQuery ? searchResults : children),
+    [appliedQuery, children, searchResults]
   );
 
   const sortedItems = useMemo(() => {
@@ -465,6 +468,11 @@ function App() {
 
   useEffect(() => {
     refreshSetup().catch((error) => setMessage(errorText(error)));
+    return () => {
+      if (searchTimeoutRef.current) {
+        clearTimeout(searchTimeoutRef.current);
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -594,8 +602,14 @@ function App() {
     setCurrentFolderId(null);
     setSelectedIds(new Set());
     setLastSelectedId(null);
-    setSearchResults([]);
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+      searchTimeoutRef.current = null;
+    }
+    searchSeqRef.current += 1;
     setQuery("");
+    setAppliedQuery("");
+    setSearchResults([]);
     await catalogLoads.run(async (request) => {
       try {
         const outcome = await loadCatalogState(() =>
@@ -676,7 +690,7 @@ function App() {
         setSelectedIds(new Set());
         setLastSelectedId(null);
         setMessage(result.warnings.join("; "));
-        const trimmedQuery = query.trim();
+        const trimmedQuery = appliedQuery.trim();
         if (trimmedQuery) {
           const results = await appInvoke<DriveItem[]>("search_catalog", {
             spaceName: targetSpace.space_name,
@@ -774,10 +788,16 @@ function App() {
   }
 
   function navigateToFolder(folderId: string) {
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+      searchTimeoutRef.current = null;
+    }
+    searchSeqRef.current += 1;
     setCurrentFolderId(folderId);
     setSelectedIds(new Set());
     setLastSelectedId(null);
     setQuery("");
+    setAppliedQuery("");
     setSearchResults([]);
   }
 
@@ -986,19 +1006,46 @@ function App() {
     });
   }
 
+  function clearSearch() {
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+      searchTimeoutRef.current = null;
+    }
+    searchSeqRef.current += 1;
+    setQuery("");
+    setAppliedQuery("");
+    setSearchResults([]);
+  }
+
   async function searchCatalog(value = query) {
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+      searchTimeoutRef.current = null;
+    }
     const trimmed = value.trim();
     setQuery(value);
     if (!trimmed) {
+      searchSeqRef.current += 1;
+      setAppliedQuery("");
       setSearchResults([]);
       return;
     }
     if (!activeSpace) return;
-    const results = await appInvoke<DriveItem[]>("search_catalog", {
-      spaceName: activeSpace.space_name,
-      query: trimmed
-    });
-    setSearchResults(results);
+    setAppliedQuery(trimmed);
+    const seq = ++searchSeqRef.current;
+    try {
+      const results = await appInvoke<DriveItem[]>("search_catalog", {
+        spaceName: activeSpace.space_name,
+        query: trimmed
+      });
+      if (searchSeqRef.current === seq) {
+        setSearchResults(results);
+      }
+    } catch (error) {
+      if (searchSeqRef.current === seq) {
+        setMessage(errorText(error));
+      }
+    }
   }
 
   async function saveToken() {
@@ -1415,14 +1462,50 @@ function App() {
                 <input
                   value={query}
                   onChange={(event) => {
-                    setQuery(event.target.value);
-                    if (view === "drive" && !event.target.value.trim()) setSearchResults([]);
+                    const val = event.target.value;
+                    setQuery(val);
+                    if (view === "drive") {
+                      if (searchTimeoutRef.current) {
+                        clearTimeout(searchTimeoutRef.current);
+                        searchTimeoutRef.current = null;
+                      }
+                      const trimmed = val.trim();
+                      if (!trimmed) {
+                        searchSeqRef.current += 1;
+                        setAppliedQuery("");
+                        setSearchResults([]);
+                      } else {
+                        searchTimeoutRef.current = setTimeout(() => {
+                          searchCatalog(val);
+                        }, 300);
+                      }
+                    }
                   }}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" && view === "drive") searchCatalog();
+                    if (event.key === "Enter" && view === "drive") {
+                      if (searchTimeoutRef.current) {
+                        clearTimeout(searchTimeoutRef.current);
+                        searchTimeoutRef.current = null;
+                      }
+                      searchCatalog(query);
+                    } else if (event.key === "Escape") {
+                      clearSearch();
+                      (event.target as HTMLInputElement).blur();
+                    }
                   }}
                   placeholder={view === "spaces" ? "搜索空间" : "搜索当前空间"}
                 />
+                {query.length > 0 && (
+                  <button
+                    type="button"
+                    className="searchClearBtn"
+                    onClick={clearSearch}
+                    title="清空搜索"
+                    aria-label="清空搜索"
+                  >
+                    <X aria-hidden />
+                  </button>
+                )}
               </div>
             </header>
           )}
@@ -1750,7 +1833,7 @@ function App() {
                 ) : visibleItems.length === 0 ? (
                   <div className="emptyDrive">
                     <FolderOpen aria-hidden />
-                    <h2>{query.trim() ? "没有搜索结果" : "此文件夹为空"}</h2>
+                    <h2>{appliedQuery ? "没有搜索结果" : "此文件夹为空"}</h2>
                   </div>
                 ) : viewMode === "grid" ? (
                   <FileGrid
