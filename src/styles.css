@@ -1726,6 +1726,12 @@ select:focus {
   font-size: 13px;
 }
 
+.fieldHint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .fieldError {
   color: var(--danger);
   font-size: 13px;

@@ -25,7 +25,16 @@ const PINYIN_DICT: Record<string, string> = {
   软: "ruan", 件: "jian", 系: "xi", 统: "tong", 数: "shu", 据: "ju",
   集: "ji", 表: "biao", 单: "dan", 记事: "jishi", 备忘: "beiwang",
   账: "zhang", 本: "ben", 财务: "caiwu", 发: "fa", 票: "piao", 合: "he",
-  同: "tong", 简: "jian", 历: "li", 报: "bao", 告: "gao", 论: "lun"
+  同: "tong", 简: "jian", 历: "li", 报: "bao", 告: "gao", 论: "lun",
+  神: "shen", 秘: "mi", 壁: "bi", 纸: "zhi", 课: "ke", 程: "cheng",
+  素: "su", 材: "cai", 包: "bao", 站: "zhan", 房: "fang", 车: "che",
+  字: "zi", 稿: "gao", 篇: "pian", 章: "zhang", 剧: "ju", 模: "mo",
+  型: "xing", 权: "quan", 重: "zhong", 训: "xun", 练: "lian", 评: "ping",
+  语: "yu", 问: "wen", 答: "da", 对: "dui", 话: "hua", 助: "zhu",
+  手: "shou", 智: "zhi", 能: "neng", 脑: "nao", 机: "ji", 器: "qi",
+  算: "suan", 法: "fa", 计: "ji", 草: "cao", 灵: "ling",
+  感: "gan", 随: "sui", 忆: "yi", 摘: "zhai", 选: "xuan", 友: "you",
+  朋: "peng", 亲: "qin", 爱: "ai", 喜: "xi", 欢: "huan", 拍: "pai"
 };
 
 export function nameToSafeSlug(name: string): string {
