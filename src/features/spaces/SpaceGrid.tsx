@@ -1,5 +1,6 @@
 import { AlertTriangle, Cloud, HardDrive, Plus, RefreshCw, Settings, Trash2 } from "lucide-react";
-import { memo } from "react";
+import { memo, useState } from "react";
+import { ConfirmModal } from "../../components/ConfirmModal.tsx";
 import type { SpaceSummary } from "../../appTypes.ts";
 
 interface SpaceGridProps {
@@ -29,6 +30,13 @@ function SpaceGridComponent({
   onRemoveSpace,
   onOpenSettings
 }: SpaceGridProps) {
+  const [unsupportedAlert, setUnsupportedAlert] = useState<{
+    open: boolean;
+    dataset: string;
+  }>({
+    open: false,
+    dataset: ""
+  });
   const isSearching = Boolean(query.trim());
 
   return (
@@ -96,9 +104,10 @@ function SpaceGridComponent({
                   key={`${space.endpoint}/${space.namespace}/${space.dataset}`}
                   onClick={() => {
                     if (hasNonAscii) {
-                      window.alert(
-                        `数据集「${space.dataset}」名称包含非 ASCII 字符（如中文）。\n\n由于 ModelScope 平台的底层 Git 服务对中文路径缺乏良好支持，极易导致空分支 404 或删除接口 500 崩溃，Lios 暂不支持将其关联为空间驱动器。\n\n建议在客户端或网页端创建纯英文标识的数据集。`
-                      );
+                      setUnsupportedAlert({
+                        open: true,
+                        dataset: space.dataset
+                      });
                       return;
                     }
                     onSelectSpace(space);
@@ -145,6 +154,17 @@ function SpaceGridComponent({
           </div>
         )}
       </section>
+
+      <ConfirmModal
+        open={unsupportedAlert.open}
+        title="暂不支持关联"
+        description={`数据集「${unsupportedAlert.dataset}」名称包含非 ASCII 字符（如中文）。`}
+        details="由于 ModelScope 平台的底层 Git 服务对中文路径缺乏良好支持，极易导致空分支 404 或删除接口 500 崩溃，Lios 暂不支持将其关联为空间驱动器。建议在客户端或网页端创建纯英文标识的数据集。"
+        confirmText="知道了"
+        hideCancel
+        onClose={() => setUnsupportedAlert((prev) => ({ ...prev, open: false }))}
+        onConfirm={() => setUnsupportedAlert((prev) => ({ ...prev, open: false }))}
+      />
     </section>
   );
 }

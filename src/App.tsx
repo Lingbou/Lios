@@ -70,6 +70,8 @@ import {
   type RecoveryKeyVerification
 } from "./recoveryKeyPresentation.ts";
 
+import { InputModal } from "./components/InputModal.tsx";
+import { ConfirmModal } from "./components/ConfirmModal.tsx";
 import { ConflictModal } from "./features/drive/ConflictModal.tsx";
 import { ContextMenu } from "./features/drive/ContextMenu.tsx";
 import { DragDropOverlay } from "./features/drive/DragDropOverlay.tsx";
@@ -139,6 +141,35 @@ function App() {
   const [createSpaceOpen, setCreateSpaceOpen] = useState(false);
   const [newSpaceName, setNewSpaceName] = useState("");
   const [createSpaceError, setCreateSpaceError] = useState("");
+  const [inputModalState, setInputModalState] = useState<{
+    open: boolean;
+    title: string;
+    description?: string;
+    inputLabel?: string;
+    placeholder?: string;
+    defaultValue?: string;
+    confirmText?: string;
+    validate?: (value: string) => string | null | undefined;
+    onSubmit: (value: string) => void | Promise<void>;
+  }>({
+    open: false,
+    title: "",
+    onSubmit: () => {}
+  });
+  const [confirmModalState, setConfirmModalState] = useState<{
+    open: boolean;
+    title: string;
+    description?: string;
+    details?: string | React.ReactNode;
+    confirmText?: string;
+    danger?: boolean;
+    hideCancel?: boolean;
+    onConfirm: () => void | Promise<void>;
+  }>({
+    open: false,
+    title: "",
+    onConfirm: () => {}
+  });
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const handleTaskError = useCallback((error: unknown) => setMessage(errorText(error)), []);
@@ -882,56 +913,110 @@ function App() {
     );
   }
 
-  async function createFolder() {
+  function createFolder() {
     if (!currentFolderId || !activeSpace) return;
-    const name = window.prompt("文件夹名称");
-    if (!name) return;
-    await run("新建文件夹", async () => {
-      const result = await appInvoke<CatalogLoadResult>("create_folder", {
-        spaceName: activeSpace.space_name,
-        parentNodeId: currentFolderId,
-        name
-      });
-      setCatalogTree(result.tree);
-      setCatalogStatus("ready");
-      setMessage(result.warnings.join("; "));
+    setInputModalState({
+      open: true,
+      title: "新建文件夹",
+      description: "在当前目录下创建新的文件夹",
+      inputLabel: "文件夹名称",
+      placeholder: "请输入文件夹名称",
+      defaultValue: "",
+      confirmText: "创建",
+      validate: (name) => {
+        const trimmed = name.trim();
+        if (!trimmed) return "文件夹名称不能为空";
+        if (trimmed.includes("/") || trimmed.includes("\\")) {
+          return "文件夹名称不能包含 / 或 \\";
+        }
+        if (children.some((item) => item.name === trimmed)) {
+          return "当前目录下已存在同名项目";
+        }
+        return null;
+      },
+      onSubmit: async (name) => {
+        setInputModalState((prev) => ({ ...prev, open: false }));
+        await run("新建文件夹", async () => {
+          const result = await appInvoke<CatalogLoadResult>("create_folder", {
+            spaceName: activeSpace.space_name,
+            parentNodeId: currentFolderId,
+            name: name.trim()
+          });
+          setCatalogTree(result.tree);
+          setCatalogStatus("ready");
+          setMessage(result.warnings.join("; "));
+        });
+      }
     });
   }
 
-  async function renameSelected() {
+  function renameSelected() {
     if (!activeSpace) return;
     const [nodeId] = [...selectedIds];
     if (!nodeId) return;
     const node = findNode(catalogTree, nodeId);
-    const newName = window.prompt("新名称", node?.name ?? "");
-    if (!newName) return;
-    await run("重命名", async () => {
-      const result = await appInvoke<CatalogLoadResult>("rename_node", {
-        spaceName: activeSpace.space_name,
-        nodeId,
-        newName
-      });
-      setCatalogTree(result.tree);
-      setCatalogStatus("ready");
-      setSelectedIds(new Set());
-      setLastSelectedId(null);
-      setMessage(result.warnings.join("; "));
+    if (!node) return;
+    const originalName = node.name;
+
+    setInputModalState({
+      open: true,
+      title: "重命名",
+      description: `将 “${originalName}” 重命名为新名称`,
+      inputLabel: "新名称",
+      placeholder: "请输入新名称",
+      defaultValue: originalName,
+      confirmText: "确定",
+      validate: (name) => {
+        const trimmed = name.trim();
+        if (!trimmed) return "名称不能为空";
+        if (trimmed.includes("/") || trimmed.includes("\\")) {
+          return "名称不能包含 / 或 \\";
+        }
+        if (trimmed !== originalName && children.some((item) => item.name === trimmed)) {
+          return "当前目录下已存在同名项目";
+        }
+        return null;
+      },
+      onSubmit: async (newName) => {
+        setInputModalState((prev) => ({ ...prev, open: false }));
+        const trimmed = newName.trim();
+        if (trimmed === originalName) return;
+        await run("重命名", async () => {
+          const result = await appInvoke<CatalogLoadResult>("rename_node", {
+            spaceName: activeSpace.space_name,
+            nodeId,
+            newName: trimmed
+          });
+          setCatalogTree(result.tree);
+          setCatalogStatus("ready");
+          setSelectedIds(new Set());
+          setLastSelectedId(null);
+          setMessage(result.warnings.join("; "));
+        });
+      }
     });
   }
 
-  async function deleteSelected() {
+  function deleteSelected() {
     if (selectedIds.size === 0 || !activeSpace) return;
-    const ok = window.confirm(
-      `从 Lios 目录中删除 ${selectedIds.size} 个项目？此操作不会进入回收站。\n\nModelScope 的令牌接口目前不支持物理删除远端文件；如需释放远端空间，请在 ModelScope 网页端删除或重建这个空间。`
-    );
-    if (!ok) return;
     const nodeIds = [...selectedIds];
-    await run("删除", async () => {
-      const task = await appInvoke<TaskSummary>("enqueue_delete_nodes", {
-        spaceName: activeSpace.space_name,
-        nodeIds
-      });
-      upsertTask(task);
+    setConfirmModalState({
+      open: true,
+      title: "删除项目",
+      description: `从 Lios 目录中删除选中的 ${nodeIds.length} 个项目？此操作不会进入回收站。`,
+      details: "ModelScope 的令牌接口目前不支持物理删除远端文件；如需释放远端空间，请在 ModelScope 网页端删除或重建这个空间。",
+      confirmText: "删除",
+      danger: true,
+      onConfirm: async () => {
+        setConfirmModalState((prev) => ({ ...prev, open: false }));
+        await run("删除", async () => {
+          const task = await appInvoke<TaskSummary>("enqueue_delete_nodes", {
+            spaceName: activeSpace.space_name,
+            nodeIds
+          });
+          upsertTask(task);
+        });
+      }
     });
   }
 
@@ -1175,22 +1260,29 @@ function App() {
     setRebuildDialog(null);
   }
 
-  async function handleRemoveSpace(space: SpaceSummary) {
-    const ok = window.confirm(
-      `确定从本地移除空间「${space.dataset}」？此操作仅移除本地空间别名映射，不会影响远端数据。`
-    );
-    if (!ok) return;
-    try {
-      await appInvoke("remove_space", { name: space.space_name });
-      if (activeSpace?.space_name === space.space_name) {
-        setActiveSpace(null);
-        setCatalogTree(null);
-        setCatalogStatus("idle");
+  function handleRemoveSpace(space: SpaceSummary) {
+    setConfirmModalState({
+      open: true,
+      title: "移除空间",
+      description: `确定从本地移除空间「${space.dataset}」？`,
+      details: "此操作仅移除本地空间别名映射，不会影响远端数据。",
+      confirmText: "移除",
+      danger: true,
+      onConfirm: async () => {
+        setConfirmModalState((prev) => ({ ...prev, open: false }));
+        try {
+          await appInvoke("remove_space", { name: space.space_name });
+          if (activeSpace?.space_name === space.space_name) {
+            setActiveSpace(null);
+            setCatalogTree(null);
+            setCatalogStatus("idle");
+          }
+          await refreshSetup(false);
+        } catch (error) {
+          setMessage(errorText(error));
+        }
       }
-      await refreshSetup(false);
-    } catch (error) {
-      setMessage(errorText(error));
-    }
+    });
   }
 
   async function selectAccount() {
@@ -1827,6 +1919,31 @@ function App() {
             setPreviewItem(null);
           }}
           onDownload={(item) => void downloadSelected([item.id])}
+        />
+
+        <InputModal
+          open={inputModalState.open}
+          title={inputModalState.title}
+          description={inputModalState.description}
+          inputLabel={inputModalState.inputLabel}
+          placeholder={inputModalState.placeholder}
+          defaultValue={inputModalState.defaultValue}
+          confirmText={inputModalState.confirmText}
+          validate={inputModalState.validate}
+          onClose={() => setInputModalState((prev) => ({ ...prev, open: false }))}
+          onSubmit={inputModalState.onSubmit}
+        />
+
+        <ConfirmModal
+          open={confirmModalState.open}
+          title={confirmModalState.title}
+          description={confirmModalState.description}
+          details={confirmModalState.details}
+          confirmText={confirmModalState.confirmText}
+          danger={confirmModalState.danger}
+          hideCancel={confirmModalState.hideCancel}
+          onClose={() => setConfirmModalState((prev) => ({ ...prev, open: false }))}
+          onConfirm={confirmModalState.onConfirm}
         />
       </main>
     </div>
