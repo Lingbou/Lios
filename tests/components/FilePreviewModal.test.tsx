@@ -101,6 +101,12 @@ describe("FilePreviewModal", () => {
 
     fireEvent.click(screen.getByTitle("关闭 (Esc)"));
     expect(onClose).toHaveBeenCalledOnce();
+
+    fireEvent.keyDown(window, { key: " " });
+    expect(onClose).toHaveBeenCalledTimes(2);
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(3);
   });
 
   it("renders header navigation buttons and handles navigation callbacks", () => {
