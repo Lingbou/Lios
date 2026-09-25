@@ -44,7 +44,7 @@ function FileTableComponent({
 
   function handleRowClick(event: MouseEvent, item: DriveItem) {
     // If clicking directly on a button or checkbox, let their own handlers handle it
-    if ((event.target as HTMLElement).closest("button, input")) return;
+    if ((event.target as HTMLElement).closest("input[type='checkbox']")) return;
 
     if (event.shiftKey) {
       onSelectRange(item.id);
@@ -128,17 +128,13 @@ function FileTableComponent({
                     type="checkbox"
                     checked={isSelected}
                     onChange={() => onToggleSelect(item.id)}
+                    onClick={(event) => event.stopPropagation()}
                     aria-label={`选择 ${item.name}`}
                   />
                 </td>
                 <td className="nameCol">
-                  <button
-                    type="button"
+                  <span
                     className="fileName"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onEnterItem(item);
-                    }}
                     title={item.name}
                   >
                     {item.kind === "Directory" ? (
@@ -147,7 +143,7 @@ function FileTableComponent({
                       <File className="itemIcon fileIcon" aria-hidden />
                     )}
                     <span>{item.name}</span>
-                  </button>
+                  </span>
                 </td>
                 <td>{item.kind === "Directory" ? `${item.children_count} 项` : "文件"}</td>
                 <td>{item.kind === "File" ? formatBytes(item.size) : "-"}</td>
