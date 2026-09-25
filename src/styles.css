@@ -641,11 +641,67 @@ select:focus {
   background: #fff0f8;
 }
 
-.fileTable input[type="checkbox"] {
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
   width: 16px;
   height: 16px;
   min-height: 16px;
-  padding: 0;
+  border: 1.5px solid var(--line-strong, #cbd5e1);
+  border-radius: 4px;
+  background-color: var(--surface-strong, #ffffff);
+  cursor: pointer;
+  display: inline-grid;
+  place-content: center;
+  margin: 0;
+  transition: all 0.15s ease-in-out;
+  position: relative;
+  vertical-align: middle;
+}
+
+input[type="checkbox"]:hover {
+  border-color: var(--pink, #2563eb);
+}
+
+input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--pink, #2563eb);
+  outline-offset: 1px;
+}
+
+input[type="checkbox"]:checked {
+  background-color: var(--pink, #2563eb);
+  border-color: var(--pink, #2563eb);
+}
+
+input[type="checkbox"]:checked::after {
+  content: "";
+  width: 8px;
+  height: 4px;
+  border-left: 2px solid #ffffff;
+  border-bottom: 2px solid #ffffff;
+  transform: rotate(-45deg) translate(0.5px, -0.5px);
+}
+
+input[type="checkbox"]:indeterminate {
+  background-color: var(--pink, #2563eb);
+  border-color: var(--pink, #2563eb);
+}
+
+input[type="checkbox"]:indeterminate::after {
+  content: "";
+  width: 8px;
+  height: 2px;
+  background-color: #ffffff;
+  border-radius: 1px;
+}
+
+.fileTable td.dateCol {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 .fileName {
@@ -2566,4 +2622,62 @@ select:focus {
   color: var(--danger);
   background: var(--danger-soft);
   border-color: var(--danger);
+}
+
+
+/* File Extension Category Colors */
+.fileCategory-code {
+  color: #0284c7 !important;
+}
+
+.fileCategory-image {
+  color: #9333ea !important;
+}
+
+.fileCategory-doc {
+  color: #dc2626 !important;
+}
+
+.fileCategory-sheet {
+  color: #16a34a !important;
+}
+
+.fileCategory-archive {
+  color: #d97706 !important;
+}
+
+.fileCategory-media {
+  color: #db2777 !important;
+}
+
+.fileCategory-default {
+  color: #64748b !important;
+}
+
+.fileExtBadge.badge-code {
+  background: #0284c7;
+}
+
+.fileExtBadge.badge-image {
+  background: #9333ea;
+}
+
+.fileExtBadge.badge-doc {
+  background: #dc2626;
+}
+
+.fileExtBadge.badge-sheet {
+  background: #16a34a;
+}
+
+.fileExtBadge.badge-archive {
+  background: #d97706;
+}
+
+.fileExtBadge.badge-media {
+  background: #db2777;
+}
+
+.fileExtBadge.badge-default {
+  background: #64748b;
 }

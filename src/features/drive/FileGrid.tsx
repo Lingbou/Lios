@@ -1,3 +1,4 @@
+import { getFileCategory, getFileExtension } from "./fileCategory.ts";
 import { File, Folder } from "lucide-react";
 import { memo, type MouseEvent } from "react";
 import type { DriveItem } from "../../appTypes.ts";
@@ -13,10 +14,7 @@ interface FileGridProps {
   onContextMenu: (event: MouseEvent, item: DriveItem | null) => void;
 }
 
-function getFileExtension(filename: string): string {
-  const parts = filename.split(".");
-  return parts.length > 1 ? (parts.pop() ?? "").toUpperCase() : "";
-}
+
 
 function FileGridComponent({
   items,
@@ -60,7 +58,8 @@ function FileGridComponent({
         {items.map((item) => {
           const isSelected = selectedIds.has(item.id);
           const isDir = item.kind === "Directory";
-          const ext = !isDir ? getFileExtension(item.name) : "";
+          const ext = !isDir ? getFileExtension(item.name).toUpperCase() : "";
+          const category = !isDir ? getFileCategory(item.name) : undefined;
 
           return (
             <div
@@ -88,8 +87,8 @@ function FileGridComponent({
                   <Folder className="gridItemIcon folderIcon" aria-hidden />
                 ) : (
                   <div className="fileIconContainer">
-                    <File className="gridItemIcon fileIcon" aria-hidden />
-                    {ext && <span className="fileExtBadge">{ext.slice(0, 4)}</span>}
+                    <File className={`gridItemIcon fileIcon fileCategory-${category}`} aria-hidden />
+                    {ext && <span className={`fileExtBadge badge-${category}`}>{ext.slice(0, 4)}</span>}
                   </div>
                 )}
               </div>
