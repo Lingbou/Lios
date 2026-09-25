@@ -5,12 +5,14 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AlertTriangle,
+  ArrowUpDown,
   ChevronRight,
   Download,
   FolderOpen,
   HardDrive,
   KeyRound,
   Minus,
+  Plus,
   RefreshCw,
   Search,
   Settings,
@@ -141,6 +143,7 @@ function App() {
   const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [appliedQuery, setAppliedQuery] = useState("");
+  const [taskDrawerCollapsed, setTaskDrawerCollapsed] = useState(false);
   const [searchResults, setSearchResults] = useState<DriveItem[]>([]);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchSeqRef = useRef(0);
@@ -1560,6 +1563,17 @@ function App() {
   const selectSpace = useStableCallback((space: SpaceSummary) => loadSpace(space));
   const removeSpace = useStableCallback(handleRemoveSpace);
   const openSettings = useStableCallback(() => setView("settings"));
+  const toggleSettings = useStableCallback(() => {
+    setView((curr) => (curr === "settings" ? (activeSpace ? "drive" : "spaces") : "settings"));
+  });
+  const toggleTaskDrawer = useStableCallback(() => {
+    if (view === "settings") {
+      setView(activeSpace ? "drive" : "spaces");
+      setTaskDrawerCollapsed(false);
+    } else {
+      setTaskDrawerCollapsed((prev) => !prev);
+    }
+  });
   const onSort = useStableCallback(handleSort);
   const onToggleSelect = useStableCallback(toggleSelection);
   const onSelectOnly = useStableCallback(selectOnly);
@@ -1576,15 +1590,6 @@ function App() {
           <span>Lios</span>
         </div>
         <div className="windowDragRegion" data-tauri-drag-region onMouseDown={startWindowDrag} />
-        <button
-          className={`titlebarAction ${view === "settings" ? "active" : ""}`}
-          onClick={openSettings}
-          title="设置"
-          aria-label="设置"
-          aria-pressed={view === "settings"}
-        >
-          <Settings aria-hidden />
-        </button>
         <div className="windowControls">
           <button onClick={minimizeWindow} title="最小化" aria-label="最小化">
             <Minus aria-hidden />
@@ -1600,34 +1605,93 @@ function App() {
 
       <main className="driveShell">
         <aside className="spaceRail">
-          <div className="accountSection">
-            <span className="sectionLabel">账号</span>
-            <button
-              className={`accountItem ${hasToken ? "active" : "empty"}`}
-              onClick={selectAccount}
-              title="点击查看所有空间"
-            >
-              <KeyRound aria-hidden />
-              <span>
-                <strong>{modelscopeUser?.username ?? "未连接账号"}</strong>
-                <small>{hasToken ? "ModelScope" : "未连接"}</small>
-              </span>
-            </button>
+          <div className="railHeader">
+            <div className="railBrand">
+              <img src={liosPetalMark} alt="" className="railBrandLogo" />
+              <div className="railBrandText">
+                <span className="railBrandTitle">Lios</span>
+                <span className="railBrandSubtitle">Desktop Drive</span>
+              </div>
+            </div>
+
+            <div className="accountSection">
+              <button
+                className={`accountItem ${hasToken ? "active" : "empty"}`}
+                onClick={selectAccount}
+                title="查看所有空间概览"
+              >
+                <KeyRound aria-hidden />
+                <span>
+                  <strong>{modelscopeUser?.username ?? "未连接账号"}</strong>
+                  <small>{hasToken ? "ModelScope" : "未连接"}</small>
+                </span>
+              </button>
+            </div>
           </div>
 
-          <div className="accountListSpacer" />
+          <div className="railSpacesSection">
+            <div className="railSectionHeader">
+              <span className="sectionLabel">已挂载空间</span>
+              <button
+                type="button"
+                className="railAddSpaceBtn"
+                onClick={createSpace}
+                title="新建空间"
+                aria-label="新建空间"
+              >
+                <Plus aria-hidden />
+              </button>
+            </div>
+
+            <div className="railSpaceList" role="list">
+              {spaces.map((space) => {
+                const isActive = view === "drive" && activeSpace?.space_name === space.space_name;
+                const displayName = space.title || space.dataset || space.space_name;
+                return (
+                  <button
+                    key={space.space_name}
+                    type="button"
+                    className={`railSpaceItem ${isActive ? "active" : ""}`}
+                    onClick={() => {
+                      void loadSpace(space);
+                    }}
+                    title={displayName}
+                  >
+                    <HardDrive aria-hidden />
+                    <span className="railSpaceName">{displayName}</span>
+                  </button>
+                );
+              })}
+              {spaces.length === 0 && (
+                <div className="railEmptySpaces">
+                  <span>暂无已挂载空间</span>
+                  <button type="button" className="railEmptyCreateBtn" onClick={createSpace}>
+                    <Plus aria-hidden /> 新建空间
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
 
           <div className="railFooter">
             <button
-              className={view === "spaces" || view === "drive" ? "active" : ""}
-              onClick={() => {
-                setView("spaces");
-                setQuery("");
-              }}
-              title="空间"
+              type="button"
+              className={view !== "settings" && !taskDrawerCollapsed ? "active" : ""}
+              onClick={toggleTaskDrawer}
+              title="传输任务概览"
             >
-              <HardDrive aria-hidden />
-              空间
+              <ArrowUpDown aria-hidden />
+              <span>传输任务</span>
+              {activeTasks > 0 && <span className="railTaskBadge">{activeTasks}</span>}
+            </button>
+            <button
+              type="button"
+              className={view === "settings" ? "active" : ""}
+              onClick={toggleSettings}
+              title="设置"
+            >
+              <Settings aria-hidden />
+              <span>设置</span>
             </button>
           </div>
         </aside>
@@ -2074,6 +2138,8 @@ function App() {
               onAction={runTaskAction}
               listTaskItems={listTaskItems}
               onError={handleTaskError}
+              isCollapsed={taskDrawerCollapsed}
+              onToggleCollapse={setTaskDrawerCollapsed}
             />
           )}
         </section>

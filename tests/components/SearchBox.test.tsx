@@ -105,7 +105,7 @@ describe("SearchBox in Drive view", () => {
     render(<App />);
 
     // Enter Drive view
-    const spaceCard = await screen.findByText("demo-dataset");
+    const spaceCard = (await screen.findAllByText("demo-dataset"))[0];
     fireEvent.click(spaceCard);
     expect(await screen.findByText("subfolder")).toBeInTheDocument();
 
@@ -142,7 +142,7 @@ describe("SearchBox in Drive view", () => {
     vi.mocked(invoke).mockImplementation(mockInvoke);
 
     render(<App />);
-    const spaceCard = await screen.findByText("demo-dataset");
+    const spaceCard = (await screen.findAllByText("demo-dataset"))[0];
     fireEvent.click(spaceCard);
     expect(await screen.findByText("subfolder")).toBeInTheDocument();
 

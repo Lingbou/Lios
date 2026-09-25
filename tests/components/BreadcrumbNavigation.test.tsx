@@ -93,7 +93,7 @@ describe("Breadcrumb navigation", () => {
     render(<App />);
 
     // Click on the space card to enter Drive view
-    const spaceCard = await screen.findByText("demo-dataset");
+    const spaceCard = (await screen.findAllByText("demo-dataset"))[0];
     fireEvent.click(spaceCard);
 
     // Now in Drive view, wait for subfolder to be displayed
