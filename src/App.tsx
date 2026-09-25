@@ -20,7 +20,7 @@ import {
   UploadCloud,
   X
 } from "lucide-react";
-import { type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import liosPetalMark from "./assets/lios-petal-mark.svg";
 import type {
   CacheCleanupReport,
@@ -88,7 +88,7 @@ import type {
   ViewMode
 } from "./features/drive/driveTypes.ts";
 import { CreateSpaceModal } from "./features/spaces/CreateSpaceModal.tsx";
-import { nameToSafeSlug } from "./features/spaces/spaceMapping.ts";
+import { nameToSafeSlug, sanitizeSpaceAlias } from "./features/spaces/spaceMapping.ts";
 import { SpaceGrid } from "./features/spaces/SpaceGrid.tsx";
 import { RebuildCatalogModal } from "./features/catalog/RebuildCatalogModal.tsx";
 import { ImportKeyModal } from "./features/recoveryKey/ImportKeyModal.tsx";
@@ -137,7 +137,10 @@ function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [appliedQuery, setAppliedQuery] = useState("");
   const [searchResults, setSearchResults] = useState<DriveItem[]>([]);
+  const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchSeqRef = useRef(0);
   const [token, setToken] = useState("");
   const [manualEndpoint, setManualEndpoint] = useState("https://modelscope.cn");
   const [createSpaceOpen, setCreateSpaceOpen] = useState(false);
@@ -208,8 +211,8 @@ function App() {
     [currentFolder]
   );
   const visibleItems = useMemo(
-    () => (query.trim() ? searchResults : children),
-    [children, query, searchResults]
+    () => (appliedQuery ? searchResults : children),
+    [appliedQuery, children, searchResults]
   );
 
   const sortedItems = useMemo(() => {
@@ -403,22 +406,22 @@ function App() {
 
       // Auto-register any discovered ASCII ModelScope dataset into local space registry
       const registeredSet = new Set(next.spaces.map((s) => `${s.namespace}/${s.dataset}`));
+      const takenAliases = new Set(next.spaces.map((s) => s.space_name));
       let anyRegistered = false;
       for (const repo of result.repositories) {
         if (!registeredSet.has(`${repo.namespace}/${repo.dataset}`)) {
-          const defaultAlias = repo.dataset.toLowerCase();
-          if (/^[a-z][a-z0-9_-]{0,31}$/.test(defaultAlias)) {
-            try {
-              await appInvoke("register_space", {
-                name: defaultAlias,
-                namespace: repo.namespace,
-                dataset: repo.dataset,
-                endpoint: repo.endpoint
-              });
-              anyRegistered = true;
-            } catch {
-              // Ignore alias collision or format error
-            }
+          const defaultAlias = sanitizeSpaceAlias(repo.dataset, takenAliases);
+          try {
+            await appInvoke("register_space", {
+              name: defaultAlias,
+              namespace: repo.namespace,
+              dataset: repo.dataset,
+              endpoint: repo.endpoint
+            });
+            takenAliases.add(defaultAlias);
+            anyRegistered = true;
+          } catch {
+            // Ignore alias collision or format error
           }
         }
       }
@@ -469,6 +472,11 @@ function App() {
 
   useEffect(() => {
     refreshSetup().catch((error) => setMessage(errorText(error)));
+    return () => {
+      if (searchTimeoutRef.current) {
+        clearTimeout(searchTimeoutRef.current);
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -658,8 +666,14 @@ function App() {
     setCurrentFolderId(null);
     setSelectedIds(new Set());
     setLastSelectedId(null);
-    setSearchResults([]);
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+      searchTimeoutRef.current = null;
+    }
+    searchSeqRef.current += 1;
     setQuery("");
+    setAppliedQuery("");
+    setSearchResults([]);
     await catalogLoads.run(async (request) => {
       try {
         const outcome = await loadCatalogState(() =>
@@ -733,12 +747,14 @@ function App() {
         }
         const result = outcome.catalog;
         setCatalogTree(result.tree);
-        if (!currentFolderId) setCurrentFolderId(result.tree.id);
+        setCurrentFolderId((current) =>
+          !current || !findNode(result.tree, current) ? result.tree.id : current
+        );
         setCatalogStatus("ready");
         setSelectedIds(new Set());
         setLastSelectedId(null);
         setMessage(result.warnings.join("; "));
-        const trimmedQuery = query.trim();
+        const trimmedQuery = appliedQuery.trim();
         if (trimmedQuery) {
           const results = await appInvoke<DriveItem[]>("search_catalog", {
             spaceName: targetSpace.space_name,
@@ -841,13 +857,23 @@ function App() {
     setPreviewItem(null);
   }
 
+  function navigateToFolder(folderId: string) {
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+      searchTimeoutRef.current = null;
+    }
+    searchSeqRef.current += 1;
+    setCurrentFolderId(folderId);
+    setSelectedIds(new Set());
+    setLastSelectedId(null);
+    setQuery("");
+    setAppliedQuery("");
+    setSearchResults([]);
+  }
+
   function enterItem(item: DriveItem) {
     if (item.kind === "Directory") {
-      setCurrentFolderId(item.id);
-      setSelectedIds(new Set());
-      setLastSelectedId(null);
-      setQuery("");
-      setSearchResults([]);
+      navigateToFolder(item.id);
     } else {
       selectOnly(item.id);
       void openFilePreview(item);
@@ -963,17 +989,40 @@ function App() {
         name
       });
       setCatalogTree(result.tree);
+      setCurrentFolderId((current) =>
+        !current || !findNode(result.tree, current) ? result.tree.id : current
+      );
       setCatalogStatus("ready");
       setMessage(result.warnings.join("; "));
     });
   }
 
-  async function renameSelected() {
+  function isDriveItem(target: unknown): target is DriveItem {
+    return (
+      typeof target === "object" &&
+      target !== null &&
+      "id" in target &&
+      typeof (target as any).id === "string"
+    );
+  }
+
+  function resolveTargetNodeIds(target?: DriveItem | string[]): string[] {
+    if (Array.isArray(target)) {
+      return target;
+    }
+    if (isDriveItem(target)) {
+      return selectedIds.has(target.id) && selectedIds.size > 1 ? [...selectedIds] : [target.id];
+    }
+    return [...selectedIds];
+  }
+
+  async function renameSelected(target?: DriveItem | string) {
     if (!activeSpace) return;
-    const [nodeId] = [...selectedIds];
+    const targetItem = isDriveItem(target) ? target : undefined;
+    const nodeId = typeof target === "string" ? target : targetItem?.id ?? [...selectedIds][0];
     if (!nodeId) return;
     const node = findNode(catalogTree, nodeId);
-    const newName = window.prompt("新名称", node?.name ?? "");
+    const newName = window.prompt("新名称", node?.name ?? targetItem?.name ?? "");
     if (!newName) return;
     await run("重命名", async () => {
       const result = await appInvoke<CatalogLoadResult>("rename_node", {
@@ -982,6 +1031,9 @@ function App() {
         newName
       });
       setCatalogTree(result.tree);
+      setCurrentFolderId((current) =>
+        !current || !findNode(result.tree, current) ? result.tree.id : current
+      );
       setCatalogStatus("ready");
       setSelectedIds(new Set());
       setLastSelectedId(null);
@@ -989,25 +1041,28 @@ function App() {
     });
   }
 
-  async function deleteSelected() {
-    if (selectedIds.size === 0 || !activeSpace) return;
+  async function deleteSelected(target?: DriveItem | string[]) {
+    if (!activeSpace) return;
+    const nodeIds = resolveTargetNodeIds(target);
+    if (nodeIds.length === 0) return;
     const ok = window.confirm(
-      `从 Lios 目录中删除 ${selectedIds.size} 个项目？此操作不会进入回收站。\n\nModelScope 的令牌接口目前不支持物理删除远端文件；如需释放远端空间，请在 ModelScope 网页端删除或重建这个空间。`
+      `从 Lios 目录中删除 ${nodeIds.length} 个项目？此操作不会进入回收站。\n\nModelScope 的令牌接口目前不支持物理删除远端文件；如需释放远端空间，请在 ModelScope 网页端删除或重建这个空间。`
     );
     if (!ok) return;
-    const nodeIds = [...selectedIds];
     await run("删除", async () => {
       const task = await appInvoke<TaskSummary>("enqueue_delete_nodes", {
         spaceName: activeSpace.space_name,
         nodeIds
       });
       upsertTask(task);
+      setSelectedIds(new Set());
+      setLastSelectedId(null);
     });
   }
 
-  async function downloadSelected(nodeIdsOverride?: string[]) {
+  async function downloadSelected(target?: DriveItem | string[]) {
     if (!activeSpace) return;
-    const nodeIds = nodeIdsOverride ?? [...selectedIds];
+    const nodeIds = resolveTargetNodeIds(target);
     if (nodeIds.length === 0) return;
     const output = await open({ directory: true, multiple: false });
     if (typeof output !== "string") return;
@@ -1021,19 +1076,46 @@ function App() {
     });
   }
 
+  function clearSearch() {
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+      searchTimeoutRef.current = null;
+    }
+    searchSeqRef.current += 1;
+    setQuery("");
+    setAppliedQuery("");
+    setSearchResults([]);
+  }
+
   async function searchCatalog(value = query) {
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+      searchTimeoutRef.current = null;
+    }
     const trimmed = value.trim();
     setQuery(value);
     if (!trimmed) {
+      searchSeqRef.current += 1;
+      setAppliedQuery("");
       setSearchResults([]);
       return;
     }
     if (!activeSpace) return;
-    const results = await appInvoke<DriveItem[]>("search_catalog", {
-      spaceName: activeSpace.space_name,
-      query: trimmed
-    });
-    setSearchResults(results);
+    setAppliedQuery(trimmed);
+    const seq = ++searchSeqRef.current;
+    try {
+      const results = await appInvoke<DriveItem[]>("search_catalog", {
+        spaceName: activeSpace.space_name,
+        query: trimmed
+      });
+      if (searchSeqRef.current === seq) {
+        setSearchResults(results);
+      }
+    } catch (error) {
+      if (searchSeqRef.current === seq) {
+        setMessage(errorText(error));
+      }
+    }
   }
 
   async function saveToken() {
@@ -1411,6 +1493,9 @@ function App() {
                     onClick={() => {
                       setView("spaces");
                       setQuery("");
+                      setSearchResults([]);
+                      setSelectedIds(new Set());
+                      setLastSelectedId(null);
                     }}
                     title="空间列表"
                     aria-label="返回空间列表"
@@ -1421,18 +1506,19 @@ function App() {
                   {crumbs.length > 0 && <ChevronRight aria-hidden className="crumbSeparator" />}
                   {crumbs.length > 0 ? (
                     crumbs.map((crumb, index) => (
-                      <button
-                        key={crumb.id}
-                        type="button"
-                        onClick={() => setCurrentFolderId(crumb.id)}
-                        className={index === crumbs.length - 1 ? "current" : ""}
-                        title={crumbPaths[index]}
-                        aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
-                        aria-current={index === crumbs.length - 1 ? "page" : undefined}
-                      >
-                        {index > 0 && <ChevronRight aria-hidden />}
-                        <span className="crumbLabel">{crumb.name}</span>
-                      </button>
+                      <Fragment key={crumb.id}>
+                        {index > 0 && <ChevronRight aria-hidden className="crumbSeparator" />}
+                        <button
+                          type="button"
+                          onClick={() => navigateToFolder(crumb.id)}
+                          className={index === crumbs.length - 1 ? "current" : ""}
+                          title={crumbPaths[index]}
+                          aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
+                          aria-current={index === crumbs.length - 1 ? "page" : undefined}
+                        >
+                          <span className="crumbLabel">{crumb.name}</span>
+                        </button>
+                      </Fragment>
                     ))
                   ) : (
                     <span className="crumbFallback" title={crumbFallbackLabel}>
@@ -1446,14 +1532,50 @@ function App() {
                 <input
                   value={query}
                   onChange={(event) => {
-                    setQuery(event.target.value);
-                    if (view === "drive" && !event.target.value.trim()) setSearchResults([]);
+                    const val = event.target.value;
+                    setQuery(val);
+                    if (view === "drive") {
+                      if (searchTimeoutRef.current) {
+                        clearTimeout(searchTimeoutRef.current);
+                        searchTimeoutRef.current = null;
+                      }
+                      const trimmed = val.trim();
+                      if (!trimmed) {
+                        searchSeqRef.current += 1;
+                        setAppliedQuery("");
+                        setSearchResults([]);
+                      } else {
+                        searchTimeoutRef.current = setTimeout(() => {
+                          searchCatalog(val);
+                        }, 300);
+                      }
+                    }
                   }}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" && view === "drive") searchCatalog();
+                    if (event.key === "Enter" && view === "drive") {
+                      if (searchTimeoutRef.current) {
+                        clearTimeout(searchTimeoutRef.current);
+                        searchTimeoutRef.current = null;
+                      }
+                      searchCatalog(query);
+                    } else if (event.key === "Escape") {
+                      clearSearch();
+                      (event.target as HTMLInputElement).blur();
+                    }
                   }}
                   placeholder={view === "spaces" ? "搜索空间" : "搜索当前空间"}
                 />
+                {query.length > 0 && (
+                  <button
+                    type="button"
+                    className="searchClearBtn"
+                    onClick={clearSearch}
+                    title="清空搜索"
+                    aria-label="清空搜索"
+                  >
+                    <X aria-hidden />
+                  </button>
+                )}
               </div>
             </header>
           )}
@@ -1684,9 +1806,9 @@ function App() {
                 onUploadFiles={() => pickUpload(false)}
                 onUploadFolder={() => pickUpload(true)}
                 onNewFolder={createFolder}
-                onDownload={downloadSelected}
-                onRename={renameSelected}
-                onDelete={deleteSelected}
+                onDownload={() => void downloadSelected()}
+                onRename={() => void renameSelected()}
+                onDelete={() => void deleteSelected()}
                 onRefresh={() => reloadCatalog()}
                 onClearSelection={() => {
                   setSelectedIds(new Set());
@@ -1781,7 +1903,7 @@ function App() {
                 ) : visibleItems.length === 0 ? (
                   <div className="emptyDrive">
                     <FolderOpen aria-hidden />
-                    <h2>{query.trim() ? "没有搜索结果" : "此文件夹为空"}</h2>
+                    <h2>{appliedQuery ? "没有搜索结果" : "此文件夹为空"}</h2>
                   </div>
                 ) : viewMode === "grid" ? (
                   <FileGrid
@@ -1826,7 +1948,11 @@ function App() {
         <ContextMenu
           state={contextMenu}
           onClose={closeContextMenu}
-          selectedCount={selectedCount}
+          selectedCount={
+            contextMenu.item != null && !selectedIds.has(contextMenu.item.id)
+              ? 1
+              : selectedCount
+          }
           onOpenItem={enterItem}
           onPreviewItem={openFilePreview}
           onDownload={downloadSelected}

@@ -108,4 +108,70 @@ describe("FilePreviewModal", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(3);
   });
+
+  it("renders header navigation buttons and handles navigation callbacks", () => {
+    const onPrev = vi.fn();
+    const onNext = vi.fn();
+
+    render(
+      <FilePreviewModal
+        open={true}
+        item={mockFile}
+        loading={false}
+        error={null}
+        content={{ isText: true, text: "code content" }}
+        hasPrev={true}
+        hasNext={true}
+        onPrev={onPrev}
+        onNext={onNext}
+        onClose={vi.fn()}
+        onDownload={vi.fn()}
+      />
+    );
+
+    const prevBtn = screen.getByLabelText("上一个文件");
+    const nextBtn = screen.getByLabelText("下一个文件");
+
+    expect(prevBtn).toBeInTheDocument();
+    expect(nextBtn).toBeInTheDocument();
+    expect(prevBtn).not.toBeDisabled();
+    expect(nextBtn).not.toBeDisabled();
+
+    fireEvent.click(prevBtn);
+    expect(onPrev).toHaveBeenCalledOnce();
+
+    fireEvent.click(nextBtn);
+    expect(onNext).toHaveBeenCalledOnce();
+
+    // Verify keyboard navigation
+    fireEvent.keyDown(window, { key: "ArrowLeft" });
+    expect(onPrev).toHaveBeenCalledTimes(2);
+
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    expect(onNext).toHaveBeenCalledTimes(2);
+  });
+
+  it("disables navigation buttons when hasPrev/hasNext are false", () => {
+    render(
+      <FilePreviewModal
+        open={true}
+        item={mockFile}
+        loading={false}
+        error={null}
+        content={{ isText: true, text: "content" }}
+        hasPrev={false}
+        hasNext={false}
+        onPrev={vi.fn()}
+        onNext={vi.fn()}
+        onClose={vi.fn()}
+        onDownload={vi.fn()}
+      />
+    );
+
+    const prevBtn = screen.getByLabelText("上一个文件");
+    const nextBtn = screen.getByLabelText("下一个文件");
+
+    expect(prevBtn).toBeDisabled();
+    expect(nextBtn).toBeDisabled();
+  });
 });

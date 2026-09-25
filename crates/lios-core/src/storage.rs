@@ -659,7 +659,7 @@ fn sha256_file(path: &std::path::Path) -> Result<String> {
 
 #[async_trait]
 pub trait StorageAdapter: Send + Sync {
-    async fn create_repo(&self, namespace: &str, dataset: &str) -> Result<()>;
+    async fn create_repo(&self, namespace: &str, dataset: &str, title: Option<&str>) -> Result<()>;
     async fn repo_exists(&self, namespace: &str, dataset: &str) -> Result<bool>;
     fn remote_delete_capability(&self) -> RemoteDeleteCapability {
         RemoteDeleteCapability::Supported
