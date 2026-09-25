@@ -1423,7 +1423,9 @@ select:focus {
 .conflictModal,
 .spaceModal,
 .recoveryKeyModal,
-.rebuildModal {
+.rebuildModal,
+.inputModal,
+.confirmModal {
   width: min(720px, 100%);
   max-height: min(680px, calc(100vh - 40px));
   overflow: hidden;
@@ -1435,7 +1437,9 @@ select:focus {
   grid-template-rows: auto minmax(0, 1fr) auto;
 }
 
-.spaceModal {
+.spaceModal,
+.inputModal,
+.confirmModal {
   width: min(460px, 100%);
 }
 
@@ -1743,18 +1747,22 @@ select:focus {
   padding: 12px 16px;
 }
 
-.spaceModalBody {
+.spaceModalBody,
+.inputModalBody,
+.confirmModalBody {
   display: grid;
-  gap: 8px;
+  gap: 12px;
   padding: 16px;
 }
 
-.spaceModalBody label {
+.spaceModalBody label,
+.inputModalBody label {
   display: grid;
   gap: 8px;
 }
 
-.spaceModalBody label span {
+.spaceModalBody label span,
+.inputModalBody label span {
   color: var(--muted);
   font-size: 13px;
 }
@@ -1763,6 +1771,50 @@ select:focus {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
+}
+
+.confirmModalDescription {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink);
+}
+
+.confirmModalNotice {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  border-radius: 8px;
+  padding: 12px;
+  border: 1px solid #f1cddd;
+  background: #fff7fb;
+  color: #6f5265;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.confirmModalNotice.danger {
+  border-color: #efb9c0;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.confirmNoticeIcon {
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  color: var(--pink-strong);
+  flex-shrink: 0;
+}
+
+.confirmModalNotice.danger .confirmNoticeIcon {
+  color: var(--danger);
+}
+
+.confirmNoticeContent p {
+  margin: 0;
 }
 
 .fieldError {
