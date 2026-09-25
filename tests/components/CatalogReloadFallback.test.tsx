@@ -112,7 +112,7 @@ describe("Catalog reload fallback", () => {
     expect(await screen.findByText("deleted-folder")).toBeInTheDocument();
 
     // Enter the folder that will be deleted
-    fireEvent.click(screen.getByRole("button", { name: "deleted-folder" }));
+    fireEvent.doubleClick(screen.getByText("deleted-folder"));
     expect(await screen.findByText("此文件夹为空")).toBeInTheDocument();
 
     // Now update the tree on server (deleted-folder is gone, replaced with new-folder)

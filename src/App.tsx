@@ -773,13 +773,17 @@ function App() {
     }
   }
 
+  function navigateToFolder(folderId: string) {
+    setCurrentFolderId(folderId);
+    setSelectedIds(new Set());
+    setLastSelectedId(null);
+    setQuery("");
+    setSearchResults([]);
+  }
+
   function enterItem(item: DriveItem) {
     if (item.kind === "Directory") {
-      setCurrentFolderId(item.id);
-      setSelectedIds(new Set());
-      setLastSelectedId(null);
-      setQuery("");
-      setSearchResults([]);
+      navigateToFolder(item.id);
     } else {
       toggleSelection(item.id);
       void openFilePreview(item);
@@ -1372,6 +1376,9 @@ function App() {
                     onClick={() => {
                       setView("spaces");
                       setQuery("");
+                      setSearchResults([]);
+                      setSelectedIds(new Set());
+                      setLastSelectedId(null);
                     }}
                     title="空间列表"
                     aria-label="返回空间列表"
@@ -1386,7 +1393,7 @@ function App() {
                         {index > 0 && <ChevronRight aria-hidden className="crumbSeparator" />}
                         <button
                           type="button"
-                          onClick={() => setCurrentFolderId(crumb.id)}
+                          onClick={() => navigateToFolder(crumb.id)}
                           className={index === crumbs.length - 1 ? "current" : ""}
                           title={crumbPaths[index]}
                           aria-label={`${index === crumbs.length - 1 ? "当前路径" : "转到路径"}：${crumbPaths[index]}`}
