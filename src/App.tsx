@@ -145,6 +145,8 @@ function App() {
   const [manualEndpoint, setManualEndpoint] = useState("https://modelscope.cn");
   const [createSpaceOpen, setCreateSpaceOpen] = useState(false);
   const [newSpaceName, setNewSpaceName] = useState("");
+  const [newSpaceSlug, setNewSpaceSlug] = useState("");
+  const [isSlugManuallyEdited, setIsSlugManuallyEdited] = useState(false);
   const [createSpaceError, setCreateSpaceError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState("");
@@ -1369,7 +1371,23 @@ function App() {
     }
     setCreateSpaceError("");
     setNewSpaceName("");
+    setNewSpaceSlug("");
+    setIsSlugManuallyEdited(false);
     setCreateSpaceOpen(true);
+  }
+
+  function handleSpaceNameChange(val: string) {
+    setNewSpaceName(val);
+    if (!isSlugManuallyEdited) {
+      setNewSpaceSlug(nameToSafeSlug(val));
+    }
+    if (createSpaceError) setCreateSpaceError("");
+  }
+
+  function handleSpaceSlugChange(val: string) {
+    setNewSpaceSlug(val);
+    setIsSlugManuallyEdited(true);
+    if (createSpaceError) setCreateSpaceError("");
   }
 
   async function submitCreateSpace() {
@@ -1379,22 +1397,28 @@ function App() {
       setCreateSpaceError("请输入空间名称");
       return;
     }
-    const repoId = nameToSafeSlug(nameTrimmed);
+    const slugTrimmed = (newSpaceSlug.trim() || nameToSafeSlug(nameTrimmed)).toLowerCase();
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(slugTrimmed)) {
+      setCreateSpaceError("仓库标识必须以小写英文字母开头，只包含字母、数字、短横线与下划线，且不超过 32 位");
+      return;
+    }
     setBusy("创建空间");
     setMessage("");
     setCreateSpaceError("");
     try {
       await appInvoke("create_dataset_repo", {
-        name: repoId,
+        name: slugTrimmed,
         title: nameTrimmed,
         namespace: modelscopeUser.username,
-        dataset: repoId,
+        dataset: slugTrimmed,
         endpoint: manualEndpoint
       });
-      globalThis.localStorage?.setItem("lios.lastSpaceName", repoId);
+      globalThis.localStorage?.setItem("lios.lastSpaceName", slugTrimmed);
       const scopedSpace = await refreshSetup(true);
       setCreateSpaceOpen(false);
       setNewSpaceName("");
+      setNewSpaceSlug("");
+      setIsSlugManuallyEdited(false);
       if (scopedSpace) await loadSpace(scopedSpace);
     } catch (error) {
       const text = errorText(error);
@@ -1994,12 +2018,11 @@ function App() {
         <CreateSpaceModal
           open={createSpaceOpen}
           name={newSpaceName}
+          slug={newSpaceSlug}
           error={createSpaceError}
           busy={busy !== null}
-          onChangeName={(val) => {
-            setNewSpaceName(val);
-            setCreateSpaceError("");
-          }}
+          onChangeName={handleSpaceNameChange}
+          onChangeSlug={handleSpaceSlugChange}
           onClose={() => {
             setCreateSpaceOpen(false);
             setCreateSpaceError("");
