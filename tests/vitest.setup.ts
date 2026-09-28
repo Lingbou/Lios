@@ -22,3 +22,59 @@ HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
     toJSON: () => ({})
   };
 };
+
+const createMemoryStorage = (): Storage => {
+  const store = new Map<string, string>();
+  return {
+    get length(): number {
+      return store.size;
+    },
+    clear(): void {
+      store.clear();
+    },
+    getItem(key: string): string | null {
+      return store.get(key) ?? null;
+    },
+    key(index: number): string | null {
+      return Array.from(store.keys())[index] ?? null;
+    },
+    removeItem(key: string): void {
+      store.delete(key);
+    },
+    setItem(key: string, value: string): void {
+      store.set(key, String(value));
+    }
+  };
+};
+
+// Node 22+ exposes an experimental `globalThis.localStorage` that stays undefined unless
+// `--localstorage-file` is passed, and it can shadow the jsdom implementation. Read it defensively
+// and install one shared in-memory Storage so both entry points behave identically.
+const readStorage = (target: Window | typeof globalThis): Storage | undefined => {
+  try {
+    const storage = target.localStorage;
+    return storage && typeof storage.clear === "function" ? storage : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const installStorage = (target: Window | typeof globalThis, storage: Storage): void => {
+  try {
+    Object.defineProperty(target, "localStorage", {
+      value: storage,
+      configurable: true,
+      writable: true
+    });
+  } catch {
+    // ignore
+  }
+};
+
+const fallbackStorage = createMemoryStorage();
+if (!readStorage(window)) {
+  installStorage(window, fallbackStorage);
+}
+if (!readStorage(globalThis)) {
+  installStorage(globalThis, readStorage(window) ?? fallbackStorage);
+}
