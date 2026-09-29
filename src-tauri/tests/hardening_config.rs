@@ -163,6 +163,28 @@ fn package_metadata_matches_the_gpl_license_file() {
 }
 
 #[test]
+fn test_profile_keeps_optimization_low() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo = fs::read_to_string(manifest.parent().unwrap().join("Cargo.toml")).unwrap();
+    let test_profile = cargo
+        .split("[profile.test]")
+        .nth(1)
+        .and_then(|section| section.split("\n[").next())
+        .expect("Cargo.toml must define [profile.test]");
+    let package_profile = cargo
+        .split("[profile.test.package.\"*\"]")
+        .nth(1)
+        .expect("Cargo.toml must define [profile.test.package.\"*\"]");
+
+    assert!(test_profile
+        .lines()
+        .any(|line| line.trim() == "opt-level = 0"));
+    assert!(package_profile
+        .lines()
+        .any(|line| line.trim() == "opt-level = 0"));
+}
+
+#[test]
 fn linux_desktop_entry_matches_the_wayland_app_id() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let shared = read_json(&manifest.join("tauri.conf.json"));
