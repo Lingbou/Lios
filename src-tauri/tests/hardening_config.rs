@@ -108,6 +108,39 @@ fn worker_sidecar_is_generated_ephemerally_and_declared_for_bundling() {
 }
 
 #[test]
+fn ci_exercises_windows_and_supported_node_versions() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        fs::read_to_string(manifest.parent().unwrap().join(".github/workflows/ci.yml")).unwrap();
+
+    for required in [
+        "name: Windows Rust tests",
+        "runs-on: windows-latest",
+        "node-version: [\"22\", \"24\"]",
+        "node scripts/build-worker-sidecar.mjs",
+    ] {
+        assert!(workflow.contains(required), "CI must contain {required:?}");
+    }
+}
+
+#[test]
+fn test_profile_enables_debug_assertions_and_overflow_checks() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo = fs::read_to_string(manifest.parent().unwrap().join("Cargo.toml")).unwrap();
+    let profile = cargo
+        .split("[profile.test]")
+        .nth(1)
+        .expect("Cargo.toml must define [profile.test]");
+
+    for required in ["debug-assertions = true", "overflow-checks = true"] {
+        assert!(
+            profile.lines().any(|line| line.trim() == required),
+            "[profile.test] must contain {required:?}"
+        );
+    }
+}
+
+#[test]
 fn linux_desktop_entry_matches_the_wayland_app_id() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let shared = read_json(&manifest.join("tauri.conf.json"));
