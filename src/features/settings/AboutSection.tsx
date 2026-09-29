@@ -54,7 +54,7 @@ export function AboutSection({ loadVersion }: AboutSectionProps) {
         </div>
         <div>
           <dt>许可证</dt>
-          <dd>MIT</dd>
+          <dd>GPL-3.0</dd>
         </div>
         <div>
           <dt>GitHub</dt>

@@ -44,7 +44,7 @@ extended-description = "Headless Linux client for browsing and operating a Lios 
 [package.metadata.generate-rpm]
 name = "lios-cli"
 summary = "Headless Lios encrypted-drive client"
-license = "MIT"
+license = "GPL-3.0-only"
 assets = [
   { source = "target/release/lios", dest = "/usr/bin/lios", mode = "0755" },
   { source = "target/release/lios-worker", dest = "/usr/bin/lios-worker", mode = "0755" },

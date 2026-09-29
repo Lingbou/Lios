@@ -141,6 +141,28 @@ fn test_profile_enables_debug_assertions_and_overflow_checks() {
 }
 
 #[test]
+fn package_metadata_matches_the_gpl_license_file() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repository = manifest.parent().unwrap();
+    let license = fs::read_to_string(repository.join("LICENSE")).unwrap();
+    let workspace = fs::read_to_string(repository.join("Cargo.toml")).unwrap();
+    let cli = fs::read_to_string(repository.join("crates/lios-cli/Cargo.toml")).unwrap();
+    let package = read_json(&repository.join("package.json"));
+    let lock = read_json(&repository.join("package-lock.json"));
+
+    assert!(license.contains("GNU GENERAL PUBLIC LICENSE"));
+    assert!(license.contains("Version 3, 29 June 2007"));
+    assert!(workspace
+        .lines()
+        .any(|line| line.trim() == "license = \"GPL-3.0-only\""));
+    assert!(cli
+        .lines()
+        .any(|line| line.trim() == "license = \"GPL-3.0-only\""));
+    assert_eq!(package["license"], "GPL-3.0-only");
+    assert_eq!(lock["packages"][""]["license"], "GPL-3.0-only");
+}
+
+#[test]
 fn linux_desktop_entry_matches_the_wayland_app_id() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let shared = read_json(&manifest.join("tauri.conf.json"));
