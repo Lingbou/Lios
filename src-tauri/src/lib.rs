@@ -3204,10 +3204,11 @@ mod remote_verification_tests {
             .get(task.id)
             .unwrap()
             .unwrap();
+        let expected_warning = format!("{} staging cleanup failed", spec.label());
         assert!(stored
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("verification staging cleanup failed")));
+            .is_some_and(|error| error.contains(&expected_warning)));
     }
 
     #[tokio::test]
