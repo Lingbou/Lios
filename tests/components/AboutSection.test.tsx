@@ -12,7 +12,7 @@ describe("AboutSection", () => {
     expect(screen.getByRole("heading", { name: "关于 Lios" })).toBeInTheDocument();
     expect(await screen.findByText("v0.1.0")).toBeInTheDocument();
     expect(screen.getByText("干翻百度网盘")).toBeInTheDocument();
-    expect(screen.getByText("MIT")).toBeInTheDocument();
+    expect(screen.getByText("GPL-3.0")).toBeInTheDocument();
     expect(screen.getByText("GitHub")).toBeInTheDocument();
     expect(screen.getByText("Lingbou")).toHaveAttribute("title", "https://github.com/Lingbou");
     expect(screen.queryByText("Desktop 与 CLI 使用同一版本号")).not.toBeInTheDocument();
@@ -25,6 +25,6 @@ describe("AboutSection", () => {
     render(<AboutSection loadVersion={loadVersion} />);
 
     expect(await screen.findByText("版本未知")).toBeInTheDocument();
-    expect(screen.getByText("MIT")).toBeInTheDocument();
+    expect(screen.getByText("GPL-3.0")).toBeInTheDocument();
   });
 });
