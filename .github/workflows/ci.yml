@@ -37,6 +37,11 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
           rustup default "$RUST_VERSION"
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+
       - name: Install Linux build dependencies
         shell: bash
         run: |
@@ -109,7 +114,6 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: npm
 
       - name: Set up Rust
         shell: bash
@@ -117,14 +121,13 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
           rustup default "$RUST_VERSION"
 
-      - name: Install frontend dependencies
-        run: npm ci
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
 
       - name: Prepare worker sidecar for Cargo checks
         run: node scripts/build-worker-sidecar.mjs
-
-      - name: Lint Rust workspace
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Test Rust workspace
         run: cargo test --workspace --locked

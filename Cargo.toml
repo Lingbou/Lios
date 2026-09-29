@@ -22,5 +22,9 @@ overflow-checks = false
 opt-level = 3
 
 [profile.test]
+opt-level = 0
 debug-assertions = true
 overflow-checks = true
+
+[profile.test.package."*"]
+opt-level = 0
