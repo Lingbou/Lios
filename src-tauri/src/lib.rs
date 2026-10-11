@@ -12,10 +12,9 @@ mod task_center;
 mod build_support;
 
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
 
 use app_log::AppLogger;
 use catalog_mutation_gate::CatalogMutationGate;
@@ -755,63 +754,7 @@ fn submit_transfer_and_spawn(
 }
 
 fn start_shared_worker(paths: &LiosPaths) -> CommandResult<()> {
-    if paths.worker_running().map_err(CommandError::from)? {
-        return Ok(());
-    }
-    let _ = fs::remove_file(paths.worker_stop_path());
-    paths.ensure_worker_control_dir()?;
-    let current = std::env::current_exe().map_err(to_err)?;
-    let extension = current.extension().map(|value| value.to_os_string());
-    let mut worker = current.with_file_name("lios-worker");
-    if let Some(extension) = extension {
-        worker.set_extension(extension);
-    }
-    if !worker.is_file() {
-        return Err(CommandError::new(
-            CommandErrorCode::Storage,
-            "lios-worker is missing from the Desktop installation",
-            false,
-            None,
-        ));
-    }
-    let home_root = paths.home.parent().ok_or_else(|| {
-        CommandError::new(
-            CommandErrorCode::Storage,
-            "Lios Home has no parent directory for worker startup",
-            false,
-            None,
-        )
-    })?;
-    let stdout = open_worker_log(paths)?;
-    let stderr = stdout.try_clone().map_err(to_err)?;
-    let mut child = ProcessCommand::new(worker)
-        .arg("--home")
-        .arg(home_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .map_err(to_err)?;
-    let log_path = paths.logs.join("lios-worker.log");
-    std::thread::spawn(move || {
-        let message = match child.wait() {
-            Ok(status) => format!("lios-worker exited: {status}"),
-            Err(error) => format!("failed to wait for lios-worker: {error}"),
-        };
-        if let Ok(mut log) = OpenOptions::new().create(true).append(true).open(log_path) {
-            let _ = writeln!(log, "{message}");
-        }
-    });
-    Ok(())
-}
-
-fn open_worker_log(paths: &LiosPaths) -> CommandResult<fs::File> {
-    fs::create_dir_all(&paths.logs).map_err(to_err)?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.logs.join("lios-worker.log"))
-        .map_err(to_err)
+    lios_application::worker_supervisor::spawn_shared_worker(paths, true)
 }
 
 fn recover_startup_tasks(paths: &LiosPaths) -> CommandResult<StartupTaskRecovery> {
