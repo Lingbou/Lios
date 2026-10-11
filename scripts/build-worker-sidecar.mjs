@@ -56,3 +56,9 @@ const destination = path.join(
 );
 await mkdir(path.dirname(destination), { recursive: true });
 await cp(source, destination);
+if (artifactTarget.includes("windows")) {
+  const msvc = path.join(root, "src-tauri", "binaries", "lios-worker-x86_64-pc-windows-msvc.exe");
+  const gnu = path.join(root, "src-tauri", "binaries", "lios-worker-x86_64-pc-windows-gnu.exe");
+  if (destination !== msvc) await cp(source, msvc);
+  if (destination !== gnu) await cp(source, gnu);
+}
