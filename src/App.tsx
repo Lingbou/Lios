@@ -1556,13 +1556,6 @@ function App() {
       <main className="driveShell">
         <aside className="spaceRail">
           <div className="railHeader">
-            <div className="railBrand">
-              <img src={liosPetalMark} alt="" className="railBrandLogo" />
-              <div className="railBrandText">
-                <span className="railBrandTitle">Lios</span>
-                <span className="railBrandSubtitle">Desktop Drive</span>
-              </div>
-            </div>
 
             <div className="accountSection">
               <button

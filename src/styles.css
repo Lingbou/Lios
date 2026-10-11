@@ -663,44 +663,78 @@ select:focus {
 
 .driveToolbar {
   min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-rows: auto auto;
-  gap: 8px 10px;
+  display: flex;
   align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 0 6px;
 }
 
 .toolbar {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
+  display: inline-flex;
+  gap: 6px;
   align-items: center;
 }
 
 .toolbarPrimary {
-  grid-column: 1;
-  grid-row: 1;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
 }
 
 .toolbarActions {
-  grid-column: 1;
-  grid-row: 2;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  flex: 1 1 auto;
   min-width: 0;
-  flex-wrap: nowrap;
+}
+
+.toolbar button {
+  min-height: 32px;
+  height: 32px;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 500;
+  gap: 6px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.88);
+  box-shadow: 0 1px 2px rgba(185, 92, 136, 0.04);
+  transition: all 120ms ease;
+}
+
+.toolbar button svg {
+  width: 15px;
+  height: 15px;
+}
+
+.toolbar button:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  background: #ffffff;
+  color: var(--pink-strong);
+  box-shadow: 0 2px 6px rgba(185, 92, 136, 0.1);
+}
+
+.toolbar button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
 }
 
 .primary {
   border-color: var(--pink-strong);
   background: linear-gradient(135deg, var(--pink), var(--pink-strong));
   color: #ffffff;
-  box-shadow: 0 6px 16px rgba(217, 79, 149, 0.28);
+  font-weight: 600;
+  box-shadow: 0 4px 12px rgba(217, 79, 149, 0.28);
 }
 
 .primary:hover:not(:disabled) {
   border-color: #bf3a80;
   background: linear-gradient(135deg, var(--pink-strong), #bf3a80);
   color: #ffffff;
-  box-shadow: 0 6px 20px rgba(217, 79, 149, 0.38);
+  box-shadow: 0 5px 16px rgba(217, 79, 149, 0.38);
 }
 
 .danger {
@@ -712,6 +746,82 @@ select:focus {
 .danger:hover:not(:disabled) {
   border-color: var(--danger);
   background: #fee2e2;
+}
+
+.toolbarDivider {
+  width: 1px;
+  height: 18px;
+  background: var(--line);
+  margin: 0 2px;
+  flex: 0 0 auto;
+}
+
+.selectionBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px 3px 10px;
+  background: var(--pink-weak);
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--pink-strong);
+  white-space: nowrap;
+}
+
+.clearSelectionBtn {
+  min-height: 0;
+  height: auto;
+  padding: 1px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.clearSelectionBtn:hover {
+  background: rgba(217, 79, 149, 0.12);
+  color: var(--pink-strong);
+}
+
+.viewModeSegment {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  background: rgba(255, 240, 248, 0.7);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.viewModeBtn {
+  width: 28px;
+  min-height: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  box-shadow: none;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.viewModeBtn:hover:not(:disabled) {
+  color: var(--pink-strong);
+  background: rgba(255, 255, 255, 0.8);
+}
+
+.viewModeBtn.active {
+  background: #ffffff;
+  color: var(--pink-strong);
+  box-shadow: 0 1px 3px rgba(185, 92, 136, 0.18);
 }
 
 .fileSurface,
@@ -1394,11 +1504,12 @@ input[type="checkbox"]:indeterminate::after {
 
 .taskRows {
   min-height: 0;
-  overflow: auto;
-  display: grid;
-  align-content: start;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
-  padding: 10px;
+  padding: 8px 10px;
 }
 
 .taskEmpty {
@@ -1410,6 +1521,8 @@ input[type="checkbox"]:indeterminate::after {
 
 .taskRow {
   min-width: 0;
+  min-height: 52px;
+  flex-shrink: 0;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1418,11 +1531,12 @@ input[type="checkbox"]:indeterminate::after {
 
 .taskSummary {
   min-width: 0;
+  min-height: 50px;
   display: grid;
   grid-template-columns: 30px 30px minmax(0, 1fr) minmax(160px, 280px) auto;
   align-items: center;
   gap: 10px;
-  padding: 10px;
+  padding: 6px 10px;
 }
 
 .taskExpandButton {
