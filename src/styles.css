@@ -1,37 +1,38 @@
 :root {
-  color: #0f172a;
-  background: #f8fafc;
-  --ink: #0f172a;
-  --ink-secondary: #334155;
-  --muted: #64748b;
-  --muted-light: #94a3b8;
-  --surface: #f8fafc;
-  --surface-subtle: #f1f5f9;
+  color: #3b2b38;
+  background: #fff6fb;
+  --ink: #3b2b38;
+  --ink-secondary: #6b5364;
+  --muted: #846b7b;
+  --muted-light: #ab95a3;
+  --surface: #fffafd;
+  --surface-subtle: #fff1f8;
   --surface-strong: #ffffff;
-  --surface-hover: #f1f5f9;
-  --line: #e2e8f0;
-  --line-strong: #cbd5e1;
-  --accent-weak: #eff6ff;
-  --accent-soft: #dbeafe;
-  --accent: #2563eb;
-  --accent-strong: #1d4ed8;
-  --pink-weak: var(--accent-weak);
-  --pink-soft: var(--accent-soft);
-  --pink: var(--accent);
-  --pink-strong: var(--accent-strong);
-  --crystal: #0ea5e9;
-  --crystal-soft: #f0f9ff;
-  --gold: #d97706;
-  --gold-soft: #fef3c7;
-  --danger: #dc2626;
-  --danger-soft: #fef2f2;
-  --success: #16a34a;
-  --success-soft: #f0fdf4;
-  --shadow-sm: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
-  --shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.07), 0 2px 4px -2px rgba(15, 23, 42, 0.05);
-  --shadow-md: 0 10px 15px -3px rgba(15, 23, 42, 0.08), 0 4px 6px -4px rgba(15, 23, 42, 0.04);
-  --shadow-lg: 0 20px 25px -5px rgba(15, 23, 42, 0.1), 0 8px 10px -6px rgba(15, 23, 42, 0.05);
-  --shadow-modal: 0 25px 50px -12px rgba(15, 23, 42, 0.25);
+  --surface-hover: #fdf0f7;
+  --line: #efd4e4;
+  --line-strong: #e7aacb;
+  --line-subtle: #f8eaf2;
+  --accent-weak: #fff0f7;
+  --accent-soft: #ffd9eb;
+  --accent: #e86ea8;
+  --accent-strong: #d94f95;
+  --pink-weak: #fff0f7;
+  --pink-soft: #ffd9eb;
+  --pink: #e86ea8;
+  --pink-strong: #d94f95;
+  --crystal: #8fd6e8;
+  --crystal-soft: #eefaff;
+  --gold: #d9a84e;
+  --gold-soft: #fef8eb;
+  --danger: #b84a5c;
+  --danger-soft: #fff0f1;
+  --success: #2ea879;
+  --success-soft: #edf9f4;
+  --shadow-sm: 0 1px 3px 0 rgba(185, 92, 136, 0.08);
+  --shadow: 0 6px 16px -2px rgba(185, 92, 136, 0.12), 0 2px 4px -2px rgba(185, 92, 136, 0.06);
+  --shadow-md: 0 12px 24px -4px rgba(185, 92, 136, 0.16), 0 4px 6px -4px rgba(185, 92, 136, 0.08);
+  --shadow-lg: 0 20px 32px -6px rgba(185, 92, 136, 0.2), 0 8px 10px -6px rgba(185, 92, 136, 0.08);
+  --shadow-modal: 0 25px 50px -12px rgba(145, 62, 106, 0.32);
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -78,9 +79,9 @@ button {
 }
 
 button:hover:not(:disabled) {
-  border-color: var(--line-strong);
+  border-color: var(--pink);
+  color: var(--pink-strong);
   background: var(--surface-hover);
-  color: var(--ink);
 }
 
 button:disabled {
@@ -108,8 +109,8 @@ select {
 input:focus,
 select:focus {
   outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+  border-color: var(--pink);
+  box-shadow: 0 0 0 3px rgba(232, 110, 168, 0.2);
 }
 
 .appFrame {
@@ -120,7 +121,9 @@ select:focus {
   overflow: hidden;
   display: grid;
   grid-template-rows: 36px minmax(0, 1fr);
-  background: var(--surface);
+  background:
+    linear-gradient(145deg, rgba(255, 216, 237, 0.74) 0%, rgba(255, 251, 253, 0.94) 34%, rgba(239, 250, 255, 0.9) 100%),
+    #fff6fb;
 }
 
 .windowTitlebar {
@@ -128,8 +131,8 @@ select:focus {
   min-height: 0;
   display: flex;
   align-items: center;
-  border-bottom: 1px solid var(--line);
-  background: var(--surface-strong);
+  border-bottom: 1px solid rgba(239, 212, 228, 0.86);
+  background: rgba(255, 250, 253, 0.88);
   user-select: none;
   -webkit-user-select: none;
 }
@@ -149,7 +152,7 @@ select:focus {
 .windowTitle img {
   width: 20px;
   height: 20px;
-  filter: none;
+  filter: drop-shadow(0 4px 8px rgba(232, 110, 168, 0.25));
 }
 
 .windowDragRegion {
@@ -172,8 +175,8 @@ select:focus {
 
 .titlebarAction:hover:not(:disabled),
 .titlebarAction.active {
-  background: var(--surface-subtle);
-  color: var(--ink);
+  background: rgba(255, 226, 240, 0.9);
+  color: var(--pink-strong);
 }
 
 .titlebarAction svg {
@@ -199,8 +202,8 @@ select:focus {
 }
 
 .windowControls button:hover:not(:disabled) {
-  background: var(--surface-subtle);
-  color: var(--ink);
+  background: rgba(255, 226, 240, 0.9);
+  color: var(--pink-strong);
 }
 
 .windowControls .closeWindow:hover:not(:disabled) {
@@ -220,7 +223,21 @@ select:focus {
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr);
   overflow: hidden;
-  background: var(--surface);
+  background:
+    linear-gradient(145deg, rgba(255, 216, 237, 0.74) 0%, rgba(255, 251, 253, 0.94) 34%, rgba(239, 250, 255, 0.9) 100%),
+    #fff6fb;
+}
+
+.driveShell::before {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  content: "";
+  background-image:
+    linear-gradient(120deg, rgba(232, 110, 168, 0.08) 0 1px, transparent 1px 96px),
+    linear-gradient(30deg, rgba(143, 214, 232, 0.09) 0 1px, transparent 1px 112px);
+  opacity: 0.8;
 }
 
 .driveShell > * {
@@ -234,7 +251,9 @@ select:focus {
   height: 100%;
   overflow: hidden;
   padding: 16px 12px;
-  background: #f8fafc;
+  background:
+    linear-gradient(180deg, rgba(255, 250, 253, 0.96), rgba(255, 241, 248, 0.92)),
+    var(--surface);
   border-right: 1px solid var(--line);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
@@ -267,14 +286,14 @@ select:focus {
 }
 
 .accountItem.active {
-  background: var(--surface-strong);
-  border-color: var(--accent);
-  box-shadow: var(--shadow-sm);
+  background: linear-gradient(135deg, #fff0f8, #f7fcff);
+  border-color: rgba(232, 110, 168, 0.52);
+  box-shadow: 0 4px 12px rgba(185, 92, 136, 0.12);
 }
 
 .accountItem.empty {
-  border-color: var(--line);
-  background: var(--surface-subtle);
+  border-color: rgba(232, 110, 168, 0.35);
+  background: linear-gradient(135deg, #fff3fa, #fffaf1);
 }
 
 .accountItem span,
@@ -671,16 +690,17 @@ select:focus {
 }
 
 .primary {
-  border-color: var(--accent);
-  background: var(--accent);
+  border-color: var(--pink-strong);
+  background: linear-gradient(135deg, var(--pink), var(--pink-strong));
   color: #ffffff;
-  box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
+  box-shadow: 0 6px 16px rgba(217, 79, 149, 0.28);
 }
 
 .primary:hover:not(:disabled) {
-  border-color: var(--accent-strong);
-  background: var(--accent-strong);
+  border-color: #bf3a80;
+  background: linear-gradient(135deg, var(--pink-strong), #bf3a80);
   color: #ffffff;
+  box-shadow: 0 6px 20px rgba(217, 79, 149, 0.38);
 }
 
 .danger {
@@ -697,10 +717,10 @@ select:focus {
 .fileSurface,
 .spaceSurface,
 .settingsBlock {
-  background: var(--surface-strong);
+  background: rgba(255, 255, 255, 0.88);
   border: 1px solid var(--line);
   border-radius: 8px;
-  box-shadow: var(--shadow-sm);
+  box-shadow: 0 10px 24px rgba(185, 92, 136, 0.08);
 }
 
 .fileSurface,
