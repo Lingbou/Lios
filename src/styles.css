@@ -722,6 +722,7 @@ select:focus {
   box-shadow: none;
 }
 
+.toolbar button.primary,
 .primary {
   border-color: var(--pink-strong);
   background: linear-gradient(135deg, var(--pink), var(--pink-strong));
@@ -730,6 +731,7 @@ select:focus {
   box-shadow: 0 4px 12px rgba(217, 79, 149, 0.28);
 }
 
+.toolbar button.primary:hover:not(:disabled),
 .primary:hover:not(:disabled) {
   border-color: #bf3a80;
   background: linear-gradient(135deg, var(--pink-strong), #bf3a80);
@@ -737,15 +739,26 @@ select:focus {
   box-shadow: 0 5px 16px rgba(217, 79, 149, 0.38);
 }
 
+.toolbar button.primary:disabled,
+.primary:disabled {
+  background: rgba(217, 79, 149, 0.35);
+  border-color: rgba(217, 79, 149, 0.3);
+  color: rgba(255, 255, 255, 0.85);
+  box-shadow: none;
+}
+
+.toolbar button.danger,
 .danger {
   border-color: #fecaca;
   background: var(--danger-soft);
   color: var(--danger);
 }
 
+.toolbar button.danger:hover:not(:disabled),
 .danger:hover:not(:disabled) {
   border-color: var(--danger);
   background: #fee2e2;
+  color: var(--danger);
 }
 
 .toolbarDivider {

@@ -562,6 +562,33 @@ impl Application {
             .await
     }
 
+    fn is_staged_file_valid(
+        local_path: &std::path::Path,
+        file: &lios_core::catalog::CatalogRemoteFile,
+    ) -> bool {
+        if !local_path.is_file() {
+            return false;
+        }
+        let expected_size = match file.expected_size {
+            Some(size) => size,
+            None => return false,
+        };
+        let meta = match local_path.metadata() {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        if meta.len() != expected_size {
+            return false;
+        }
+        if let Some(expected_sha256) = &file.sha256 {
+            crate::sha256_hex_file(local_path)
+                .map(|sha| sha.eq_ignore_ascii_case(expected_sha256))
+                .unwrap_or(false)
+        } else {
+            true
+        }
+    }
+
     async fn run_persisted_pull(
         &self,
         paths: &LiosPaths,
@@ -588,62 +615,6 @@ impl Application {
         }
         let catalog = Catalog::from_staging(paths.staging.clone());
         let mut journal = transfer_journal(paths, task.id)?;
-        let node_ids = plan
-            .actions
-            .iter()
-            .filter(|action| !transfer_action_finished(&journal, action))
-            .filter(|action| action.entry_kind == TransferEntryKind::File)
-            .filter(|action| {
-                !matches!(
-                    action.kind,
-                    TransferActionKind::Skip | TransferActionKind::Delete
-                )
-            })
-            .filter_map(|action| action.remote_node_id.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let has_downloads = !node_ids.is_empty();
-        let selection = CatalogSelection::Nodes(node_ids);
-        let remote_files = catalog
-            .remote_files_for_selection(&selection, &key)
-            .map_err(to_err)?;
-        if has_downloads {
-            TaskStore::open(&paths.database)
-                .map_err(to_err)?
-                .update_phase(task.id, Some("downloading".to_string()))
-                .map_err(to_err)?;
-            let download_actions = plan
-                .actions
-                .iter()
-                .filter(|action| {
-                    !transfer_action_finished(&journal, action)
-                        && action.entry_kind == TransferEntryKind::File
-                        && !matches!(
-                            action.kind,
-                            TransferActionKind::Skip | TransferActionKind::Delete
-                        )
-                })
-                .collect::<Vec<_>>();
-            for action in download_actions {
-                mark_transfer_item(
-                    paths,
-                    &mut journal,
-                    action,
-                    TaskItemState::Running,
-                    Some("downloading"),
-                    false,
-                    None,
-                )?;
-            }
-        }
-        for file in &remote_files {
-            let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
-            adapter
-                .download_object(&repo.namespace, &repo.dataset, &file.path, &local_path)
-                .await
-                .map_err(to_err)?;
-        }
 
         let total = u64::try_from(plan.actions.len()).map_err(|_| {
             CommandError::new(
@@ -690,6 +661,224 @@ impl Application {
             .iter()
             .filter(|action| transfer_action_finished(&journal, action))
             .count();
+
+        let node_ids = plan
+            .actions
+            .iter()
+            .filter(|action| !transfer_action_finished(&journal, action))
+            .filter(|action| action.entry_kind == TransferEntryKind::File)
+            .filter(|action| {
+                !matches!(
+                    action.kind,
+                    TransferActionKind::Skip | TransferActionKind::Delete
+                )
+            })
+            .filter_map(|action| action.remote_node_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let has_downloads = !node_ids.is_empty();
+        let selection = CatalogSelection::Nodes(node_ids);
+        let remote_files = catalog
+            .remote_files_for_selection(&selection, &key)
+            .map_err(to_err)?;
+
+        let download_actions = plan
+            .actions
+            .iter()
+            .filter(|action| {
+                !transfer_action_finished(&journal, action)
+                    && action.entry_kind == TransferEntryKind::File
+                    && !matches!(
+                        action.kind,
+                        TransferActionKind::Skip | TransferActionKind::Delete
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        if has_downloads {
+            let store = TaskStore::open(&paths.database).map_err(to_err)?;
+            store
+                .update_phase(task.id, Some("downloading".to_string()))
+                .map_err(to_err)?;
+            store
+                .update_transfer(
+                    task.id,
+                    u64::try_from(completed).unwrap_or(0),
+                    total,
+                    bytes_done,
+                    bytes_total,
+                    0,
+                )
+                .map_err(to_err)?;
+
+            for action in &download_actions {
+                mark_transfer_item(
+                    paths,
+                    &mut journal,
+                    action,
+                    TaskItemState::Running,
+                    Some("downloading"),
+                    false,
+                    None,
+                )?;
+            }
+
+            let mut path_to_action: HashMap<String, String> = HashMap::new();
+            for action in &download_actions {
+                if let Some(node_id) = &action.remote_node_id {
+                    if let Ok(files) = catalog
+                        .remote_files_for_selection(&CatalogSelection::Node(node_id.clone()), &key)
+                    {
+                        for f in files {
+                            path_to_action.insert(f.path, action.relative_path.clone());
+                        }
+                    }
+                }
+            }
+
+            let total_remote_bytes: u64 = remote_files
+                .iter()
+                .map(|f| f.expected_size.unwrap_or(0))
+                .sum();
+            let mut downloaded_remote_bytes: u64 = 0;
+            let mut metrics = crate::task_support::TransferMetrics::new();
+
+            for file in &remote_files {
+                if paths.worker_cancel_path(task.id).exists()
+                    || paths.worker_pause_path(task.id).exists()
+                {
+                    return Err(CommandError::new(
+                        CommandErrorCode::Internal,
+                        "download interrupted by user",
+                        true,
+                        None,
+                    ));
+                }
+
+                let local_path = remote_to_staging_path(&paths.staging, &file.path)?;
+                let file_expected_size = file.expected_size.unwrap_or(0);
+                let action_rel_path = path_to_action
+                    .get(&file.path)
+                    .cloned()
+                    .or_else(|| download_actions.first().map(|a| a.relative_path.clone()));
+
+                if Self::is_staged_file_valid(&local_path, file) {
+                    downloaded_remote_bytes =
+                        downloaded_remote_bytes.saturating_add(file_expected_size);
+                    let current_bytes_done = if total_remote_bytes > 0 && bytes_total > 0 {
+                        ((downloaded_remote_bytes as u128 * bytes_total as u128)
+                            / total_remote_bytes as u128) as u64
+                    } else {
+                        downloaded_remote_bytes
+                    }
+                    .min(bytes_total);
+
+                    let observation = metrics.observe(current_bytes_done, bytes_total, false);
+                    if observation.should_publish {
+                        let _ = store.update_transfer(
+                            task.id,
+                            u64::try_from(completed).unwrap_or(0),
+                            total,
+                            current_bytes_done,
+                            bytes_total,
+                            observation.speed_bps,
+                        );
+                        let _ = store.update_eta(task.id, observation.eta_seconds);
+                        if let Some(rel_path) = &action_rel_path {
+                            if let Some(item) = journal.get_mut(rel_path) {
+                                if download_actions.len() == 1 {
+                                    item.bytes_done = current_bytes_done.min(item.bytes_total);
+                                } else {
+                                    item.bytes_done = item
+                                        .bytes_done
+                                        .saturating_add(file_expected_size)
+                                        .min(item.bytes_total);
+                                }
+                                let _ = store.upsert_item(item);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                let file_base_remote_bytes = downloaded_remote_bytes;
+                let mut last_written = 0u64;
+
+                adapter
+                    .download_object_with_progress(
+                        &repo.namespace,
+                        &repo.dataset,
+                        &file.path,
+                        &local_path,
+                        |written| {
+                            let delta = written.saturating_sub(last_written);
+                            last_written = written;
+                            let current_remote_bytes =
+                                file_base_remote_bytes.saturating_add(written);
+                            let current_bytes_done = if total_remote_bytes > 0 && bytes_total > 0 {
+                                ((current_remote_bytes as u128 * bytes_total as u128)
+                                    / total_remote_bytes as u128)
+                                    as u64
+                            } else {
+                                current_remote_bytes
+                            }
+                            .min(bytes_total);
+
+                            let observation =
+                                metrics.observe(current_bytes_done, bytes_total, false);
+                            if observation.should_publish {
+                                let _ = store.update_transfer(
+                                    task.id,
+                                    u64::try_from(completed).unwrap_or(0),
+                                    total,
+                                    current_bytes_done,
+                                    bytes_total,
+                                    observation.speed_bps,
+                                );
+                                let _ = store.update_eta(task.id, observation.eta_seconds);
+                                if let Some(rel_path) = &action_rel_path {
+                                    if let Some(item) = journal.get_mut(rel_path) {
+                                        if download_actions.len() == 1 {
+                                            item.bytes_done =
+                                                current_bytes_done.min(item.bytes_total);
+                                        } else {
+                                            item.bytes_done = item
+                                                .bytes_done
+                                                .saturating_add(delta)
+                                                .min(item.bytes_total);
+                                        }
+                                        let _ = store.upsert_item(item);
+                                    }
+                                }
+                            }
+                        },
+                    )
+                    .await
+                    .map_err(to_err)?;
+
+                downloaded_remote_bytes =
+                    downloaded_remote_bytes.saturating_add(last_written.max(file_expected_size));
+            }
+
+            let final_download_bytes = bytes_total;
+            let observation = metrics.observe(final_download_bytes, bytes_total, true);
+            let _ = store.update_transfer(
+                task.id,
+                u64::try_from(completed).unwrap_or(0),
+                total,
+                final_download_bytes,
+                bytes_total,
+                observation.speed_bps,
+            );
+            let _ = store.update_eta(task.id, None);
+            for action in &download_actions {
+                if let Some(item) = journal.get_mut(&action.relative_path) {
+                    item.bytes_done = item.bytes_total;
+                    let _ = store.upsert_item(item);
+                }
+            }
+        }
         for action in ordered_actions {
             if transfer_action_finished(&journal, action) {
                 continue;
@@ -1745,5 +1934,46 @@ mod tests {
         delete_local_destination(&child_action).unwrap();
         validate_local_destination_fingerprint(&parent_action).unwrap();
         delete_local_destination(&parent_action).unwrap();
+    }
+    #[test]
+    fn staged_file_validity_verifies_size_and_sha256() {
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join("chunk.lios");
+        std::fs::write(&file_path, b"test chunk content").unwrap();
+        let sha = crate::sha256_hex_file(&file_path).unwrap();
+
+        let remote = lios_core::catalog::CatalogRemoteFile {
+            path: "chunks/test.lios".to_string(),
+            expected_size: Some(18),
+            sha256: Some(sha.clone()),
+        };
+        assert!(super::Application::is_staged_file_valid(
+            &file_path, &remote
+        ));
+
+        let wrong_size = lios_core::catalog::CatalogRemoteFile {
+            path: "chunks/test.lios".to_string(),
+            expected_size: Some(10),
+            sha256: Some(sha.clone()),
+        };
+        assert!(!super::Application::is_staged_file_valid(
+            &file_path,
+            &wrong_size
+        ));
+
+        let wrong_sha = lios_core::catalog::CatalogRemoteFile {
+            path: "chunks/test.lios".to_string(),
+            expected_size: Some(18),
+            sha256: Some("badhash".to_string()),
+        };
+        assert!(!super::Application::is_staged_file_valid(
+            &file_path, &wrong_sha
+        ));
+
+        let missing_path = temp.path().join("nonexistent.lios");
+        assert!(!super::Application::is_staged_file_valid(
+            &missing_path,
+            &remote
+        ));
     }
 }
