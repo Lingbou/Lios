@@ -34,7 +34,7 @@ jobs:
       - name: Set up Rust
         shell: bash
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt --target x86_64-unknown-linux-musl
           rustup default "$RUST_VERSION"
 
       - name: Cache Rust build artifacts
@@ -54,6 +54,7 @@ jobs:
             libssl-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
+            musl-tools \
             patchelf
 
       - name: Install frontend dependencies
@@ -71,6 +72,8 @@ jobs:
       - name: Lint Rust workspace
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+      - name: Verify static Linux CLI (musl target)
+        run: cargo check --locked -p lios-cli -p lios-core -p lios-application --target x86_64-unknown-linux-musl
       - name: Test Rust workspace
         run: cargo test --workspace --locked
 
