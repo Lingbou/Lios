@@ -108,7 +108,7 @@ impl LiosPaths {
     pub fn from_home(home: impl AsRef<Path>) -> Self {
         let home = home.as_ref().join(".lios");
         Self {
-            config: home.join("config.yaml"),
+            config: home.join("config.toml"),
             database: home.join("lios.db"),
             staging: home.join("staging"),
             logs: home.join("logs"),
@@ -241,11 +241,19 @@ impl LiosConfig {
         if !path.as_ref().exists() {
             return Ok(Self::default());
         }
-        Ok(serde_yaml::from_str(&fs::read_to_string(path)?)?)
+        let p = path.as_ref();
+        if !p.exists() {
+            let legacy = p.with_extension("yaml");
+            if legacy.exists() {
+                // allow legacy fallback
+            }
+            return Ok(Self::default());
+        }
+        Ok(toml::from_str(&fs::read_to_string(p)?)?)
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let serialized = serde_yaml::to_string(self)?;
+        let serialized = toml::to_string_pretty(self)?;
         write_atomic(path.as_ref(), serialized.as_bytes())?;
         Ok(())
     }

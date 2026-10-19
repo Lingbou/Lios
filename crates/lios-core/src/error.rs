@@ -65,8 +65,10 @@ pub enum LiosError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("YAML error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    #[error("TOML deserialization error: {0}")]
+    TomlDe(#[from] toml::de::Error),
+    #[error("TOML serialization error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("walkdir error: {0}")]
