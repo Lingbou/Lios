@@ -62,15 +62,3 @@ pub fn sha256_hex_file(path: &Path) -> CommandResult<String> {
 
 pub use service::{CatalogMutationGate, ConfigMutationGate};
 pub use transfer_request::{prepare_download_task, PreparedDownload};
-
-pub mod catalog_mutation_gate {
-    pub use crate::service::CatalogMutationGate;
-}
-
-pub mod config_mutation_gate {
-    pub use crate::service::ConfigMutationGate;
-}
-
-pub mod download_service {
-    pub use crate::transfer_request::{prepare_download_task, PreparedDownload};
-}

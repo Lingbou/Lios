@@ -549,7 +549,7 @@ mod catalog_transaction_integration_tests {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         paths.ensure_dirs().unwrap();
-        let key = KeyFile::generate_to_path(temp.path().join("key.yaml")).unwrap();
+        let key = KeyFile::generate_to_path(temp.path().join("recovery.key")).unwrap();
         let catalog = Catalog::initialize_empty("Space", &key, paths.staging.clone()).unwrap();
         let expected_hash = sha256_hex_file(&paths.staging.join(CATALOG_FILE)).unwrap();
 
@@ -1293,7 +1293,7 @@ mod catalog_rebuild_command_tests {
         let temp = tempdir().unwrap();
         let paths = LiosPaths::from_home(temp.path());
         paths.ensure_dirs().unwrap();
-        let key = KeyFile::generate_to_path(temp.path().join("key.yaml")).unwrap();
+        let key = KeyFile::generate_to_path(temp.path().join("recovery.key")).unwrap();
         let catalog = Catalog::initialize_empty("Recovered", &key, paths.staging.clone()).unwrap();
         let mut remote = catalog
             .remote_files_for_selection(&CatalogSelection::All, &key)

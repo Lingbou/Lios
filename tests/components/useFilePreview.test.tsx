@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { useFilePreview } from "../../src/features/drive/useFilePreview.ts";
 import type { DriveItem, SpaceSummary } from "../../src/appTypes.ts";
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), isTauri: () => true }));
 
 const mockSpace: SpaceSummary = {
   space_name: "test-space",

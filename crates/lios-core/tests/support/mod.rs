@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use lios_core::catalog::{Catalog, ConflictResolution, PackOutcome, PackReport};
+use lios_core::catalog::{PackOptions, PackProgress};
 use lios_core::crypto::KeyFile;
-use lios_core::pack::{PackOptions, PackProgress};
 use lios_core::{LiosError, Result};
 
 fn into_catalog(outcome: PackOutcome) -> Result<Catalog> {

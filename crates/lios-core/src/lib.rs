@@ -19,11 +19,3 @@ pub mod tasks;
 pub use error::{LiosError, RemoteError, RemoteErrorKind, Result};
 
 pub use catalog::{PackOptions, PackProgress, RestoreOptions};
-
-pub mod pack {
-    pub use crate::catalog::{PackOptions, PackProgress};
-}
-
-pub mod restore {
-    pub use crate::catalog::RestoreOptions;
-}

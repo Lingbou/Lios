@@ -1,7 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri as coreIsTauri } from "@tauri-apps/api/core";
 
-export function hasTauriRuntime() {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+export function isTauri(): boolean {
+  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+    return true;
+  }
+  return typeof coreIsTauri === "function" ? coreIsTauri() : false;
 }
 
-export const appInvoke = invoke;
+export { invoke as appInvoke };
+export const hasTauriRuntime = isTauri;

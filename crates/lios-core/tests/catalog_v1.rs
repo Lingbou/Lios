@@ -10,9 +10,8 @@ use lios_core::{
     },
     crypto::KeyFile,
     format_v1::{decrypt_envelope_v1, encrypt_envelope_v1, parse_envelope_v1, EnvelopeKindV1},
-    pack::PackOptions,
-    restore::RestoreOptions,
     storage::StorageObject,
+    PackOptions, RestoreOptions,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::Digest;

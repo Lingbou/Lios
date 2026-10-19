@@ -56,6 +56,7 @@ import { useWindowControls } from "./hooks/useWindowControls.ts";
 import { useDriveSelection } from "./features/drive/useDriveSelection.ts";
 import { useFilePreview } from "./features/drive/useFilePreview.ts";
 import { useStableCallback } from "./useStableCallback.ts";
+import { appInvoke, isTauri } from "./runtime.ts";
 import {
   type RecoveryKeyStatus,
   type RecoveryKeyVerification
@@ -81,26 +82,8 @@ import { SpaceGrid } from "./features/spaces/SpaceGrid.tsx";
 import { RebuildCatalogModal } from "./features/catalog/RebuildCatalogModal.tsx";
 import { ImportKeyModal } from "./features/recoveryKey/ImportKeyModal.tsx";
 
-type InvokeArgs = Record<string, unknown>;
-
-type TauriRuntimeGlobal = typeof globalThis & {
-  isTauri?: boolean;
-  __TAURI_INTERNALS__?: {
-    invoke?: unknown;
-  };
-};
-
-function hasTauriRuntime() {
-  const runtime = globalThis as TauriRuntimeGlobal;
-  return Boolean(runtime.isTauri || runtime.__TAURI_INTERNALS__?.invoke);
-}
-
 async function loadAppVersion() {
   return getVersion();
-}
-
-async function appInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
-  return invoke<T>(command, args);
 }
 
 const taskApi = createTaskApi(appInvoke);
@@ -516,7 +499,7 @@ function App() {
   // Native Tauri drag and drop integration
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    if (hasTauriRuntime()) {
+    if (isTauri()) {
       try {
         getCurrentWebview()
           .onDragDropEvent((event) => {
