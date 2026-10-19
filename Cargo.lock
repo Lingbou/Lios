@@ -2524,7 +2524,6 @@ dependencies = [
  "httpmock",
  "lios-application",
  "lios-core",
- "regex",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2535,7 +2534,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
- "walkdir",
 ]
 
 [[package]]
