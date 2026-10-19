@@ -238,15 +238,8 @@ pub(crate) fn ensure_private_state_directory(path: &Path) -> io::Result<()> {
 
 impl LiosConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        if !path.as_ref().exists() {
-            return Ok(Self::default());
-        }
         let p = path.as_ref();
         if !p.exists() {
-            let legacy = p.with_extension("yaml");
-            if legacy.exists() {
-                // allow legacy fallback
-            }
             return Ok(Self::default());
         }
         Ok(toml::from_str(&fs::read_to_string(p)?)?)

@@ -1,0 +1,114 @@
+:root {
+  color: #3b2b38;
+  background: #fff6fb;
+  --ink: #3b2b38;
+  --ink-secondary: #6b5364;
+  --muted: #846b7b;
+  --muted-light: #ab95a3;
+  --surface: #fffafd;
+  --surface-subtle: #fff1f8;
+  --surface-strong: #ffffff;
+  --surface-hover: #fdf0f7;
+  --line: #efd4e4;
+  --line-strong: #e7aacb;
+  --line-subtle: #f8eaf2;
+  --accent-weak: #fff0f7;
+  --accent-soft: #ffd9eb;
+  --accent: #e86ea8;
+  --accent-strong: #d94f95;
+  --pink-weak: #fff0f7;
+  --pink-soft: #ffd9eb;
+  --pink: #e86ea8;
+  --pink-strong: #d94f95;
+  --crystal: #8fd6e8;
+  --crystal-soft: #eefaff;
+  --gold: #d9a84e;
+  --gold-soft: #fef8eb;
+  --danger: #b84a5c;
+  --danger-soft: #fff0f1;
+  --success: #2ea879;
+  --success-soft: #edf9f4;
+  --shadow-sm: 0 1px 3px 0 rgba(185, 92, 136, 0.08);
+  --shadow: 0 6px 16px -2px rgba(185, 92, 136, 0.12), 0 2px 4px -2px rgba(185, 92, 136, 0.06);
+  --shadow-md: 0 12px 24px -4px rgba(185, 92, 136, 0.16), 0 4px 6px -4px rgba(185, 92, 136, 0.08);
+  --shadow-lg: 0 20px 32px -6px rgba(185, 92, 136, 0.2), 0 8px 10px -6px rgba(185, 92, 136, 0.08);
+  --shadow-modal: 0 25px 50px -12px rgba(145, 62, 106, 0.32);
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--pink);
+  color: var(--pink-strong);
+  background: var(--surface-hover);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+button svg {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+}
+
+input,
+select {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--ink);
+  padding: 8px 10px;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--pink);
+  box-shadow: 0 0 0 3px rgba(232, 110, 168, 0.2);
+}

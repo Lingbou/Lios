@@ -377,7 +377,7 @@ impl Application {
         .await
     }
 
-    pub(crate) fn read_token(&self) -> CommandResult<String> {
+    pub fn read_token(&self) -> CommandResult<String> {
         unprotect_from_file(&self.paths.credentials).map_err(|_| {
             CommandError::invalid_input("ModelScope token is not configured or cannot be read")
         })
@@ -407,7 +407,7 @@ impl Application {
     }
 }
 
-pub(crate) fn key_from_config(config: &LiosConfig) -> CommandResult<KeyFile> {
+pub fn key_from_config(config: &LiosConfig) -> CommandResult<KeyFile> {
     let path = config
         .key_file_path
         .as_ref()
