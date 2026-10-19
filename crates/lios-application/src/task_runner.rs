@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use lios_core::catalog::{
     Catalog, CatalogIntegrityReport, CatalogRemoteIntegrityReport, CatalogSelection,
-    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution, CATALOG_FILE,
+    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution, PackOptions,
+    RestoreOptions, CATALOG_FILE,
 };
 use lios_core::catalog_transaction::{
     probe_catalog_sha256, CatalogBlobCheckpointState, CatalogTransactionOutcome,
@@ -10,8 +11,6 @@ use lios_core::catalog_transaction::{
 };
 use lios_core::config::{LiosConfig, LiosPaths, RepoConfig};
 use lios_core::modelscope::ModelScopeAdapter;
-use lios_core::pack::PackOptions;
-use lios_core::restore::RestoreOptions;
 use lios_core::storage::StorageAdapter;
 use lios_core::tasks::{
     CheckpointState, PersistedTransferAction, PersistedTransferPlan, TaskItem, TaskItemState,

@@ -1,3 +1,34 @@
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+
+#[derive(Default)]
+pub struct ConfigMutationGate {
+    inner: StdMutex<()>,
+}
+
+impl ConfigMutationGate {
+    pub fn lock(&self) -> CommandResult<StdMutexGuard<'_, ()>> {
+        self.inner.lock().map_err(|_| {
+            CommandError::new(
+                crate::command_error::CommandErrorCode::Internal,
+                "config mutation gate is unavailable",
+                false,
+                None,
+            )
+        })
+    }
+}
+
+#[derive(Default)]
+pub struct CatalogMutationGate {
+    mutex: AsyncMutex<()>,
+}
+
+impl CatalogMutationGate {
+    pub async fn lock(&self) -> AsyncMutexGuard<'_, ()> {
+        self.mutex.lock().await
+    }
+}
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,10 +43,8 @@ use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUse
 use lios_core::storage::StorageAdapter;
 use uuid::Uuid;
 
-use crate::catalog_mutation_gate::CatalogMutationGate;
 use crate::catalog_probe::{ensure_space_can_initialize, map_catalog_load_error};
 use crate::catalog_sync::{download_catalog_baseline, sync_current_catalog, CatalogBaseline};
-use crate::config_mutation_gate::ConfigMutationGate;
 use crate::production_config::{configured_endpoint, prepare_startup_config, validate_repo};
 use crate::recovery_key_service::{
     export_recovery_key_for_paths, import_recovery_key_for_paths, verify_recovery_key_for_paths,

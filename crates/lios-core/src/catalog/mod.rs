@@ -19,8 +19,6 @@ use crate::framed_v1::{
     decode_chunk_stream_v1, encode_chunk_stream_with_compression_and_whole_hasher_v1,
     ChunkDecodeLimitsV1, ChunkIdV1,
 };
-use crate::pack::{PackOptions, PackProgress};
-use crate::restore::RestoreOptions;
 use crate::storage::StorageObject;
 use crate::{LiosError, Result};
 
