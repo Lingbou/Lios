@@ -15,7 +15,7 @@ fn fixed_key(path: &Path, byte: u8) -> KeyFile {
     std::fs::write(
         path,
         format!(
-            "version: 1\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: {encoded}\n"
+            "version = 1\nkdf = \"HKDF-SHA256\"\nalgorithm = \"XChaCha20-Poly1305\"\nmaster_key = \"{encoded}\"\n"
         ),
     )
     .unwrap();
