@@ -6,12 +6,11 @@ use lios_core::{
     catalog::{Catalog, CatalogSelection, CATALOG_FILE},
     crypto::KeyFile,
     modelscope::ModelScopeAdapter,
-    pack::PackOptions,
-    restore::RestoreOptions,
     storage::{
         current_catalog_sha256, BlobSpec, BlobValidation, CommitPlan, RemoteAction,
         RemoteDeleteCapability, StorageAdapter,
     },
+    PackOptions, RestoreOptions,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;

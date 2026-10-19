@@ -1,10 +1,10 @@
 import { type MouseEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { hasTauriRuntime } from "../runtime.ts";
+import { isTauri } from "../runtime.ts";
 
 export function useWindowControls(onError: (error: unknown) => void) {
   async function minimizeWindow() {
-    if (!hasTauriRuntime()) return;
+    if (!isTauri()) return;
     try {
       await getCurrentWindow().minimize();
     } catch (error) {
@@ -13,7 +13,7 @@ export function useWindowControls(onError: (error: unknown) => void) {
   }
 
   async function toggleMaximizeWindow() {
-    if (!hasTauriRuntime()) return;
+    if (!isTauri()) return;
     try {
       await getCurrentWindow().toggleMaximize();
     } catch (error) {
@@ -22,7 +22,7 @@ export function useWindowControls(onError: (error: unknown) => void) {
   }
 
   async function closeWindow() {
-    if (!hasTauriRuntime()) return;
+    if (!isTauri()) return;
     try {
       await getCurrentWindow().close();
     } catch (error) {
@@ -31,7 +31,7 @@ export function useWindowControls(onError: (error: unknown) => void) {
   }
 
   async function startWindowDrag(event: MouseEvent<HTMLElement>) {
-    if (event.button !== 0 || !hasTauriRuntime()) return;
+    if (event.button !== 0 || !isTauri()) return;
     event.preventDefault();
     try {
       await getCurrentWindow().startDragging();

@@ -7,7 +7,7 @@ use lios_core::{
         ConflictResolution,
     },
     crypto::KeyFile,
-    pack::{PackOptions, PackProgress},
+    PackOptions, PackProgress,
 };
 use tempfile::tempdir;
 

@@ -7,8 +7,7 @@ use lios_core::{
         PackOutcome, SkippedPathReason,
     },
     crypto::KeyFile,
-    pack::PackOptions,
-    LiosError,
+    LiosError, PackOptions,
 };
 use tempfile::tempdir;
 
