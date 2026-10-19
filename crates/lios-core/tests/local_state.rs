@@ -28,7 +28,7 @@ fn local_paths_follow_lios_layout() {
     let paths = LiosPaths::from_home(tmp.path());
 
     assert_eq!(paths.home, tmp.path().join(".lios"));
-    assert_eq!(paths.config, tmp.path().join(".lios/config.yaml"));
+    assert_eq!(paths.config, tmp.path().join(".lios/config.toml"));
     assert_eq!(paths.database, tmp.path().join(".lios/lios.db"));
     assert_eq!(paths.staging, tmp.path().join(".lios/staging"));
     assert_eq!(paths.logs, tmp.path().join(".lios/logs"));
@@ -93,9 +93,9 @@ fn task_scoped_paths_are_nested_under_staging_and_reject_unsafe_ids() {
 }
 
 #[test]
-fn config_roundtrips_as_yaml_without_token_material() {
+fn config_roundtrips_as_toml_without_token_material() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("config.yaml");
+    let path = tmp.path().join("config.toml");
     let config = LiosConfig {
         spaces: [(
             "archive".to_string(),
@@ -115,7 +115,7 @@ fn config_roundtrips_as_yaml_without_token_material() {
     };
 
     config.save(&path).unwrap();
-    let raw_yaml = std::fs::read_to_string(&path).unwrap();
+    let raw_toml = std::fs::read_to_string(&path).unwrap();
     let loaded = LiosConfig::load(&path).unwrap();
 
     assert_eq!(loaded.schema_version, CONFIG_SCHEMA_VERSION);
@@ -124,12 +124,12 @@ fn config_roundtrips_as_yaml_without_token_material() {
         loaded.backup_path.as_deref(),
         Some(tmp.path().join("backups/recovery.key").as_path())
     );
-    assert!(raw_yaml.contains("backup_path:"));
-    assert!(raw_yaml.contains(&format!("schema_version: {CONFIG_SCHEMA_VERSION}")));
-    assert!(raw_yaml.contains("spaces:"));
-    assert!(!raw_yaml.contains("active_repo"));
-    assert!(!raw_yaml.contains("token"));
-    assert!(!raw_yaml.contains("secret"));
+    assert!(raw_toml.contains("backup_path"));
+    assert!(raw_toml.contains(&format!("schema_version = {CONFIG_SCHEMA_VERSION}")));
+    assert!(raw_toml.contains("spaces"));
+    assert!(!raw_toml.contains("active_repo"));
+    assert!(!raw_toml.contains("token"));
+    assert!(!raw_toml.contains("secret"));
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn generated_and_exported_keys_use_the_only_supported_v1_schema() {
     KeyFile::generate_to_path(&generated_path).unwrap();
     std::fs::write(
         &v1_source_path,
-        "version: 1\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        "version = 1\nkdf = \"HKDF-SHA256\"\nalgorithm = \"XChaCha20-Poly1305\"\nmaster_key = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\n",
     )
     .unwrap();
     KeyFile::load_from_path(&v1_source_path)
@@ -250,7 +250,7 @@ fn generated_and_exported_keys_use_the_only_supported_v1_schema() {
 
     for path in [&generated_path, &exported_path] {
         let parsed: EmittedV1KeyFile =
-            serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.kdf, "HKDF-SHA256");
         assert_eq!(parsed.algorithm, "XChaCha20-Poly1305");
@@ -267,12 +267,16 @@ fn generated_and_exported_keys_use_the_only_supported_v1_schema() {
 }
 
 #[test]
-fn v1_key_yaml_loads() {
+fn v1_key_toml_loads() {
     let tmp = tempdir().unwrap();
     let v1_path = tmp.path().join("v1.key");
     std::fs::write(
         &v1_path,
-        "version: 1\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        r#"version = 1
+kdf = "HKDF-SHA256"
+algorithm = "XChaCha20-Poly1305"
+master_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+"#,
     )
     .unwrap();
 
@@ -283,10 +287,10 @@ fn v1_key_yaml_loads() {
 fn unknown_key_versions_and_algorithms_are_rejected() {
     let tmp = tempdir().unwrap();
     let cases = [
-        "version: 9\nkdf: HKDF-SHA256\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
-        "version: 1\nkdf: HKDF-SHA256\nalgorithm: unknown\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
-        "version: 1\nkdf: unknown\nalgorithm: XChaCha20-Poly1305\nmaster_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
-        "version: 1\nalgorithm: XChaCha20Poly1305-compatible-32-byte-key\nkey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+        "version = 9\nkdf = \"HKDF-SHA256\"\nalgorithm = \"XChaCha20-Poly1305\"\nmaster_key = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\n",
+        "version = 1\nkdf = \"HKDF-SHA256\"\nalgorithm = \"unknown\"\nmaster_key = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\n",
+        "version = 1\nkdf = \"unknown\"\nalgorithm = \"XChaCha20-Poly1305\"\nmaster_key = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\n",
+        "version = 1\nalgorithm = \"XChaCha20Poly1305-compatible-32-byte-key\"\nkey = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\n",
     ];
 
     for (index, contents) in cases.into_iter().enumerate() {

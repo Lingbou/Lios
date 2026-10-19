@@ -20,7 +20,7 @@ pub struct KeyFile {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct KeyFileYaml {
+struct KeyFileDoc {
     version: u8,
     algorithm: String,
     kdf: String,
@@ -28,7 +28,7 @@ struct KeyFileYaml {
 }
 
 #[derive(Serialize)]
-struct KeyFileYamlV1 {
+struct KeyFileDocV1 {
     version: u8,
     kdf: &'static str,
     algorithm: &'static str,
@@ -65,8 +65,7 @@ impl KeyFile {
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
         let text = fs::read_to_string(path)?;
-        let parsed: KeyFileYaml =
-            serde_yaml::from_str(&text).map_err(|_| LiosError::InvalidKeyFile)?;
+        let parsed: KeyFileDoc = toml::from_str(&text).map_err(|_| LiosError::InvalidKeyFile)?;
         if parsed.version != 1
             || parsed.algorithm != KEY_FILE_V1_ALGORITHM
             || parsed.kdf != KEY_FILE_V1_KDF
@@ -81,21 +80,21 @@ impl KeyFile {
     }
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
-        let yaml = KeyFileYamlV1 {
+        let doc = KeyFileDocV1 {
             version: 1,
             kdf: KEY_FILE_V1_KDF,
             algorithm: KEY_FILE_V1_ALGORITHM,
             master_key: STANDARD.encode(self.key),
         };
-        self.write_yaml(path.as_ref(), &yaml)
+        self.write_doc(path.as_ref(), &doc)
     }
 
     pub fn same_material(&self, other: &Self) -> bool {
         self.key == other.key
     }
 
-    fn write_yaml(&self, path: &Path, yaml: &impl Serialize) -> Result<()> {
-        let serialized = serde_yaml::to_string(yaml)?;
+    fn write_doc(&self, path: &Path, doc: &impl Serialize) -> Result<()> {
+        let serialized = toml::to_string_pretty(doc)?;
         write_private_atomic_new(path, serialized.as_bytes())?;
         Ok(())
     }
@@ -152,12 +151,11 @@ mod tests {
         let key = KeyFile::generate_to_path(&generated).unwrap();
         key.save_to_path(&saved).unwrap();
 
-        let yaml: serde_yaml::Value =
-            serde_yaml::from_str(&std::fs::read_to_string(saved).unwrap()).unwrap();
-        assert_eq!(yaml["version"].as_u64(), Some(1));
-        assert_eq!(yaml["kdf"].as_str(), Some("HKDF-SHA256"));
-        assert_eq!(yaml["algorithm"].as_str(), Some("XChaCha20-Poly1305"));
-        assert_eq!(yaml["master_key"].as_str().map(str::len), Some(44));
-        assert!(yaml.get("key").is_none());
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(saved).unwrap()).unwrap();
+        assert_eq!(doc["version"].as_integer(), Some(1));
+        assert_eq!(doc["kdf"].as_str(), Some("HKDF-SHA256"));
+        assert_eq!(doc["algorithm"].as_str(), Some("XChaCha20-Poly1305"));
+        assert_eq!(doc["master_key"].as_str().map(str::len), Some(44));
+        assert!(doc.get("key").is_none());
     }
 }

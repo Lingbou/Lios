@@ -255,7 +255,7 @@ impl From<LiosError> for CommandError {
                 false,
                 None,
             ),
-            LiosError::Json(_) | LiosError::Yaml(_) => Self::new(
+            LiosError::Json(_) | LiosError::TomlDe(_) | LiosError::TomlSer(_) => Self::new(
                 CommandErrorCode::CorruptedData,
                 "stored data could not be decoded",
                 false,
