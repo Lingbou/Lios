@@ -112,6 +112,14 @@ impl Application {
         &self.paths
     }
 
+    pub fn config_gate(&self) -> &ConfigMutationGate {
+        &self.config_gate
+    }
+
+    pub fn catalog_gate(&self) -> &CatalogMutationGate {
+        &self.catalog_gate
+    }
+
     pub fn setup(&self) -> CommandResult<SetupSnapshot> {
         self.paths.ensure_dirs().map_err(to_err)?;
         let config = {

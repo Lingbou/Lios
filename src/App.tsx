@@ -1,3 +1,5 @@
+import { Titlebar } from "./components/Titlebar.tsx";
+import { SpaceRail } from "./components/SpaceRail.tsx";
 import { ToastContainer } from "./features/toast/Toast.tsx";
 import { useToasts } from "./features/toast/useToasts.ts";
 import { getVersion } from "@tauri-apps/api/app";
@@ -25,7 +27,6 @@ import {
   X
 } from "lucide-react";
 import { Fragment, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import liosPetalMark from "./assets/lios-petal-mark.svg";
 import type {
   CacheCleanupReport,
   CatalogLoadResult,
@@ -1495,111 +1496,29 @@ function App() {
 
   return (
     <div className="appFrame">
-      <header className="windowTitlebar">
-        <div className="windowTitle" data-tauri-drag-region onMouseDown={startWindowDrag}>
-          <img src={liosPetalMark} alt="" />
-          <span>Lios</span>
-        </div>
-        <div className="windowDragRegion" data-tauri-drag-region onMouseDown={startWindowDrag} />
-        <div className="windowControls">
-          <button onClick={minimizeWindow} title="最小化" aria-label="最小化">
-            <Minus aria-hidden />
-          </button>
-          <button onClick={toggleMaximizeWindow} title="最大化" aria-label="最大化">
-            <Square aria-hidden />
-          </button>
-          <button className="closeWindow" onClick={closeWindow} title="关闭" aria-label="关闭">
-            <X aria-hidden />
-          </button>
-        </div>
-      </header>
+      <Titlebar
+        onDrag={startWindowDrag}
+        onMinimize={minimizeWindow}
+        onToggleMaximize={toggleMaximizeWindow}
+        onClose={closeWindow}
+      />
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
 
       <main className="driveShell">
-        <aside className="spaceRail">
-          <div className="railHeader">
-
-            <div className="accountSection">
-              <button
-                className={`accountItem ${hasToken ? "active" : "empty"}`}
-                onClick={selectAccount}
-                title="查看所有空间概览"
-              >
-                <KeyRound aria-hidden />
-                <span>
-                  <strong>{modelscopeUser?.username ?? "未连接账号"}</strong>
-                  <small>{hasToken ? "ModelScope" : "未连接"}</small>
-                </span>
-              </button>
-            </div>
-          </div>
-
-          <div className="railSpacesSection">
-            <div className="railSectionHeader">
-              <span className="sectionLabel">已挂载空间</span>
-              <button
-                type="button"
-                className="railAddSpaceBtn"
-                onClick={createSpace}
-                title="新建空间"
-                aria-label="新建空间"
-              >
-                <Plus aria-hidden />
-              </button>
-            </div>
-
-            <div className="railSpaceList" role="list">
-              {spaces.map((space) => {
-                const isActive = view === "drive" && activeSpace?.space_name === space.space_name;
-                const displayName = space.title || space.dataset || space.space_name;
-                return (
-                  <button
-                    key={space.space_name}
-                    type="button"
-                    className={`railSpaceItem ${isActive ? "active" : ""}`}
-                    onClick={() => {
-                      void loadSpace(space);
-                    }}
-                    title={displayName}
-                  >
-                    <HardDrive aria-hidden />
-                    <span className="railSpaceName">{displayName}</span>
-                  </button>
-                );
-              })}
-              {spaces.length === 0 && (
-                <div className="railEmptySpaces">
-                  <span>暂无已挂载空间</span>
-                  <button type="button" className="railEmptyCreateBtn" onClick={createSpace}>
-                    <Plus aria-hidden /> 新建空间
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="railFooter">
-            <button
-              type="button"
-              className={view !== "settings" && !taskDrawerCollapsed ? "active" : ""}
-              onClick={toggleTaskDrawer}
-              title="传输任务概览"
-            >
-              <ArrowUpDown aria-hidden />
-              <span>传输任务</span>
-              {activeTasks > 0 && <span className="railTaskBadge">{activeTasks}</span>}
-            </button>
-            <button
-              type="button"
-              className={view === "settings" ? "active" : ""}
-              onClick={toggleSettings}
-              title="设置"
-            >
-              <Settings aria-hidden />
-              <span>设置</span>
-            </button>
-          </div>
-        </aside>
+        <SpaceRail
+          hasToken={hasToken}
+          username={modelscopeUser?.username}
+          spaces={spaces}
+          activeSpaceName={activeSpace?.space_name}
+          view={view}
+          taskDrawerCollapsed={taskDrawerCollapsed}
+          activeTasks={activeTasks}
+          onSelectAccount={selectAccount}
+          onCreateSpace={createSpace}
+          onSelectSpace={(space) => void loadSpace(space)}
+          onToggleTaskDrawer={toggleTaskDrawer}
+          onToggleSettings={toggleSettings}
+        />
 
         <section className="driveWorkspace">
           {view !== "settings" && (

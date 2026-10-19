@@ -1,9 +1,9 @@
 use base64::Engine;
+use lios_application::prepare_download_task;
 pub use lios_application::{
     app_log, catalog_probe, catalog_sync, command_error, production_config, recovery_key_service,
     task_support,
 };
-use lios_application::{prepare_download_task, CatalogMutationGate, ConfigMutationGate};
 
 pub mod command_surface;
 mod task_center;
@@ -79,10 +79,9 @@ use uuid::Uuid;
 type CommandResult<T> = std::result::Result<T, CommandError>;
 
 struct AppContext {
+    app: Application,
     paths: LiosPaths,
     app_log: AppLogger,
-    catalog_mutation_gate: CatalogMutationGate,
-    config_mutation_gate: ConfigMutationGate,
 }
 
 impl AppContext {
@@ -97,11 +96,12 @@ impl AppContext {
             "app_started",
             serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
         );
+        let app =
+            Application::new(paths.clone()).expect("failed to initialize application service");
         Self {
+            app,
             paths,
             app_log,
-            catalog_mutation_gate: CatalogMutationGate::default(),
-            config_mutation_gate: ConfigMutationGate::default(),
         }
     }
 }
@@ -1095,7 +1095,7 @@ async fn head_revision(
 fn current_setup(state: tauri::State<'_, AppContext>) -> CommandResult<SetupSnapshot> {
     state.paths.ensure_dirs().map_err(to_err)?;
     let config = {
-        let _config_guard = state.config_mutation_gate.lock()?;
+        let _config_guard = state.app.config_gate().lock()?;
         let mut config = load_config(&state.paths)?;
         prepare_startup_config(&state.paths, &mut config)?;
         config
@@ -1122,13 +1122,13 @@ fn setup_token(state: tauri::State<'_, AppContext>, token: String) -> CommandRes
 
 #[tauri::command]
 fn clear_token(state: tauri::State<'_, AppContext>) -> CommandResult<()> {
-    Application::new(state.paths.clone())?.clear_token()
+    state.app.clear_token()
 }
 
 #[tauri::command]
 fn set_endpoint(state: tauri::State<'_, AppContext>, endpoint: String) -> CommandResult<()> {
     state.paths.ensure_dirs().map_err(to_err)?;
-    let _config_guard = state.config_mutation_gate.lock()?;
+    let _config_guard = state.app.config_gate().lock()?;
     let _lock = state.paths.try_lock_config().map_err(CommandError::from)?;
     let mut config = load_config(&state.paths)?;
     let trimmed = endpoint.trim();
@@ -1157,9 +1157,8 @@ async fn create_dataset_repo(
         endpoint,
         title,
     })?;
-    let application = Application::new(state.paths.clone())?;
-    application.create_dataset_repo(repo.clone()).await?;
-    if let Err(error) = application.initialize_space(repo.clone()).await {
+    state.app.create_dataset_repo(repo.clone()).await?;
+    if let Err(error) = state.app.initialize_space(repo.clone()).await {
         return Err(CommandError::new(
             error.code,
             format!(
@@ -1320,7 +1319,7 @@ async fn initialize_space(
             "space was not found or is not visible",
         ));
     }
-    let _catalog_mutation_guard = state.catalog_mutation_gate.lock().await;
+    let _catalog_mutation_guard = state.app.catalog_gate().lock().await;
     ensure_space_can_initialize(
         &adapter,
         &repo.namespace,
@@ -1362,9 +1361,7 @@ async fn load_space_catalog(
 ) -> CommandResult<CatalogLoadResult> {
     state.paths.ensure_dirs().map_err(to_err)?;
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
-    let snapshot = Application::new(state.paths.clone())?
-        .open_space(repo)
-        .await?;
+    let snapshot = state.app.open_space(repo).await?;
     Ok(CatalogLoadResult {
         local_path: snapshot.local_path.display().to_string(),
         bytes: snapshot.bytes,
@@ -1445,8 +1442,7 @@ async fn preview_file_node(
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let config = load_config(&state.paths)?;
     let key = key_from_config(&config)?;
-    let app = Application::new(state.paths.clone())?;
-    let snapshot = app.open_space(repo.clone()).await?;
+    let snapshot = state.app.open_space(repo.clone()).await?;
 
     let node = find_tree_node(&snapshot.tree, &node_id)
         .ok_or_else(|| CommandError::invalid_input("file not found in space catalog"))?;
@@ -1554,7 +1550,8 @@ async fn preview_upload_conflicts(
 ) -> CommandResult<Vec<UploadConflict>> {
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-    Application::new(state.paths.clone())?
+    state
+        .app
         .preview_upload_conflicts_in(repo, &parent_node_id, &paths)
         .await
 }
@@ -1567,7 +1564,8 @@ async fn create_folder(
     name: String,
 ) -> CommandResult<CatalogLoadResult> {
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
-    let snapshot = Application::new(state.paths.clone())?
+    let snapshot = state
+        .app
         .create_folder_in(repo, &parent_node_id, &name)
         .await?;
     Ok(CatalogLoadResult {
@@ -1586,9 +1584,7 @@ async fn rename_node(
     new_name: String,
 ) -> CommandResult<CatalogLoadResult> {
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
-    let snapshot = Application::new(state.paths.clone())?
-        .rename_node_in(repo, &node_id, &new_name)
-        .await?;
+    let snapshot = state.app.rename_node_in(repo, &node_id, &new_name).await?;
     Ok(CatalogLoadResult {
         local_path: snapshot.local_path.display().to_string(),
         bytes: snapshot.bytes,
@@ -1604,9 +1600,7 @@ async fn search_catalog(
     query: String,
 ) -> CommandResult<Vec<DriveItem>> {
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
-    Application::new(state.paths.clone())?
-        .search_in(repo, &query)
-        .await
+    state.app.search_in(repo, &query).await
 }
 
 #[tauri::command]
@@ -1616,7 +1610,7 @@ fn export_recovery_key(
 ) -> CommandResult<RecoveryKeyStatus> {
     let status = export_recovery_key_for_paths(
         &state.paths,
-        &state.config_mutation_gate,
+        state.app.config_gate(),
         Path::new(&destination),
     )?;
     state.app_log.log(
@@ -1641,7 +1635,7 @@ async fn import_recovery_key(
     path: String,
 ) -> CommandResult<RecoveryKeyVerification> {
     let verification =
-        import_recovery_key_for_paths(&state.paths, &state.config_mutation_gate, Path::new(&path))
+        import_recovery_key_for_paths(&state.paths, state.app.config_gate(), Path::new(&path))
             .await?;
     state.app_log.log(
         "info",
@@ -1691,8 +1685,7 @@ async fn enqueue_upload_to_folder(
     key_from_config(&config)?;
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
-    let planning_app = Application::new(state.paths.clone())?;
-    let snapshot = planning_app.open_space(repo.clone()).await?;
+    let snapshot = state.app.open_space(repo.clone()).await?;
     let baseline = lios_application::sha256_hex_file(&snapshot.local_path)?;
     let parent_path = catalog_node_path(&snapshot.tree, &parent_node_id)
         .ok_or_else(|| CommandError::invalid_input("upload destination folder was not found"))?;
@@ -1775,7 +1768,7 @@ async fn enqueue_download(
     key_from_config(&config)?;
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
-    let planning_app = Application::new(state.paths.clone())?;
+    let planning_app = &state.app;
     let snapshot = planning_app.open_space(repo.clone()).await?;
     let baseline = lios_application::sha256_hex_file(&snapshot.local_path)?;
     let sources = node_ids
@@ -1955,7 +1948,7 @@ fn list_task_items(
 async fn cleanup_local_cache(
     state: tauri::State<'_, AppContext>,
 ) -> CommandResult<CacheCleanupReport> {
-    let _shared_staging_guard = state.catalog_mutation_gate.lock().await;
+    let _shared_staging_guard = state.app.catalog_gate().lock().await;
     match cleanup_if_idle(&state.paths, || {
         cleanup_current_staging_cache(&state.paths, true, false)
     })
@@ -1977,9 +1970,7 @@ async fn pause_task(
     let summary = task_summary_for_paths(&state.paths, task_id)?
         .ok_or_else(|| CommandError::invalid_input("task was not found"))?;
     if matches!(summary.state, TaskState::Queued | TaskState::Running) {
-        Application::new(state.paths.clone())?
-            .pause_task(task_id)
-            .await?;
+        state.app.pause_task(task_id).await?;
         if summary.state == TaskState::Running {
             state.paths.ensure_worker_control_dir()?;
             fs::write(state.paths.worker_pause_path(task_id), b"pause\n").map_err(to_err)?;
@@ -1995,7 +1986,7 @@ async fn resume_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    Application::new(state.paths.clone())?.requeue_paused_task(task_id)?;
+    state.app.requeue_paused_task(task_id)?;
     start_shared_worker(&state.paths)?;
     emit_task(&app, &state.paths, task_id);
     Ok(())
@@ -2007,7 +1998,7 @@ async fn retry_task(
     state: tauri::State<'_, AppContext>,
     task_id: Uuid,
 ) -> CommandResult<()> {
-    Application::new(state.paths.clone())?.requeue_failed_task(task_id)?;
+    state.app.requeue_failed_task(task_id)?;
     emit_task(&app, &state.paths, task_id);
     start_shared_worker(&state.paths)?;
     Ok(())
@@ -2025,16 +2016,12 @@ async fn cancel_task(
         // Queued and paused tasks are not being executed, so the durable task
         // state alone is enough; a control file would never be consumed.
         TaskState::Queued | TaskState::Paused => {
-            Application::new(state.paths.clone())?
-                .cancel_task(task_id)
-                .await?;
+            state.app.cancel_task(task_id).await?;
         }
         // Cancel the durable state immediately, then ask the worker to drop
         // the in-flight execution at its next interruptible boundary.
         TaskState::Running => {
-            Application::new(state.paths.clone())?
-                .cancel_task(task_id)
-                .await?;
+            state.app.cancel_task(task_id).await?;
             state.paths.ensure_worker_control_dir()?;
             fs::write(state.paths.worker_cancel_path(task_id), b"cancel\n").map_err(to_err)?;
         }
