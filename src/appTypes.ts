@@ -135,3 +135,5 @@ export type ConflictResolution = {
   source_path: string;
   action: ConflictAction;
 };
+
+export type CatalogStatus = "idle" | "loading" | "ready" | "missing" | "error";

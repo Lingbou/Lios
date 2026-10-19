@@ -1,0 +1,621 @@
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  background: rgba(15, 23, 42, 0.45); backdrop-filter: blur(4px);
+  padding: 20px;
+}
+
+.conflictModal,
+.spaceModal,
+.recoveryKeyModal,
+.rebuildModal,
+.inputModal,
+.confirmModal {
+  width: min(720px, 100%);
+  max-height: min(680px, calc(100vh - 40px));
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-strong);
+  box-shadow: var(--shadow-modal);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.spaceModal,
+.inputModal,
+.confirmModal {
+  width: min(460px, 100%);
+}
+
+.recoveryKeyModal {
+  width: min(540px, 100%);
+}
+
+.rebuildModal {
+  width: min(900px, 100%);
+}
+
+.modalHeader,
+.modalActions {
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.modalHeader {
+  border-bottom: 1px solid var(--line);
+}
+
+.modalHeader h2,
+.modalHeader p {
+  margin: 0;
+}
+
+.modalHeader h2 {
+  font-size: 19px;
+}
+
+.modalHeader p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.modalHeader button {
+  width: 34px;
+  min-height: 34px;
+  padding: 0;
+}
+
+.rebuildModalBody {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  padding: 16px;
+}
+
+.recoveryKeyModalBody {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  padding: 16px;
+}
+
+.recoveryVerificationResult,
+.externalKeyNotice {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.recoveryVerificationResult {
+  border: 1px solid #bbf7d0;
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.externalKeyNotice {
+  border: 1px solid var(--line);
+  background: var(--surface-subtle);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.recoveryVerificationResult > svg,
+.externalKeyNotice > svg {
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  color: var(--pink-strong);
+}
+
+.recoveryVerificationResult strong,
+.recoveryVerificationResult small {
+  display: block;
+}
+
+.recoveryVerificationResult small {
+  margin-top: 5px;
+  color: #15803d;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.rebuildLoading {
+  min-height: 240px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.rebuildLoading svg {
+  width: 34px;
+  height: 34px;
+  color: var(--pink);
+  animation: spin 1.2s linear infinite;
+}
+
+.rebuildLoading strong {
+  color: var(--ink);
+  font-size: 16px;
+}
+
+.rebuildLoading span {
+  font-size: 13px;
+}
+
+.rebuildError {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: var(--danger-soft);
+  padding: 11px 12px;
+  color: var(--danger);
+}
+
+.rebuildError svg {
+  margin-top: 1px;
+}
+
+.rebuildError strong,
+.rebuildError small {
+  display: block;
+}
+
+.rebuildError small {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+
+.rebuildIntro {
+  margin: 0;
+  color: var(--ink-secondary);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.rebuildReport {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+
+.rebuildReport > div {
+  min-width: 0;
+  padding: 10px 12px;
+  border-right: 1px solid var(--line);
+}
+
+.rebuildReport dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rebuildReport dd {
+  margin: 5px 0 0;
+  color: var(--ink);
+  font-size: 17px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.rebuildTreePanel,
+.rebuildWarnings {
+  display: grid;
+  gap: 8px;
+}
+
+.rebuildSectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.rebuildSectionHeader h3 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.rebuildSectionHeader span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rebuildTreeScroll {
+  max-height: 300px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 8px;
+}
+
+.rebuildTree,
+.rebuildTree ul {
+  margin: 0;
+  list-style: none;
+}
+
+.rebuildTree {
+  padding: 0;
+}
+
+.rebuildTree ul {
+  padding-left: 22px;
+}
+
+.rebuildTreeRow {
+  min-height: 32px;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  padding: 5px 7px;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.rebuildTreeRow svg {
+  width: 16px;
+  height: 16px;
+  color: var(--pink);
+}
+
+.rebuildTreeRow span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.rebuildTreeRow small {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.rebuildWarnings {
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
+.rebuildWarnings ul,
+.rebuildWarnings p {
+  margin: 0;
+  color: var(--ink-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.rebuildWarnings ul {
+  padding-left: 20px;
+}
+
+.modalActionGroup {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.rebuildModal .loadingGlyph {
+  animation: spin 1.2s linear infinite;
+}
+
+.conflictList {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  gap: 8px;
+  padding: 12px 16px;
+}
+
+.spaceModalBody,
+.inputModalBody,
+.confirmModalBody {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.spaceModalBody label,
+.inputModalBody label {
+  display: grid;
+  gap: 8px;
+}
+
+.spaceModalBody label span,
+.inputModalBody label span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.fieldHint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.confirmModalDescription {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink);
+}
+
+.confirmModalNotice {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  border-radius: 8px;
+  padding: 12px;
+  border: 1px solid #f1cddd;
+  background: #fff7fb;
+  color: #6f5265;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.confirmModalNotice.danger {
+  border-color: #efb9c0;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.confirmNoticeIcon {
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  color: var(--pink-strong);
+  flex-shrink: 0;
+}
+
+.confirmModalNotice.danger .confirmNoticeIcon {
+  color: var(--danger);
+}
+
+.confirmNoticeContent p {
+  margin: 0;
+}
+
+.fieldError {
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.conflictItem {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.conflictItem strong,
+.conflictItem small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conflictItem small {
+  margin-top: 4px;
+  color: var(--muted);
+}
+
+.modalActions {
+  border-top: 1px solid var(--line);
+  justify-content: flex-end;
+}
+
+@media (max-width: 980px) {
+  .driveShell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .spaceRail {
+    height: auto;
+    padding: 8px 12px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: auto;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .spaceRail .sectionLabel,
+  .railBrandSubtitle,
+  .railSpacesSection {
+    display: none;
+  }
+
+  .accountSection {
+    min-width: 0;
+    display: block;
+  }
+
+  .accountItem {
+    min-height: 46px;
+  }
+
+  .railFooter {
+    display: flex;
+    align-items: center;
+    padding-top: 0;
+    border-top: 0;
+  }
+
+  .railFooter button {
+    width: auto;
+  }
+
+  .connectionGrid,
+  .manualGrid,
+  .tokenRow {
+    grid-template-columns: 1fr;
+  }
+
+  .settingsHeaderRow {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .settingsActions {
+    justify-content: flex-start;
+  }
+
+  .aboutBlock {
+    min-height: 276px;
+    grid-template-columns: 1fr;
+  }
+
+  .aboutMeta {
+    grid-template-columns: 1fr;
+  }
+
+  .aboutMeta > div + div {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .recoveryKeySummary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .backupStatus {
+    max-width: 100%;
+  }
+
+  .taskSummary {
+    grid-template-columns: 30px 30px minmax(0, 1fr);
+  }
+
+  .taskProgress,
+  .taskButtons {
+    grid-column: 3;
+  }
+
+  .taskFileProgress {
+    grid-column: 2;
+  }
+
+  .taskVirtualRow {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+
+  .taskVirtualRow .taskFileProgress {
+    grid-column: 2;
+  }
+
+  .accountSpacesHeader {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .fileTable th:nth-child(5),
+  .fileTable td:nth-child(5) {
+    display: none;
+  }
+}
+
+@media (max-width: 680px) {
+  .modalBackdrop {
+    padding: 10px;
+  }
+
+  .rebuildReport {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .rebuildTreeScroll {
+    max-height: 240px;
+  }
+
+  .rebuildModal .modalActions,
+  .recoveryKeyModal .modalActions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .modalActionGroup {
+    flex-wrap: wrap;
+  }
+
+  .modalActionGroup > button {
+    flex: 1 1 auto;
+  }
+
+  .driveWorkspace {
+    padding: 12px;
+  }
+
+  .driveTopbar {
+    grid-template-columns: 1fr;
+  }
+
+  .driveToolbar {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .toolbar {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .toolbar button {
+    width: 100%;
+  }
+
+  .viewModeSegment {
+    grid-column: 1;
+    grid-row: auto;
+    justify-self: start;
+  }
+
+  .fileTable th:nth-child(3),
+  .fileTable td:nth-child(3),
+  .fileTable th:nth-child(4),
+  .fileTable td:nth-child(4) {
+    display: none;
+  }
+
+  .conflictItem {
+    grid-template-columns: 1fr;
+  }
+}

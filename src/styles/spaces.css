@@ -1,0 +1,59 @@
+.spaceGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.spaceCard {
+  min-width: 0;
+  min-height: 74px;
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) 18px;
+  justify-content: flex-start;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-strong);
+  padding: 12px;
+  transition: all 0.15s ease;
+}
+
+.spaceCard:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  background: var(--surface-hover);
+  box-shadow: var(--shadow-sm);
+}
+
+.spaceCard.active {
+  border-color: var(--accent);
+  background: var(--accent-weak);
+  color: var(--accent-strong);
+}
+
+.spaceCard > svg:first-child {
+  color: var(--accent);
+}
+
+.spaceCard > svg:last-child {
+  color: var(--muted);
+}
+
+.spaceCard span,
+.spaceCard strong,
+.spaceCard small {
+  min-width: 0;
+}
+
+.spaceCard strong,
+.spaceCard small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spaceCard small {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}

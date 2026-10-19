@@ -14,7 +14,6 @@ mod build_support;
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use app_log::AppLogger;
@@ -28,8 +27,10 @@ use catalog_sync::{sync_current_catalog, CatalogBaseline};
 use command_error::{CommandError, CommandErrorCode};
 use command_surface::with_registered_commands;
 use lios_application::location::LocalLocation;
-use lios_application::service::Application;
+use lios_application::service::{key_from_config, Application};
+pub(crate) use lios_application::sha256_hex_file;
 use lios_application::space_registry::SpaceRegistry;
+use lios_application::to_err;
 use lios_application::transfer_request::{
     catalog_node_path, catalog_tree_entries, prepare_download, prepare_upload, RemoteSource,
 };
@@ -38,22 +39,16 @@ use lios_core::catalog::{
     Catalog, CatalogRebuildReport, CatalogRemoteFile, CatalogSelection, CatalogTreeNode,
     ConflictAction, ConflictResolution, DriveItem, UploadConflict, CATALOG_FILE,
 };
-#[cfg(test)]
-use lios_core::catalog_transaction::{
-    CatalogBlobCheckpointState, CatalogTransactionPhase, CatalogTransactionProgress,
-};
 use lios_core::config::{
     validate_modelscope_production_endpoint, LiosConfig, LiosPaths, RepoConfig,
 };
-use lios_core::credentials::{protect_to_file, unprotect_from_file};
+use lios_core::credentials::protect_to_file;
 use lios_core::crypto::KeyFile;
 use lios_core::modelscope::{DatasetRepoSummary, ModelScopeAdapter, ModelScopeUserSummary};
 use lios_core::space_lock::SpaceLockError;
 #[cfg(test)]
 use lios_core::storage::CatalogSyncFile;
 use lios_core::storage::{RepoRevision, StorageAdapter, StorageObject};
-#[cfg(test)]
-use lios_core::tasks::{CheckpointState, TaskItemState, TaskObjectCheckpoint};
 use lios_core::tasks::{TaskRecord, TaskSpec, TaskState, TaskStore, TaskSummary};
 use production_config::{
     configured_endpoint, persist_config, prepare_startup_config, validate_repo,
@@ -63,15 +58,12 @@ use recovery_key_service::{
     verify_recovery_key_for_paths, RecoveryKeyStatus, RecoveryKeyVerification,
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 #[cfg(test)]
 use task_center::TaskUpdateEvent;
 use task_center::{
     emit_removed_tasks, emit_task, list_task_items_for_paths, task_summaries_for_paths,
     task_summary_for_paths, webview_safe_task_summary, TaskItemsPageDto,
 };
-#[cfg(test)]
-use task_support::TransferMetrics;
 use task_support::{persist_submission, persist_transfer_submission, TaskScope};
 use tauri::Manager;
 use uuid::Uuid;
@@ -203,13 +195,6 @@ impl From<DatasetRepoSummary> for DatasetRepoSummaryDto {
     }
 }
 
-fn to_err<E>(error: E) -> CommandError
-where
-    CommandError: From<E>,
-{
-    error.into()
-}
-
 fn paths_dto(paths: &LiosPaths) -> PathsDto {
     PathsDto {
         home: paths.home.display().to_string(),
@@ -237,115 +222,6 @@ fn task_store(paths: &LiosPaths) -> CommandResult<TaskStore> {
     TaskStore::open(&paths.database).map_err(to_err)
 }
 
-#[cfg(test)]
-fn transaction_phase_label(phase: CatalogTransactionPhase) -> &'static str {
-    match phase {
-        CatalogTransactionPhase::ValidateBlobs => "validating",
-        CatalogTransactionPhase::UploadBlobs => "uploading",
-        CatalogTransactionPhase::Prepublish => "uploading",
-        CatalogTransactionPhase::ProbeCatalog => "checking",
-        CatalogTransactionPhase::Publish => "committing",
-        CatalogTransactionPhase::Cleanup => "cleaning",
-    }
-}
-
-#[cfg(test)]
-fn persist_transaction_progress(
-    paths: &LiosPaths,
-    app: Option<&tauri::AppHandle>,
-    task: &mut TaskRecord,
-    metrics: &mut TransferMetrics,
-    progress: CatalogTransactionProgress,
-) -> lios_core::Result<()> {
-    if let Some(checkpoint) = &progress.blob_checkpoint {
-        TaskStore::open(&paths.database)?.upsert_checkpoint(&TaskObjectCheckpoint {
-            task_id: task.id,
-            remote_path: checkpoint.path.clone(),
-            oid: checkpoint.oid.clone(),
-            size: checkpoint.size,
-            state: match checkpoint.state {
-                CatalogBlobCheckpointState::Uploaded => CheckpointState::Uploaded,
-                CatalogBlobCheckpointState::Committed => CheckpointState::Committed,
-            },
-        })?;
-    }
-    let state = match progress.phase {
-        CatalogTransactionPhase::ValidateBlobs
-        | CatalogTransactionPhase::UploadBlobs
-        | CatalogTransactionPhase::Prepublish
-        | CatalogTransactionPhase::ProbeCatalog => TaskState::Running,
-        CatalogTransactionPhase::Publish | CatalogTransactionPhase::Cleanup => {
-            TaskState::Committing
-        }
-    };
-    let phase = transaction_phase_label(progress.phase).to_string();
-    let phase_changed = task.phase.as_deref() != Some(phase.as_str());
-    let observation = metrics.observe(
-        progress.bytes_done,
-        progress.bytes_total,
-        phase_changed || progress.completed_items >= progress.total_items,
-    );
-    if !observation.should_publish {
-        return Ok(());
-    }
-    task.state = state.clone();
-    task.phase = Some(phase.clone());
-    task.progress_done = progress.completed_items;
-    task.progress_total = progress.total_items;
-    task.bytes_done = progress.bytes_done;
-    task.bytes_total = progress.bytes_total;
-    task.speed_bps = observation.speed_bps;
-    task.eta_seconds = observation.eta_seconds;
-    let store = TaskStore::open(&paths.database)?;
-    if task.label == "upload" {
-        let item_phase = match progress.phase {
-            CatalogTransactionPhase::ValidateBlobs
-            | CatalogTransactionPhase::UploadBlobs
-            | CatalogTransactionPhase::Prepublish
-            | CatalogTransactionPhase::ProbeCatalog => "uploading",
-            CatalogTransactionPhase::Publish | CatalogTransactionPhase::Cleanup => "committing",
-        };
-        store.update_items_state(
-            task.id,
-            TaskItemState::Running,
-            Some(item_phase.to_string()),
-            None,
-            false,
-        )?;
-    }
-    if !store.set_transaction_state(task.id, state)? {
-        return Err(lios_core::LiosError::Unsupported(
-            "task was interrupted before the catalog transaction phase could start".to_string(),
-        ));
-    }
-    store.update_phase(task.id, Some(phase))?;
-    store.update_transfer(
-        task.id,
-        task.progress_done,
-        task.progress_total,
-        task.bytes_done,
-        task.bytes_total,
-        task.speed_bps,
-    )?;
-    store.update_eta(task.id, task.eta_seconds)?;
-    if let Some(app) = app {
-        emit_task(app, paths, task.id);
-    }
-    Ok(())
-}
-
-fn read_token(paths: &LiosPaths) -> CommandResult<String> {
-    unprotect_from_file(&paths.credentials).map_err(to_err)
-}
-
-fn key_from_config(config: &LiosConfig) -> CommandResult<KeyFile> {
-    let path = config
-        .key_file_path
-        .clone()
-        .ok_or_else(|| CommandError::invalid_input("key file is not configured"))?;
-    KeyFile::load_from_path(path).map_err(to_err)
-}
-
 fn remote_to_staging_path(staging: &Path, remote_path: &str) -> CommandResult<PathBuf> {
     let relative = Path::new(remote_path);
     if relative.is_absolute()
@@ -358,20 +234,6 @@ fn remote_to_staging_path(staging: &Path, remote_path: &str) -> CommandResult<Pa
         )));
     }
     Ok(staging.join(relative))
-}
-
-fn sha256_hex_file(path: &Path) -> CommandResult<String> {
-    let mut file = fs::File::open(path).map_err(to_err)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(to_err)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex::encode(hasher.finalize()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1284,7 +1146,7 @@ async fn list_dataset_repos(
     state.paths.ensure_dirs().map_err(to_err)?;
     let config = load_config(&state.paths)?;
     let endpoint = configured_endpoint(&config, endpoint)?;
-    let token = read_token(&state.paths)?;
+    let token = state.app.read_token()?;
     let adapter = ModelScopeAdapter::new(endpoint, token);
     let user = adapter.whoami().await.map_err(to_err)?;
     let repositories = adapter
@@ -1308,7 +1170,7 @@ async fn initialize_space(
         .paths
         .try_lock_space(&TaskScope::from_repo(&repo).space_id)
         .map_err(CommandError::from)?;
-    let token = read_token(&state.paths)?;
+    let token = state.app.read_token()?;
     let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), token);
     if !adapter
         .repo_exists(&repo.namespace, &repo.dataset)
@@ -1486,7 +1348,7 @@ async fn preview_file_node(
         return Err(CommandError::invalid_input("invalid selection"));
     };
 
-    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(&state.paths)?);
+    let adapter = ModelScopeAdapter::new(repo.endpoint.clone(), state.app.read_token()?);
     let catalog = Catalog::from_staging(catalog_staging.clone());
     let remote_files = catalog
         .remote_files_for_selection(&CatalogSelection::Nodes(node_ids), &key)
@@ -1813,7 +1675,7 @@ async fn enqueue_verify_space(
 ) -> CommandResult<TaskSummary> {
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
-    read_token(&state.paths)?;
+    state.app.read_token()?;
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let scope = TaskScope::from_repo(&repo);
     let spec = TaskSpec::VerifySpace {
@@ -1837,7 +1699,7 @@ async fn preview_rebuild_catalog(
         .paths
         .try_lock_space(&scope.space_id)
         .map_err(CommandError::from)?;
-    let branch_adapter = ModelScopeAdapter::new(repo.endpoint.clone(), read_token(&state.paths)?);
+    let branch_adapter = ModelScopeAdapter::new(repo.endpoint.clone(), state.app.read_token()?);
     let started_revision = head_revision(&branch_adapter, &repo).await?;
     let revision = verification_commit_id(&started_revision)?.to_string();
     let adapter = branch_adapter.clone().with_revision(revision.clone());
@@ -1904,7 +1766,7 @@ async fn enqueue_rebuild_catalog(
 ) -> CommandResult<TaskSummary> {
     let config = load_config(&state.paths)?;
     key_from_config(&config)?;
-    read_token(&state.paths)?;
+    state.app.read_token()?;
     let repo = SpaceRegistry::new(state.paths.clone()).resolve(&space_name)?;
     let expected_revision = expected_revision.trim();
     if expected_revision.is_empty() {

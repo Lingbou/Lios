@@ -643,19 +643,12 @@ mod task_checkpoint_tests {
     use std::collections::HashSet;
     use std::fs;
 
-    use lios_core::catalog_transaction::{
-        CatalogBlobCheckpoint, CatalogBlobCheckpointState, CatalogTransactionPhase,
-        CatalogTransactionProgress,
-    };
     use lios_core::config::LiosPaths;
     use lios_core::storage::CatalogSyncUpload;
-    use lios_core::tasks::{CheckpointState, TaskRecord, TaskState, TaskStore};
+    use lios_core::tasks::{CheckpointState, TaskRecord, TaskStore};
     use tempfile::tempdir;
 
-    use super::{
-        persist_sync_checkpoints, persist_transaction_progress, sha256_hex_file, SyncWork,
-        TransferMetrics,
-    };
+    use super::{persist_sync_checkpoints, sha256_hex_file, SyncWork};
 
     #[test]
     fn sync_plan_persists_base_target_and_pending_objects_before_remote_work() {
@@ -707,83 +700,6 @@ mod task_checkpoint_tests {
                     || (checkpoint.remote_path == "objects/files/a/manifest.enc"
                         && checkpoint.oid == object_oid))
         }));
-    }
-
-    #[test]
-    fn transaction_checkpoint_progress_is_persisted_even_when_ui_refresh_is_throttled() {
-        let temp = tempdir().unwrap();
-        let paths = LiosPaths::from_home(temp.path());
-        let store = TaskStore::open(&paths.database).unwrap();
-        let mut task = TaskRecord::queued("upload", 2);
-        task.state = TaskState::Running;
-        store.insert(&task).unwrap();
-        let mut metrics = TransferMetrics::new();
-
-        persist_transaction_progress(
-            &paths,
-            None,
-            &mut task,
-            &mut metrics,
-            CatalogTransactionProgress {
-                phase: CatalogTransactionPhase::UploadBlobs,
-                completed_items: 0,
-                total_items: 2,
-                bytes_done: 0,
-                bytes_total: 10,
-                blob_checkpoint: None,
-            },
-        )
-        .unwrap();
-        persist_transaction_progress(
-            &paths,
-            None,
-            &mut task,
-            &mut metrics,
-            CatalogTransactionProgress {
-                phase: CatalogTransactionPhase::UploadBlobs,
-                completed_items: 1,
-                total_items: 2,
-                bytes_done: 5,
-                bytes_total: 10,
-                blob_checkpoint: Some(CatalogBlobCheckpoint {
-                    path: "objects/files/a/chunks/b.lios".to_string(),
-                    oid: "a".repeat(64),
-                    size: 5,
-                    state: CatalogBlobCheckpointState::Uploaded,
-                }),
-            },
-        )
-        .unwrap();
-
-        let checkpoints = store.list_checkpoints(task.id).unwrap();
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].state, CheckpointState::Uploaded);
-
-        persist_transaction_progress(
-            &paths,
-            None,
-            &mut task,
-            &mut metrics,
-            CatalogTransactionProgress {
-                phase: CatalogTransactionPhase::Publish,
-                completed_items: 2,
-                total_items: 2,
-                bytes_done: 5,
-                bytes_total: 10,
-                blob_checkpoint: Some(CatalogBlobCheckpoint {
-                    path: "objects/files/a/chunks/b.lios".to_string(),
-                    oid: "a".repeat(64),
-                    size: 5,
-                    state: CatalogBlobCheckpointState::Committed,
-                }),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            store.list_checkpoints(task.id).unwrap()[0].state,
-            CheckpointState::Committed
-        );
     }
 }
 

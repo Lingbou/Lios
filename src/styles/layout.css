@@ -1,0 +1,400 @@
+.appFrame {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: 36px minmax(0, 1fr);
+  background:
+    linear-gradient(145deg, rgba(255, 216, 237, 0.74) 0%, rgba(255, 251, 253, 0.94) 34%, rgba(239, 250, 255, 0.9) 100%),
+    #fff6fb;
+}
+
+.windowTitlebar {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid rgba(239, 212, 228, 0.86);
+  background: rgba(255, 250, 253, 0.88);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.windowTitle {
+  min-width: 0;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.windowTitle img {
+  width: 20px;
+  height: 20px;
+  filter: drop-shadow(0 4px 8px rgba(232, 110, 168, 0.25));
+}
+
+.windowDragRegion {
+  min-width: 0;
+  height: 100%;
+  flex: 1 1 auto;
+}
+
+.titlebarAction {
+  width: 38px;
+  min-height: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+}
+
+.titlebarAction:hover:not(:disabled),
+.titlebarAction.active {
+  background: rgba(255, 226, 240, 0.9);
+  color: var(--pink-strong);
+}
+
+.titlebarAction svg {
+  width: 16px;
+  height: 16px;
+}
+
+.windowControls {
+  height: 100%;
+  display: flex;
+}
+
+.windowControls button {
+  width: 46px;
+  min-height: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+}
+
+.windowControls button:hover:not(:disabled) {
+  background: rgba(255, 226, 240, 0.9);
+  color: var(--pink-strong);
+}
+
+.windowControls .closeWindow:hover:not(:disabled) {
+  background: #e95f85;
+  color: #ffffff;
+}
+
+.windowControls svg {
+  width: 15px;
+  height: 15px;
+}
+
+.driveShell {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  overflow: hidden;
+  background:
+    linear-gradient(145deg, rgba(255, 216, 237, 0.74) 0%, rgba(255, 251, 253, 0.94) 34%, rgba(239, 250, 255, 0.9) 100%),
+    #fff6fb;
+}
+
+.driveShell::before {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  content: "";
+  background-image:
+    linear-gradient(120deg, rgba(232, 110, 168, 0.08) 0 1px, transparent 1px 96px),
+    linear-gradient(30deg, rgba(143, 214, 232, 0.09) 0 1px, transparent 1px 112px);
+  opacity: 0.8;
+}
+
+.driveShell > * {
+  position: relative;
+  z-index: 1;
+}
+
+.spaceRail {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  padding: 16px 12px;
+  background:
+    linear-gradient(180deg, rgba(255, 250, 253, 0.96), rgba(255, 241, 248, 0.92)),
+    var(--surface);
+  border-right: 1px solid var(--line);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 14px;
+}
+
+.accountSection {
+  display: grid;
+  gap: 8px;
+}
+
+.sectionLabel {
+  padding: 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.accountItem {
+  width: 100%;
+  min-height: 52px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  justify-content: flex-start;
+  text-align: left;
+  background: var(--surface-strong);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.accountItem.active {
+  background: linear-gradient(135deg, #fff0f8, #f7fcff);
+  border-color: rgba(232, 110, 168, 0.52);
+  box-shadow: 0 4px 12px rgba(185, 92, 136, 0.12);
+}
+
+.accountItem.empty {
+  border-color: rgba(232, 110, 168, 0.35);
+  background: linear-gradient(135deg, #fff3fa, #fffaf1);
+}
+
+.accountItem span,
+.accountItem strong,
+.accountItem small {
+  min-width: 0;
+}
+
+.accountItem strong,
+.accountItem small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.accountItem strong {
+  color: var(--ink);
+}
+
+.accountItem small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.railFooter button {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.railHeader {
+  display: grid;
+  gap: 10px;
+}
+
+.railBrand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px;
+}
+
+.railBrandLogo {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+}
+
+.railBrandText {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.railBrandTitle {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink);
+  line-height: 1.2;
+}
+
+.railBrandSubtitle {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.2;
+}
+
+.railSpacesSection {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  overflow: hidden;
+}
+
+.railSectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px;
+}
+
+.railAddSpaceBtn {
+  width: 24px;
+  min-height: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.railAddSpaceBtn:hover:not(:disabled) {
+  background: var(--pink-weak);
+  color: var(--pink-strong);
+  border-color: var(--line);
+}
+
+.railAddSpaceBtn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.railSpaceList {
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-right: 2px;
+}
+
+.railSpaceItem {
+  width: 100%;
+  min-height: 36px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.railSpaceItem:hover:not(:disabled) {
+  background: var(--pink-weak);
+  color: var(--pink-strong);
+}
+
+.railSpaceItem.active {
+  background: var(--pink-weak);
+  border-color: var(--line-strong);
+  color: var(--pink-strong);
+  font-weight: 600;
+}
+
+.railSpaceItem svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.railSpaceName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.railEmptySpaces {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.railEmptyCreateBtn {
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+
+.railTaskBadge {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--pink);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.railFooter {
+  display: grid;
+  gap: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.railFooter button {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.railFooter button:hover:not(:disabled) {
+  background: var(--surface-subtle);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.railFooter button.active {
+  background: var(--accent-weak);
+  border-color: var(--accent-soft);
+  color: var(--accent-strong);
+}

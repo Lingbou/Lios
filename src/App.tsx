@@ -8,27 +8,15 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
-  AlertTriangle,
-  ArrowUpDown,
   ChevronRight,
-  Download,
-  FolderOpen,
   HardDrive,
-  KeyRound,
-  Minus,
-  Plus,
-  RefreshCw,
   Search,
-  Settings,
-  ShieldCheck,
-  Square,
-  Trash2,
-  UploadCloud,
   X
 } from "lucide-react";
 import { Fragment, type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   CacheCleanupReport,
+  CatalogStatus,
   CatalogLoadResult,
   CatalogRebuildDialog,
   CatalogRebuildPreview,
@@ -49,13 +37,9 @@ import {
   loadCatalogState
 } from "./catalogState.ts";
 import { errorText } from "./commandError.ts";
-import { AboutSection } from "./features/settings/AboutSection.tsx";
-import { ConnectionSection, EndpointSection } from "./features/settings/ConnectionSettings.tsx";
 import {
   breadcrumb,
-  displayPath,
   findNode,
-  formatCacheBytes,
   sameSpace,
   treeToDriveItem
 } from "./features/catalog/catalogPresentation.tsx";
@@ -73,21 +57,14 @@ import { useDriveSelection } from "./features/drive/useDriveSelection.ts";
 import { useFilePreview } from "./features/drive/useFilePreview.ts";
 import { useStableCallback } from "./useStableCallback.ts";
 import {
-  conciseRecoveryKeyPath,
-  recoveryKeyBackupText,
   type RecoveryKeyStatus,
   type RecoveryKeyVerification
 } from "./recoveryKeyPresentation.ts";
 
-import { InputModal } from "./components/InputModal.tsx";
-import { ConfirmModal } from "./components/ConfirmModal.tsx";
-import { ConflictModal } from "./features/drive/ConflictModal.tsx";
-import { ContextMenu } from "./features/drive/ContextMenu.tsx";
-import { DragDropOverlay } from "./features/drive/DragDropOverlay.tsx";
-import { DriveToolbar } from "./features/drive/DriveToolbar.tsx";
-import { FileGrid } from "./features/drive/FileGrid.tsx";
-import { FileTable } from "./features/drive/FileTable.tsx";
-import { FilePreviewModal, type FilePreviewContent } from "./features/drive/FilePreviewModal.tsx";
+import { SettingsView } from "./features/settings/SettingsView.tsx";
+import { DriveView } from "./features/drive/DriveView.tsx";
+import { AppModals } from "./components/AppModals.tsx";
+import { type FilePreviewContent } from "./features/drive/FilePreviewModal.tsx";
 import {
   calculateNextArrowIndex,
   getGridColumnCount
@@ -129,7 +106,7 @@ async function appInvoke<T>(command: string, args?: InvokeArgs): Promise<T> {
 const taskApi = createTaskApi(appInvoke);
 
 type View = "spaces" | "drive" | "settings";
-type CatalogStatus = "idle" | "loading" | "ready" | "missing" | "error";
+// CatalogStatus moved to appTypes.ts
 const naturalNameCollator = new Intl.Collator(undefined, {
   numeric: true,
   sensitivity: "base"
@@ -1621,179 +1598,39 @@ function App() {
 
 
           {view === "settings" ? (
-            <section className="settingsPage">
-              <div className="settingsPageHeader">
-                <div>
-                  <h2>设置</h2>
-                  <span>应用、安全与本地状态</span>
-                </div>
-              </div>
-              <div className="settingsBlocks">
-              <ConnectionSection
-                hasToken={hasToken}
-                username={modelscopeUser?.username}
-                token={token}
-                onTokenChange={setToken}
-                onConnect={saveToken}
-                onDisconnect={disconnectToken}
-                busy={busy !== null}
-              />
-
-              <EndpointSection
-                endpoint={manualEndpoint}
-                onEndpointChange={setManualEndpoint}
-                onSave={saveEndpoint}
-                busy={busy !== null}
-              />
-
-              <div className="settingsBlock recoveryKeyBlock">
-                <div className="settingsHeaderRow">
-                  <div>
-                    <h2>恢复密钥</h2>
-                    <p>用于打开已加密的 Lios 空间</p>
-                  </div>
-                  <div className="settingsActions">
-                    <button
-                      onClick={exportRecoveryKey}
-                      disabled={!snapshot?.recovery_key.key_location || busy !== null}
-                    >
-                      <Download aria-hidden />
-                      导出备份
-                    </button>
-                    <button
-                      onClick={selectRecoveryKeyForImport}
-                      disabled={busy !== null || recoveryKeyImport !== null}
-                    >
-                      <UploadCloud aria-hidden />
-                      导入密钥
-                    </button>
-                  </div>
-                </div>
-                <div className="recoveryKeySummary">
-                  <div className="recoveryKeyLocation">
-                    <KeyRound aria-hidden />
-                    <span>
-                      <small>当前密钥</small>
-                      <strong title={snapshot?.recovery_key.key_location ?? undefined}>
-                        {conciseRecoveryKeyPath(snapshot?.recovery_key.key_location)}
-                      </strong>
-                    </span>
-                  </div>
-                  <span
-                    className={`backupStatus ${snapshot?.recovery_key.backed_up ? "ready" : "missing"}`}
-                    title={snapshot?.recovery_key.backup_location ?? undefined}
-                  >
-                    {recoveryKeyBackupText(snapshot?.recovery_key)}
-                  </span>
-                </div>
-              </div>
-
-              <div className="settingsBlock">
-                <div className="settingsHeaderRow">
-                  <div>
-                    <h2>空间检查</h2>
-                    <p>
-                      {selectedSpace
-                        ? `${selectedSpace.namespace}/${selectedSpace.dataset}`
-                        : "未选择空间"}
-                    </p>
-                  </div>
-                  <div className="settingsActions">
-                    <button
-                      onClick={() => verifySpace(false)}
-                      disabled={!selectedSpace || busy !== null}
-                    >
-                      <ShieldCheck aria-hidden />
-                      快速检查
-                    </button>
-                    <button
-                      onClick={() => verifySpace(true)}
-                      disabled={!selectedSpace || busy !== null}
-                    >
-                      <HardDrive aria-hidden />
-                      完整检查
-                    </button>
-                    <button
-                      onClick={openCatalogRebuildDialog}
-                      disabled={
-                        !selectedSpace || busy !== null || rebuildDialog !== null || rebuildTaskActive
-                      }
-                    >
-                      <RefreshCw aria-hidden />
-                      重建 Catalog
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div className="settingsBlock">
-                <div className="settingsHeaderRow">
-                  <div>
-                    <h2>传输分块</h2>
-                    <p>设置大文件上传的分块大小（弱网环境下建议使用较小分块以提升断点重传成功率）</p>
-                  </div>
-                  <select
-                    value={snapshot?.config.chunk_size ?? 134217728}
-                    onChange={async (event) => {
-                      const size = Number(event.target.value);
-                      try {
-                        await appInvoke("set_chunk_size", { chunkSizeBytes: size });
-                        await refreshSetup(false);
-                      } catch (error) {
-                        setMessage(errorText(error));
-                      }
-                    }}
-                    disabled={busy !== null || activeTasks > 0}
-                  >
-                    <option value={16777216}>16 MB (弱网快速重传)</option>
-                    <option value={33554432}>32 MB (推荐 / 均衡)</option>
-                    <option value={67108864}>64 MB (高速网络)</option>
-                    <option value={134217728}>128 MB (超大单块)</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="settingsBlock">
-                <div className="settingsHeaderRow">
-                  <div>
-                    <h2>本地状态</h2>
-                  </div>
-                  <button onClick={cleanupLocalCache} disabled={busy !== null || activeTasks > 0}>
-                    <Trash2 aria-hidden />
-                    清理缓存
-                  </button>
-                </div>
-                {cacheCleanup && (
-                  <div className="cleanupResult">
-                    已清理 {cacheCleanup.files_removed} 个文件、{cacheCleanup.dirs_removed} 个空目录，释放{" "}
-                    {formatCacheBytes(cacheCleanup.bytes_removed)}
-                  </div>
-                )}
-                <dl className="pathGrid">
-                  <div>
-                    <dt>Config</dt>
-                    <dd>{displayPath(snapshot?.paths.config)}</dd>
-                  </div>
-                  <div>
-                    <dt>Database</dt>
-                    <dd>{displayPath(snapshot?.paths.database)}</dd>
-                  </div>
-                  <div>
-                    <dt>Staging</dt>
-                    <dd>{displayPath(snapshot?.paths.staging)}</dd>
-                  </div>
-                  <div>
-                    <dt>Logs</dt>
-                    <dd title={snapshot?.paths.logs ?? undefined}>
-                      {conciseRecoveryKeyPath(snapshot?.paths.logs)}
-                    </dd>
-                  </div>
-                </dl>
-              </div>
-
-              <AboutSection loadVersion={loadAppVersion} />
-              </div>
-            </section>
+            <SettingsView
+              hasToken={hasToken}
+              modelscopeUser={modelscopeUser}
+              token={token}
+              onTokenChange={setToken}
+              onConnect={saveToken}
+              onDisconnect={disconnectToken}
+              manualEndpoint={manualEndpoint}
+              onEndpointChange={setManualEndpoint}
+              onSaveEndpoint={saveEndpoint}
+              snapshot={snapshot}
+              busy={busy !== null}
+              recoveryKeyImport={recoveryKeyImport}
+              onExportRecoveryKey={exportRecoveryKey}
+              onSelectRecoveryKeyForImport={selectRecoveryKeyForImport}
+              selectedSpace={selectedSpace}
+              onVerifySpace={verifySpace}
+              onOpenCatalogRebuildDialog={openCatalogRebuildDialog}
+              rebuildDialog={rebuildDialog}
+              rebuildTaskActive={rebuildTaskActive}
+              activeTasks={activeTasks}
+              onChangeChunkSize={async (size) => {
+                try {
+                  await appInvoke("set_chunk_size", { chunkSizeBytes: size });
+                  await refreshSetup(false);
+                } catch (error) {
+                  setMessage(errorText(error));
+                }
+              }}
+              cacheCleanup={cacheCleanup}
+              onCleanupLocalCache={cleanupLocalCache}
+              loadAppVersion={loadAppVersion}
+            />
           ) : view === "spaces" ? (
             <SpaceGrid
               accountName={accountName}
@@ -1809,142 +1646,58 @@ function App() {
               onOpenSettings={openSettings}
             />
           ) : (
-            <>
-              <DriveToolbar
-                canUpload={Boolean(catalogTree)}
-                selectedCount={selectedCount}
-                totalCount={visibleItems.length}
-                viewMode={viewMode}
-                busy={busy !== null}
-                onUploadFiles={() => pickUpload(false)}
-                onUploadFolder={() => pickUpload(true)}
-                onNewFolder={createFolder}
-                onDownload={() => void downloadSelected()}
-                onRename={() => void renameSelected()}
-                onDelete={() => void deleteSelected()}
-                onRefresh={() => reloadCatalog()}
-                onClearSelection={() => {
-                  setSelectedIds(new Set());
-                  setLastSelectedId(null);
-                }}
-                onViewModeChange={handleViewModeChange}
-              />
-
-              <section
-                className="fileSurface"
-                onDragOver={(event) => {
-                  event.preventDefault();
-                  if (activeSpace && currentFolderId) setIsDragging(true);
-                }}
-                onDragLeave={(event) => {
-                  if (event.currentTarget.contains(event.relatedTarget as Node)) return;
-                  setIsDragging(false);
-                }}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  setIsDragging(false);
-                }}
-              >
-                <DragDropOverlay
-                  isDragging={isDragging}
-                  targetDirName={currentFolder?.name || activeSpace?.title || activeSpace?.dataset}
-                />
-
-                {!activeSpace ? (
-                  <div className="emptyDrive">
-                    {emptyDriveMode === "create" ? (
-                      <HardDrive aria-hidden />
-                    ) : (
-                      <UploadCloud aria-hidden />
-                    )}
-                    <h2>
-                      {emptyDriveMode === "create"
-                        ? "创建一个空间"
-                        : emptyDriveMode === "connect"
-                          ? "连接 ModelScope"
-                          : "选择一个空间"}
-                    </h2>
-                    {emptyDriveMode !== "select" && (
-                      <button
-                        className="primary"
-                        onClick={
-                          emptyDriveMode === "create"
-                            ? openCreateSpaceDialog
-                            : () => setView("settings")
-                        }
-                      >
-                        {emptyDriveMode === "create" ? (
-                          <UploadCloud aria-hidden />
-                        ) : (
-                          <Settings aria-hidden />
-                        )}
-                        <span>{emptyDriveMode === "create" ? "创建空间" : "设置令牌"}</span>
-                      </button>
-                    )}
-                  </div>
-                ) : catalogStatus === "loading" || catalogStatus === "idle" ? (
-                  <div className="emptyDrive">
-                    <RefreshCw className="loadingGlyph" aria-hidden />
-                    <h2>正在打开空间</h2>
-                  </div>
-                ) : catalogStatus === "missing" ? (
-                  <div className="emptyDrive">
-                    <HardDrive aria-hidden />
-                    <h2>{activeSpace.title || activeSpace.dataset}</h2>
-                    <button
-                      className="primary"
-                      onClick={initializeActiveSpace}
-                      disabled={busy !== null}
-                    >
-                      <ShieldCheck aria-hidden />
-                      初始化空间
-                    </button>
-                  </div>
-                ) : catalogStatus === "error" || !catalogTree ? (
-                  <div className="emptyDrive">
-                    <AlertTriangle aria-hidden />
-                    <h2>打开空间失败</h2>
-                    <button
-                      className="primary"
-                      onClick={() => reloadCatalog()}
-                      disabled={busy !== null}
-                    >
-                      <RefreshCw aria-hidden />
-                      重试
-                    </button>
-                  </div>
-                ) : visibleItems.length === 0 ? (
-                  <div className="emptyDrive">
-                    <FolderOpen aria-hidden />
-                    <h2>{appliedQuery ? "没有搜索结果" : "此文件夹为空"}</h2>
-                  </div>
-                ) : viewMode === "grid" ? (
-                  <FileGrid
-                    items={sortedItems}
-                    selectedIds={selectedIds}
-                    onToggleSelect={onToggleSelect}
-                    onSelectOnly={onSelectOnly}
-                    onSelectRange={onSelectRange}
-                    onEnterItem={onEnterItem}
-                    onContextMenu={onContextMenu}
-                  />
-                ) : (
-                  <FileTable
-                    items={sortedItems}
-                    selectedIds={selectedIds}
-                    sortField={sortField}
-                    sortDirection={sortDirection}
-                    onSort={onSort}
-                    onToggleSelect={onToggleSelect}
-                    onSelectOnly={onSelectOnly}
-                    onSelectRange={onSelectRange}
-                    onSelectAll={onSelectAll}
-                    onEnterItem={onEnterItem}
-                    onContextMenu={onContextMenu}
-                  />
-                )}
-              </section>
-            </>
+            <DriveView
+              catalogTree={catalogTree}
+              catalogStatus={catalogStatus}
+              activeSpace={activeSpace}
+              currentFolder={currentFolder}
+              currentFolderId={currentFolderId}
+              emptyDriveMode={emptyDriveMode}
+              selectedCount={selectedCount}
+              visibleItemsCount={visibleItems.length}
+              sortedItems={sortedItems}
+              selectedIds={selectedIds}
+              viewMode={viewMode}
+              sortField={sortField}
+              sortDirection={sortDirection}
+              appliedQuery={appliedQuery}
+              busy={busy !== null}
+              isDragging={isDragging}
+              onDragOver={(event) => {
+                event.preventDefault();
+                if (activeSpace && currentFolderId) setIsDragging(true);
+              }}
+              onDragLeave={(event) => {
+                if (event.currentTarget.contains(event.relatedTarget as Node)) return;
+                setIsDragging(false);
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                setIsDragging(false);
+              }}
+              onUploadFiles={() => pickUpload(false)}
+              onUploadFolder={() => pickUpload(true)}
+              onNewFolder={createFolder}
+              onDownload={() => void downloadSelected()}
+              onRename={() => void renameSelected()}
+              onDelete={() => void deleteSelected()}
+              onRefresh={() => reloadCatalog()}
+              onClearSelection={() => {
+                setSelectedIds(new Set());
+                setLastSelectedId(null);
+              }}
+              onViewModeChange={handleViewModeChange}
+              onSort={onSort}
+              onToggleSelect={onToggleSelect}
+              onSelectOnly={onSelectOnly}
+              onSelectRange={onSelectRange}
+              onSelectAll={onSelectAll}
+              onEnterItem={onEnterItem}
+              onContextMenu={onContextMenu}
+              openCreateSpaceDialog={openCreateSpaceDialog}
+              onOpenSettings={() => setView("settings")}
+              initializeActiveSpace={initializeActiveSpace}
+            />
           )}
 
           {view !== "settings" && (
@@ -1960,14 +1713,11 @@ function App() {
           )}
         </section>
 
-        <ContextMenu
-          state={contextMenu}
-          onClose={closeContextMenu}
-          selectedCount={
-            contextMenu.item != null && !selectedIds.has(contextMenu.item.id)
-              ? 1
-              : selectedCount
-          }
+        <AppModals
+          contextMenu={contextMenu}
+          onCloseContextMenu={closeContextMenu}
+          selectedCount={selectedCount}
+          selectedIds={selectedIds}
           onOpenItem={enterItem}
           onPreviewItem={openFilePreview}
           onDownload={downloadSelected}
@@ -1978,86 +1728,50 @@ function App() {
           onNewFolder={createFolder}
           onRefresh={() => reloadCatalog()}
           onSelectAll={selectAll}
-        />
-
-        <RebuildCatalogModal
-          dialog={rebuildDialog}
+          rebuildDialog={rebuildDialog}
           rebuildTaskActive={rebuildTaskActive}
-          onClose={closeCatalogRebuildDialog}
-          onReloadPreview={() => rebuildDialog && loadCatalogRebuildPreview(rebuildDialog.space)}
-          onConfirm={confirmCatalogRebuild}
-        />
-
-        <ImportKeyModal
-          dialog={recoveryKeyImport}
-          onClose={() => setRecoveryKeyImport(null)}
-          onConfirm={confirmRecoveryKeyImport}
-        />
-
-        <ConflictModal
+          onCloseCatalogRebuildDialog={closeCatalogRebuildDialog}
+          onReloadCatalogRebuildPreview={() => rebuildDialog && loadCatalogRebuildPreview(rebuildDialog.space)}
+          onConfirmCatalogRebuild={confirmCatalogRebuild}
+          recoveryKeyImport={recoveryKeyImport}
+          onCloseRecoveryKeyImport={() => setRecoveryKeyImport(null)}
+          onConfirmRecoveryKeyImport={confirmRecoveryKeyImport}
           conflicts={conflicts}
           conflictActions={conflictActions}
-          onSetAction={handleConflictAction}
-          onSetAllActions={handleSetAllConflictActions}
-          onCancel={() => {
+          onSetConflictAction={handleConflictAction}
+          onSetAllConflictActions={handleSetAllConflictActions}
+          onCancelConflicts={() => {
             setConflicts([]);
             setPendingUpload([]);
           }}
-          onConfirm={confirmConflicts}
-        />
-
-        <CreateSpaceModal
-          open={createSpaceOpen}
-          name={newSpaceName}
-          slug={newSpaceSlug}
-          error={createSpaceError}
+          onConfirmConflicts={confirmConflicts}
+          createSpaceOpen={createSpaceOpen}
+          newSpaceName={newSpaceName}
+          newSpaceSlug={newSpaceSlug}
+          createSpaceError={createSpaceError}
           busy={busy !== null}
-          onChangeName={handleSpaceNameChange}
-          onChangeSlug={handleSpaceSlugChange}
-          onClose={() => {
+          onChangeSpaceName={handleSpaceNameChange}
+          onChangeSpaceSlug={handleSpaceSlugChange}
+          onCloseCreateSpace={() => {
             setCreateSpaceOpen(false);
             setCreateSpaceError("");
           }}
-          onSubmit={submitCreateSpace}
-        />
-
-        <FilePreviewModal
-          open={previewOpen}
-          item={previewItem}
-          loading={previewLoading}
-          error={previewError}
-          content={previewContent}
-          hasPrev={hasPrevPreview}
-          hasNext={hasNextPreview}
-          onPrev={handlePrevPreview}
-          onNext={handleNextPreview}
-          onClose={closePreview}
-          onDownload={(item) => void downloadSelected([item.id])}
-        />
-
-        <InputModal
-          open={inputModalState.open}
-          title={inputModalState.title}
-          description={inputModalState.description}
-          inputLabel={inputModalState.inputLabel}
-          placeholder={inputModalState.placeholder}
-          defaultValue={inputModalState.defaultValue}
-          confirmText={inputModalState.confirmText}
-          validate={inputModalState.validate}
-          onClose={() => setInputModalState((prev) => ({ ...prev, open: false }))}
-          onSubmit={inputModalState.onSubmit}
-        />
-
-        <ConfirmModal
-          open={confirmModalState.open}
-          title={confirmModalState.title}
-          description={confirmModalState.description}
-          details={confirmModalState.details}
-          confirmText={confirmModalState.confirmText}
-          danger={confirmModalState.danger}
-          hideCancel={confirmModalState.hideCancel}
-          onClose={() => setConfirmModalState((prev) => ({ ...prev, open: false }))}
-          onConfirm={confirmModalState.onConfirm}
+          onSubmitCreateSpace={submitCreateSpace}
+          previewOpen={previewOpen}
+          previewItem={previewItem}
+          previewLoading={previewLoading}
+          previewError={previewError}
+          previewContent={previewContent}
+          hasPrevPreview={hasPrevPreview}
+          hasNextPreview={hasNextPreview}
+          onPrevPreview={handlePrevPreview}
+          onNextPreview={handleNextPreview}
+          onClosePreview={closePreview}
+          onDownloadPreview={(item) => void downloadSelected([item.id])}
+          inputModalState={inputModalState}
+          onCloseInputModal={() => setInputModalState((prev) => ({ ...prev, open: false }))}
+          confirmModalState={confirmModalState}
+          onCloseConfirmModal={() => setConfirmModalState((prev) => ({ ...prev, open: false }))}
         />
       </main>
     </div>
