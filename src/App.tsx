@@ -66,6 +66,9 @@ import {
 } from "./features/tasks/taskPresentation.ts";
 import { type TaskSummary } from "./features/tasks/taskTypes.ts";
 import { useTasks } from "./features/tasks/useTasks.ts";
+import { useWindowControls } from "./hooks/useWindowControls.ts";
+import { useDriveSelection } from "./features/drive/useDriveSelection.ts";
+import { useFilePreview } from "./features/drive/useFilePreview.ts";
 import { useStableCallback } from "./useStableCallback.ts";
 import {
   conciseRecoveryKeyPath,
@@ -140,8 +143,7 @@ function App() {
   const [catalogTree, setCatalogTree] = useState<CatalogTreeNode | null>(null);
   const [catalogStatus, setCatalogStatus] = useState<CatalogStatus>("idle");
   const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
+
   const [query, setQuery] = useState("");
   const [appliedQuery, setAppliedQuery] = useState("");
   const [taskDrawerCollapsed, setTaskDrawerCollapsed] = useState(false);
@@ -246,7 +248,6 @@ function App() {
   const catalogMutationCompletions = useRef<Set<string>>(new Set());
   const catalogMutationCompletionBaselineReady = useRef(false);
   const rebuildPreviewRequest = useRef(0);
-  const previewRequest = useRef(0);
 
   // New states for enhanced interaction
   const [sortField, setSortField] = useState<SortField>("name");
@@ -268,12 +269,7 @@ function App() {
     item: null
   });
 
-  // In-app file preview states
-  const [previewOpen, setPreviewOpen] = useState(false);
-  const [previewItem, setPreviewItem] = useState<DriveItem | null>(null);
-  const [previewLoading, setPreviewLoading] = useState(false);
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const [previewContent, setPreviewContent] = useState<FilePreviewContent | null>(null);
+
 
 
 
@@ -330,6 +326,34 @@ function App() {
     () => sortedItems.filter((i) => i.kind === "File"),
     [sortedItems]
   );
+
+  const {
+    selectedIds,
+    setSelectedIds,
+    lastSelectedId,
+    setLastSelectedId,
+    toggleSelection,
+    selectOnly,
+    selectRange,
+    selectAll
+  } = useDriveSelection(sortedItems);
+
+  const {
+    previewOpen,
+    previewItem,
+    previewLoading,
+    previewError,
+    previewContent,
+    openFilePreview,
+    closePreview
+  } = useFilePreview(activeSpace);
+
+  const {
+    minimizeWindow,
+    toggleMaximizeWindow,
+    closeWindow,
+    startWindowDrag
+  } = useWindowControls(handleTaskError);
   const previewIndex = useMemo(
     () =>
       previewItem
@@ -411,42 +435,7 @@ function App() {
         : "选择一个空间";
   const fullBreadcrumbPath = crumbPaths[crumbPaths.length - 1] ?? crumbFallbackLabel;
 
-  async function minimizeWindow() {
-    if (!hasTauriRuntime()) return;
-    try {
-      await getCurrentWindow().minimize();
-    } catch (error) {
-      setMessage(errorText(error));
-    }
-  }
 
-  async function toggleMaximizeWindow() {
-    if (!hasTauriRuntime()) return;
-    try {
-      await getCurrentWindow().toggleMaximize();
-    } catch (error) {
-      setMessage(errorText(error));
-    }
-  }
-
-  async function closeWindow() {
-    if (!hasTauriRuntime()) return;
-    try {
-      await getCurrentWindow().close();
-    } catch (error) {
-      setMessage(errorText(error));
-    }
-  }
-
-  async function startWindowDrag(event: MouseEvent<HTMLElement>) {
-    if (event.button !== 0 || !hasTauriRuntime()) return;
-    event.preventDefault();
-    try {
-      await getCurrentWindow().startDragging();
-    } catch (error) {
-      setMessage(errorText(error));
-    }
-  }
 
   async function refreshSetup(loadSpaces = true) {
     const next = await appInvoke<Snapshot>("current_setup");
@@ -854,88 +843,7 @@ function App() {
     });
   }
 
-  function toggleSelection(id: string) {
-    setLastSelectedId(id);
-    setSelectedIds((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
 
-  function selectOnly(id: string) {
-    setLastSelectedId(id);
-    setSelectedIds(new Set([id]));
-  }
-
-  function selectRange(targetId: string) {
-    if (!lastSelectedId || lastSelectedId === targetId) {
-      selectOnly(targetId);
-      return;
-    }
-    const lastIdx = sortedItems.findIndex((item) => item.id === lastSelectedId);
-    const targetIdx = sortedItems.findIndex((item) => item.id === targetId);
-    if (lastIdx === -1 || targetIdx === -1) {
-      selectOnly(targetId);
-      return;
-    }
-    const start = Math.min(lastIdx, targetIdx);
-    const end = Math.max(lastIdx, targetIdx);
-    const rangeIds = sortedItems.slice(start, end + 1).map((item) => item.id);
-    setSelectedIds(new Set(rangeIds));
-  }
-
-  function selectAll() {
-    if (sortedItems.length === 0) return;
-    if (sortedItems.every((item) => selectedIds.has(item.id))) {
-      setSelectedIds(new Set());
-    } else {
-      setSelectedIds(new Set(sortedItems.map((item) => item.id)));
-    }
-  }
-
-  async function openFilePreview(item: DriveItem) {
-    if (!activeSpace) return;
-    const requestId = ++previewRequest.current;
-    const spaceName = activeSpace.space_name;
-    setPreviewItem(item);
-    setPreviewOpen(true);
-    setPreviewLoading(true);
-    setPreviewError(null);
-    setPreviewContent(null);
-    try {
-      const res = await appInvoke<{
-        name: string;
-        size: number;
-        mime_type: string;
-        is_text: boolean;
-        text?: string;
-        data_url?: string;
-      }>("preview_file_node", {
-        spaceName,
-        nodeId: item.id
-      });
-      if (requestId !== previewRequest.current) return;
-      setPreviewContent({
-        isText: res.is_text,
-        text: res.text,
-        dataUrl: res.data_url
-      });
-    } catch (err) {
-      if (requestId !== previewRequest.current) return;
-      setPreviewError(errorText(err));
-    } finally {
-      if (requestId !== previewRequest.current) return;
-      setPreviewLoading(false);
-    }
-  }
-
-  function closePreview() {
-    previewRequest.current += 1;
-    setPreviewOpen(false);
-    setPreviewItem(null);
-  }
 
   function navigateToFolder(folderId: string) {
     if (searchTimeoutRef.current) {
@@ -1648,13 +1556,6 @@ function App() {
       <main className="driveShell">
         <aside className="spaceRail">
           <div className="railHeader">
-            <div className="railBrand">
-              <img src={liosPetalMark} alt="" className="railBrandLogo" />
-              <div className="railBrandText">
-                <span className="railBrandTitle">Lios</span>
-                <span className="railBrandSubtitle">Desktop Drive</span>
-              </div>
-            </div>
 
             <div className="accountSection">
               <button

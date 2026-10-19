@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
-use std::process::{Command as ProcessCommand, Stdio};
 
 use args::{
     parse_repository_address, AuthCommand, Cli, Command, CpArgs, KeyCommand, MkdirArgs, MvArgs,
@@ -680,37 +679,7 @@ async fn run_sync(
 }
 
 fn start_worker(paths: &LiosPaths) -> CliResult<()> {
-    if paths
-        .worker_running()
-        .map_err(lios_application::CommandError::from)?
-    {
-        return Ok(());
-    }
-    let _ = fs::remove_file(paths.worker_stop_path());
-    let current = std::env::current_exe()?;
-    let extension = current.extension().map(|value| value.to_os_string());
-    let mut worker = current.with_file_name("lios-worker");
-    if let Some(extension) = extension {
-        worker.set_extension(extension);
-    }
-    if !worker.is_file() {
-        return Err(CliError::new(format!(
-            "lios-worker was not found beside {}",
-            current.display()
-        )));
-    }
-    let home_root = paths
-        .home
-        .parent()
-        .ok_or_else(|| CliError::new("Lios Home has no parent directory for worker startup"))?;
-    ProcessCommand::new(worker)
-        .arg("--home")
-        .arg(home_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    Ok(())
+    lios_application::worker_supervisor::spawn_shared_worker(paths, false).map_err(CliError::from)
 }
 
 async fn wait_for_worker_task(

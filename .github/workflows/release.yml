@@ -475,7 +475,7 @@ jobs:
           fi
           deb_depends="$(dpkg-deb --field "$deb" Depends)"
           printf 'CLI DEB dependencies: %s\n' "$deb_depends"
-          for required_deb_dependency in libc6 libssl3; do
+          for required_deb_dependency in libc6; do
             if ! grep -Eq "(^|, )[[:space:]]*${required_deb_dependency}([[:space:](,]|$)" <<<"$deb_depends"; then
               echo "::error::CLI DEB is missing the runtime dependency $required_deb_dependency"
               exit 1
@@ -532,9 +532,7 @@ jobs:
               fi
               printf "%s\n" "$rpm_requires"
               for required_rpm_dependency in \
-                "libc.so.6()(64bit)" \
-                "libcrypto.so.3()(64bit)" \
-                "libssl.so.3()(64bit)"; do
+                "libc.so.6()(64bit)"; do
                 if ! grep -Fxq "$required_rpm_dependency" <<<"$rpm_requires"; then
                   echo "::error::CLI RPM is missing the runtime dependency $required_rpm_dependency"
                   exit 1

@@ -547,13 +547,23 @@ pub fn prepare_pull(
     local_destination: &LocalLocation,
     options: &PlanOptions,
 ) -> CommandResult<PreparedPull> {
-    prepare_pull_with_snapshot(
-        sources,
-        local_destination,
-        options,
-        PullConflictMode::Fail,
-        |root, _source_entries| snapshot_local_destination(root),
-    )
+    if !options.delete {
+        prepare_pull_with_snapshot(
+            sources,
+            local_destination,
+            options,
+            PullConflictMode::Fail,
+            snapshot_download_destination,
+        )
+    } else {
+        prepare_pull_with_snapshot(
+            sources,
+            local_destination,
+            options,
+            PullConflictMode::Fail,
+            |root, _source_entries| snapshot_local_destination(root),
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1000,7 +1010,18 @@ fn snapshot_local_destination(
     if !root.exists() {
         return Ok((Vec::new(), BTreeMap::new()));
     }
-    let metadata = safe_metadata(root)?;
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), BTreeMap::new()));
+        }
+        Err(e) => return Err(to_err(e)),
+    };
+    if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
+        return Err(CommandError::invalid_input(
+            "restore destination contains unsupported symbolic links or junctions",
+        ));
+    }
     if !metadata.is_dir() {
         return Ok((Vec::new(), BTreeMap::new()));
     }
@@ -1008,7 +1029,18 @@ fn snapshot_local_destination(
     let mut fingerprints = BTreeMap::new();
     for entry in WalkDir::new(root).follow_links(false).min_depth(1) {
         let entry = entry.map_err(to_err)?;
-        let metadata = safe_metadata(entry.path())?;
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                return Err(to_err(error));
+            }
+        };
+        if metadata.file_type().is_symlink() || is_windows_reparse_point(&metadata) {
+            continue;
+        }
         let relative = path_to_catalog(
             entry
                 .path()

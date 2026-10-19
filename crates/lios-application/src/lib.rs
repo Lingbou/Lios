@@ -22,6 +22,7 @@ pub mod task_runner;
 pub mod task_support;
 pub mod transfer_planner;
 pub mod transfer_request;
+pub mod worker_supervisor;
 
 pub use command_error::{CommandError, CommandErrorCode};
 
