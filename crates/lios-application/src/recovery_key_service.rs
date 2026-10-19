@@ -12,8 +12,8 @@ use lios_core::{LiosError, RemoteErrorKind};
 use serde::Serialize;
 
 use crate::command_error::{CommandError, CommandErrorCode};
-use crate::config_mutation_gate::ConfigMutationGate;
 use crate::production_config::{persist_config, validate_repo};
+use crate::service::ConfigMutationGate;
 
 type ServiceResult<T> = std::result::Result<T, CommandError>;
 

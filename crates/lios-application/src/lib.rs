@@ -7,12 +7,9 @@ use std::path::{Component, Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 pub mod app_log;
-pub mod catalog_mutation_gate;
 pub mod catalog_probe;
 pub mod catalog_sync;
 pub mod command_error;
-pub mod config_mutation_gate;
-pub mod download_service;
 pub mod location;
 pub mod production_config;
 pub mod recovery_key_service;
@@ -61,4 +58,19 @@ pub fn sha256_hex_file(path: &Path) -> CommandResult<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+pub use service::{CatalogMutationGate, ConfigMutationGate};
+pub use transfer_request::{prepare_download_task, PreparedDownload};
+
+pub mod catalog_mutation_gate {
+    pub use crate::service::CatalogMutationGate;
+}
+
+pub mod config_mutation_gate {
+    pub use crate::service::ConfigMutationGate;
+}
+
+pub mod download_service {
+    pub use crate::transfer_request::{prepare_download_task, PreparedDownload};
 }

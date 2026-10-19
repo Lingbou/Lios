@@ -12,7 +12,7 @@ use crate::transfer_planner::{
 };
 use crate::{sha256_hex_file, to_err, CommandError, CommandResult};
 use lios_core::catalog::{
-    CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution,
+    CatalogSelection, CatalogTreeNode, CatalogTreeNodeKind, ConflictAction, ConflictResolution,
 };
 use lios_core::tasks::{
     PersistedTransferAction, PersistedTransferPlan, TransferActionKind, TransferActionState,
@@ -1271,4 +1271,40 @@ fn join_catalog(parent: &str, child: &str) -> String {
         (_, true) => parent.trim_matches('/').to_string(),
         (false, false) => format!("{}/{}", parent.trim_matches('/'), child.trim_matches('/')),
     }
+}
+
+#[derive(Debug)]
+pub struct PreparedDownload {
+    pub selection: CatalogSelection,
+    pub output_dir: PathBuf,
+}
+
+pub fn prepare_download_task(
+    node_ids: Vec<String>,
+    output_dir: String,
+) -> CommandResult<PreparedDownload> {
+    let ids = node_ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Err(CommandError::invalid_input(
+            "download selection cannot be empty",
+        ));
+    }
+    let output_dir = PathBuf::from(output_dir.trim());
+    if !output_dir.is_absolute() || !output_dir.is_dir() {
+        return Err(CommandError::invalid_input(
+            "download output must be an existing absolute directory",
+        ));
+    }
+    let output_dir = output_dir.canonicalize().map_err(|_| {
+        CommandError::invalid_input("download output must be an existing absolute directory")
+    })?;
+
+    Ok(PreparedDownload {
+        selection: CatalogSelection::Nodes(ids),
+        output_dir,
+    })
 }

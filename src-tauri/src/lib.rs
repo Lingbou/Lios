@@ -1,8 +1,9 @@
 use base64::Engine;
 pub use lios_application::{
-    app_log, catalog_mutation_gate, catalog_probe, catalog_sync, command_error,
-    config_mutation_gate, download_service, production_config, recovery_key_service, task_support,
+    app_log, catalog_probe, catalog_sync, command_error, production_config, recovery_key_service,
+    task_support,
 };
+use lios_application::{prepare_download_task, CatalogMutationGate, ConfigMutationGate};
 
 pub mod command_surface;
 mod task_center;
@@ -17,7 +18,6 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use app_log::AppLogger;
-use catalog_mutation_gate::CatalogMutationGate;
 use catalog_probe::ensure_space_can_initialize;
 #[cfg(test)]
 use catalog_sync::{
@@ -27,8 +27,6 @@ use catalog_sync::{
 use catalog_sync::{sync_current_catalog, CatalogBaseline};
 use command_error::{CommandError, CommandErrorCode};
 use command_surface::with_registered_commands;
-use config_mutation_gate::ConfigMutationGate;
-use download_service::prepare_download_task;
 use lios_application::location::LocalLocation;
 use lios_application::service::Application;
 use lios_application::space_registry::SpaceRegistry;
@@ -1508,7 +1506,7 @@ async fn preview_file_node(
         }
     }
 
-    let restore_options = lios_core::restore::RestoreOptions {
+    let restore_options = lios_core::RestoreOptions {
         output_dir: temp_preview_path,
     };
     catalog

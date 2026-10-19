@@ -1449,12 +1449,12 @@ mod recovery_key_service_tests {
     use tokio::sync::oneshot;
 
     use super::command_error::CommandErrorCode;
-    use super::config_mutation_gate::ConfigMutationGate;
     use super::recovery_key_service::{
         export_recovery_key_for_paths, import_candidate_with_adapter,
         import_candidate_with_adapter_after_verification, recovery_key_status,
         verify_candidate_with_adapter,
     };
+    use lios_application::ConfigMutationGate;
 
     enum DownloadResult {
         Catalog(PathBuf),

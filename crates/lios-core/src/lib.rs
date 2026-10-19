@@ -12,10 +12,18 @@ pub mod error;
 pub mod format_v1;
 pub mod framed_v1;
 pub mod modelscope;
-pub mod pack;
-pub mod restore;
 pub mod space_lock;
 pub mod storage;
 pub mod tasks;
 
 pub use error::{LiosError, RemoteError, RemoteErrorKind, Result};
+
+pub use catalog::{PackOptions, PackProgress, RestoreOptions};
+
+pub mod pack {
+    pub use crate::catalog::{PackOptions, PackProgress};
+}
+
+pub mod restore {
+    pub use crate::catalog::RestoreOptions;
+}
